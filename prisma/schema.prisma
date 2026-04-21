@@ -57,6 +57,8 @@ model Message {
   usagePromptTokens     Int?
   usageCompletionTokens Int?
   providerModel         String?
+  ttftMs                Int?
+  avgTokensPerSecond    Float?
   createdAt             DateTime @default(now())
   chat                  Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
 

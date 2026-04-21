@@ -17,7 +17,10 @@ export type ChatMessage = {
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
   providerModel?: string;
+  ttftMs?: number;
+  avgTokensPerSecond?: number;
   createdAt: string;
+  _isStreaming?: boolean;
 };
 
 export type ChatDetail = {

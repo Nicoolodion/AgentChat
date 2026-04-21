@@ -8,14 +8,16 @@ import {
   getConversationForModel,
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
-import { runNanoGPTCompletion } from "@/lib/nanogpt";
+import { streamCompletionWithCallbacks, generateChatTitle, runNanoGPTCompletion } from "@/lib/nanogpt";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
 });
 
-function makeTitleFromPrompt(content: string): string {
-  return content.replace(/\s+/g, " ").trim().slice(0, 48) || "New chat";
+const encoder = new TextEncoder();
+
+function sendSseEvent(controller: ReadableStreamDefaultController, event: string, data: unknown) {
+  controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 }
 
 export async function POST(
@@ -53,85 +55,139 @@ export async function POST(
       maxMessages: 30,
     });
 
-    let completion;
-    try {
-      completion = await runNanoGPTCompletion({
-        model: chat.model,
-        webSearchEnabled: chat.webSearchEnabled,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a secure assistant in Chatinterface. Use tools when useful and return concise, accurate answers.",
-          },
-          ...priorConversation,
-        ],
-      });
-    } catch (error) {
-      const err = error as Error & { status?: number; response?: { status?: number }; code?: string; error?: unknown };
-      console.error("[NanoGPT Completion Error]", {
-        message: err?.message,
-        status: err?.status ?? err?.response?.status,
-        code: err?.code,
-        error: err?.error,
-        name: err?.name,
-      });
-      console.error("Stack:", error);
-      
-      const statusCode = err?.status ?? err?.response?.status ?? 500;
-      const isAuthError = statusCode === 401 || statusCode === 403 || 
-                          err?.message?.toLowerCase().includes("auth") ||
-                          err?.message?.toLowerCase().includes("api key");
-      const isRateLimit = statusCode === 429;
-      const isNotFound = statusCode === 404;
-      
-      let message: string;
-      if (isNotFound) {
-        message = "Model not found - check if the model ID and API base URL are correct";
-      } else if (isAuthError) {
-        message = "AI authentication failed - verify your API key is correct";
-      } else if (isRateLimit) {
-        message = "AI service rate limit reached, please try again in a moment";
-      } else {
-        message = `AI service error: ${err?.message ?? "Unknown error"}`;
-      }
-      return NextResponse.json({ error: message }, { status: isAuthError ? 503 : isNotFound ? 404 : 500 });
-    }
+    const stream = new ReadableStream({
+      async start(controller) {
+        let completion;
+        try {
+          completion = await streamCompletionWithCallbacks(
+            {
+              model: chat.model,
+              webSearchEnabled: chat.webSearchEnabled,
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "You are a secure assistant in Chatinterface. Use tools when useful and return concise, accurate answers.",
+                },
+                ...priorConversation,
+              ],
+            },
+            {
+              onTTFT: (ttftMs: number) => sendSseEvent(controller, "ttft", { ttftMs }),
+              onContent: (text: string) => sendSseEvent(controller, "content", { text }),
+              onReasoning: (text: string) => sendSseEvent(controller, "reasoning", { text }),
+              onToolStart: (name: string) => sendSseEvent(controller, "tool_start", { name }),
+              onToolDone: (name: string, ok: boolean) => sendSseEvent(controller, "tool_done", { name, ok }),
+            },
+          );
+        } catch (error) {
+          const err = error as Error & { status?: number; response?: { status?: number }; code?: string; error?: unknown };
+          console.error("[NanoGPT Completion Error]", {
+            message: err?.message,
+            status: err?.status ?? err?.response?.status,
+            code: err?.code,
+            error: err?.error,
+            name: err?.name,
+          });
 
-    const assistantMessage = await appendMessageToChat({
-      chatId: chat.id,
-      role: "assistant",
-      content: completion.content,
-      reasoning: completion.reasoning,
-      toolPayload: completion.toolPayload,
-      userKey: auth.userKey,
-      usagePromptTokens: completion.usagePromptTokens,
-      usageCompletionTokens: completion.usageCompletionTokens,
-      providerModel: completion.providerModel,
+          const statusCode = err?.status ?? err?.response?.status ?? 500;
+          const isAuthError = statusCode === 401 || statusCode === 403 || 
+                              err?.message?.toLowerCase().includes("auth") ||
+                              err?.message?.toLowerCase().includes("api key");
+          const isRateLimit = statusCode === 429;
+          const isNotFound = statusCode === 404;
+          
+          let message: string;
+          if (isNotFound) {
+            message = "Model not found - check if the model ID and API base URL are correct";
+          } else if (isAuthError) {
+            message = "AI authentication failed - verify your API key is correct";
+          } else if (isRateLimit) {
+            message = "AI service rate limit reached, please try again in a moment";
+          } else {
+            message = `AI service error: ${err?.message ?? "Unknown error"}`;
+          }
+          
+          sendSseEvent(controller, "error", { message });
+          controller.close();
+          return;
+        }
+
+        const streamEndTime = Date.now();
+        const elapsedSec = (streamEndTime - (completion.ttftMs ?? streamEndTime)) / 1000;
+        const avgTokensPerSecond = 
+          elapsedSec > 0 && completion.usageCompletionTokens 
+            ? completion.usageCompletionTokens / elapsedSec 
+            : undefined;
+
+        let assistantMessage;
+        try {
+          assistantMessage = await appendMessageToChat({
+            chatId: chat.id,
+            role: "assistant",
+            content: completion.content,
+            reasoning: completion.reasoning,
+            toolPayload: completion.toolPayload,
+            userKey: auth.userKey,
+            usagePromptTokens: completion.usagePromptTokens,
+            usageCompletionTokens: completion.usageCompletionTokens,
+            providerModel: completion.providerModel,
+            ttftMs: completion.ttftMs,
+            avgTokensPerSecond,
+          });
+        } catch (dbError) {
+          console.error("[DB Write Error]", dbError);
+          sendSseEvent(controller, "error", { message: "Failed to save response." });
+          controller.close();
+          return;
+        }
+
+        const shouldSetTitle = priorConversation.length <= 1;
+        let generatedTitle: string | undefined;
+
+        if (shouldSetTitle) {
+          generatedTitle = await generateChatTitle({
+            userMessage: parsed.data.content,
+            assistantMessage: completion.content,
+          }).catch(() => undefined);
+
+          void updateChatSettingsForUser({
+            userId: auth.userId,
+            chatId: chat.id,
+            userKey: auth.userKey,
+            title: generatedTitle ?? "New chat",
+          }).catch(() => {});
+        }
+
+        sendSseEvent(controller, "done", {
+          userMessage,
+          assistantMessage,
+          title: generatedTitle,
+          meta: {
+            selectedModel: chat.model,
+            webSearchEnabled: chat.webSearchEnabled,
+            providerModel: completion.providerModel,
+            usagePromptTokens: completion.usagePromptTokens,
+            usageCompletionTokens: completion.usageCompletionTokens,
+            ttftMs: completion.ttftMs,
+            avgTokensPerSecond,
+          },
+        });
+
+        controller.close();
+      },
     });
 
-    const shouldSetTitle = priorConversation.length <= 1;
-    if (shouldSetTitle) {
-      await updateChatSettingsForUser({
-        userId: auth.userId,
-        chatId: chat.id,
-        userKey: auth.userKey,
-        title: makeTitleFromPrompt(parsed.data.content),
-      });
-    }
-
-    return NextResponse.json({
-      userMessage,
-      assistantMessage,
-      meta: {
-        selectedModel: chat.model,
-        webSearchEnabled: chat.webSearchEnabled,
-        providerModel: completion.providerModel,
-        usagePromptTokens: completion.usagePromptTokens,
-        usageCompletionTokens: completion.usageCompletionTokens,
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
       },
     });
   } catch (error) {
+    console.error("[Messages Route Error]", error);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

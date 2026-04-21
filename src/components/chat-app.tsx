@@ -1,8 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Bot,
+  CornerDownLeft,
   Globe,
   KeyRound,
   Loader2,
@@ -13,10 +16,14 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  ChevronRight,
+  ChevronDown,
+  Zap,
+  Activity,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
-import type { ChatDetail, ChatListItem, ModelInfo } from "@/lib/chat-types";
+import type { ChatDetail, ChatListItem, ChatMessage, ModelInfo } from "@/lib/chat-types";
 import { cn } from "@/lib/ui";
 
 type MePayload = {
@@ -57,6 +64,179 @@ function prettyDate(iso: string): string {
   }).format(date);
 }
 
+function MessageBubble({
+  message,
+  prettyDate,
+}: {
+  message: ChatMessage;
+  prettyDate: (iso: string) => string;
+}) {
+  const isAssistant = message.role === "assistant";
+  const isStreaming = "_isStreaming" in message;
+  const isEmpty = !message.content && !message.reasoning;
+
+  return (
+    <div
+      className={cn(
+        "rounded-2xl border px-4 py-3",
+        message.role === "user"
+          ? "ml-auto max-w-[85%] border-teal-300/40 bg-teal-400/15"
+          : "max-w-[90%] border-white/15 bg-white/5",
+      )}
+    >
+      <div className="mb-1 flex items-center gap-2 text-xs uppercase tracking-wide text-slate-300">
+        {isAssistant ? <Bot className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
+        {message.role}
+        <span className="text-slate-500">{prettyDate(message.createdAt)}</span>
+        {message.ttftMs && (
+          <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-300">
+            <Zap className="h-3 w-3" />
+            {message.ttftMs}ms TTFT
+          </span>
+        )}
+        {message.avgTokensPerSecond && (
+          <span className="flex items-center gap-1 text-[10px] font-medium text-amber-300">
+            <Activity className="h-3 w-3" />
+            {message.avgTokensPerSecond.toFixed(1)} t/s
+          </span>
+        )}
+      </div>
+
+      {message.reasoning && (
+        <details className="group/details mb-2 overflow-hidden rounded-xl border border-white/10 bg-slate-950/40">
+          <summary className="flex cursor-pointer items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-200 transition group-open/details:bg-white/5">
+            <ChevronRight className="h-3 w-3 transition-transform group-open/details:rotate-90" />
+            Reasoning ({message.reasoning.length} chars)
+          </summary>
+          <div className="border-t border-white/5 px-3 py-2">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                pre: ({ children }) => (
+                  <pre className="overflow-x-auto rounded-lg bg-slate-900 p-3 text-[11px] leading-relaxed text-slate-200">
+                    {children}
+                  </pre>
+                ),
+                code: ({ className, children }) => {
+                  const isBlock = className?.includes("language-");
+                  if (isBlock) {
+                    return <>{children}</>;
+                  }
+                  return (
+                    <code className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[11px] text-slate-100">
+                      {children}
+                    </code>
+                  );
+                },
+              }}
+            >
+              {message.reasoning}
+            </ReactMarkdown>
+          </div>
+        </details>
+      )}
+
+      {isStreaming && isEmpty ? (
+        <div className="flex items-center gap-1.5 py-2">
+          <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-teal-300" style={{ animationDelay: "0ms" }} />
+          <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-teal-300" style={{ animationDelay: "150ms" }} />
+          <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-teal-300" style={{ animationDelay: "300ms" }} />
+          <span className="ml-2 text-xs text-slate-400">Thinking{message.ttftMs ? "..." : ""}</span>
+        </div>
+      ) : null}
+
+      {message.content && (
+        <div className="mt-1">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              h1: ({ children }) => <h1 className="mb-2 mt-3 text-lg font-semibold text-white">{children}</h1>,
+              h2: ({ children }) => <h2 className="mb-2 mt-3 text-base font-semibold text-white">{children}</h2>,
+              h3: ({ children }) => <h3 className="mb-1 mt-2 text-sm font-semibold text-white">{children}</h3>,
+              p: ({ children }) => <p className="mb-2 text-sm text-slate-100 leading-relaxed">{children}</p>,
+              ul: ({ children }) => <ul className="mb-2 ml-4 list-disc text-sm text-slate-100">{children}</ul>,
+              ol: ({ children }) => <ol className="mb-2 ml-4 list-decimal text-sm text-slate-100">{children}</ol>,
+              li: ({ children }) => <li className="mb-1 leading-relaxed">{children}</li>,
+              a: ({ href, children }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer" className="text-teal-300 underline underline-offset-2 hover:text-teal-200">
+                  {children}
+                </a>
+              ),
+              blockquote: ({ children }) => (
+                <blockquote className="mb-2 border-l-3 border-teal-300/40 pl-3 italic text-slate-300">
+                  {children}
+                </blockquote>
+              ),
+              hr: () => <hr className="my-3 border-white/10" />,
+              table: ({ children }) => (
+                <div className="my-3 overflow-x-auto">
+                  <table className="min-w-full border-collapse border border-white/10 text-sm text-slate-100">
+                    {children}
+                  </table>
+                </div>
+              ),
+              th: ({ children }) => (
+                <th className="border border-white/10 bg-white/5 px-3 py-1.5 font-semibold">{children}</th>
+              ),
+              td: ({ children }) => <td className="border border-white/10 px-3 py-1.5">{children}</td>,
+              pre: ({ children }) => (
+                <pre className="my-2 overflow-x-auto rounded-xl border border-white/10 bg-slate-900/80 p-3 text-[12px] leading-relaxed text-slate-200">
+                  {children}
+                </pre>
+              ),
+              code: ({ className, children }) => {
+                const isBlock = className?.includes("language-");
+                if (isBlock) {
+                  return <>{children}</>;
+                }
+                return (
+                  <code className="rounded-lg bg-white/10 px-1.5 py-0.5 font-mono text-[12px] text-slate-100">
+                    {children}
+                  </code>
+                );
+              },
+            }}
+          >
+            {message.content}
+          </ReactMarkdown>
+        </div>
+      )}
+
+      {message.toolPayload && (
+        <details className="group/details mt-2 overflow-hidden rounded-xl border border-white/10 bg-slate-950/40">
+          <summary className="flex cursor-pointer items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-200 transition group-open/details:bg-white/5">
+            <ChevronRight className="h-3 w-3 transition-transform group-open/details:rotate-90" />
+            Tool use
+          </summary>
+          <div className="border-t border-white/5 px-3 py-2">
+            <pre className="overflow-x-auto font-mono text-[11px] leading-relaxed text-slate-300">
+              {message.toolPayload}
+            </pre>
+          </div>
+        </details>
+      )}
+
+      {(message.usagePromptTokens || message.usageCompletionTokens) && (
+        <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
+          <span>
+            prompt {message.usagePromptTokens ?? 0} / completion {message.usageCompletionTokens ?? 0}
+          </span>
+          {message.providerModel && (
+            <span className="font-mono">{message.providerModel}</span>
+          )}
+        </div>
+      )}
+
+      {isStreaming && !isEmpty && (
+        <div className="flex items-center gap-1.5 pt-1">
+          <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-teal-300" />
+          <span className="text-[10px] text-slate-400">Streaming...</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ChatApp() {
   const router = useRouter();
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -66,7 +246,6 @@ export function ChatApp() {
   const [chats, setChats] = useState<ChatListItem[]>([]);
   const [activeChat, setActiveChat] = useState<ChatDetail | null>(null);
   const [messageInput, setMessageInput] = useState("");
-  const [chatTitle, setChatTitle] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -179,7 +358,6 @@ export function ChatApp() {
   async function openChat(chatId: string) {
     const detail = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${chatId}`);
     setActiveChat(detail.chat);
-    setChatTitle(detail.chat.title);
   }
 
   async function createChat(modelId?: string) {
@@ -202,7 +380,6 @@ export function ChatApp() {
     });
 
     setActiveChat(updated.chat);
-    setChatTitle(updated.chat.title);
     await reloadChatsAndKeepSelection(updated.chat.id);
   }
 
@@ -227,26 +404,197 @@ export function ChatApp() {
     const content = messageInput.trim();
     setMessageInput("");
 
+    const tempId = `temp-${Date.now()}`;
+
+    const userMsg: ChatMessage = {
+      id: `user-${tempId}`,
+      role: "user",
+      content,
+      createdAt: new Date().toISOString(),
+    };
+
+    const tempAsstMsg: ChatMessage & { _isStreaming: true } = {
+      id: tempId,
+      role: "assistant",
+      content: "",
+      createdAt: new Date().toISOString(),
+      _isStreaming: true,
+    };
+
+    setActiveChat((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        messages: [...current.messages, userMsg, tempAsstMsg],
+      };
+    });
+
+    let ttftMsVal: number | undefined;
+    let liveTokensPerSec: number | undefined;
+    let totalTokens = 0;
+    let streamingStarted = false;
+    let streamStartTime = Date.now();
+
     try {
-      const response = await apiFetch<{
-        userMessage: ChatDetail["messages"][number];
-        assistantMessage: ChatDetail["messages"][number];
-      }>(`/api/chats/${activeChat.id}/messages`, {
+      const response = await fetch(`/api/chats/${activeChat.id}/messages`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
       });
 
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error((errData as { error?: string }).error ?? "Request failed");
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const lines = part.split("\n");
+          let eventType = "data";
+          let dataStr = "";
+
+          for (const line of lines) {
+            if (line.startsWith("event: ")) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              dataStr += line.slice(6) + "\n";
+            }
+          }
+
+          if (!dataStr.trim()) continue;
+
+          try {
+            const data = JSON.parse(dataStr.trim());
+
+            if (eventType === "ttft" && !streamingStarted) {
+              ttftMsVal = data.ttftMs;
+              streamingStarted = true;
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                msgs[lastIdx] = {
+                  ...msgs[lastIdx]!,
+                  content: "",
+                  ttftMs: data.ttftMs,
+                  _isStreaming: true,
+                };
+                return { ...current, messages: msgs };
+              });
+              continue;
+            }
+
+            if (eventType === "content" && data.text) {
+              totalTokens += data.text.length;
+              if (!streamingStarted) {
+                streamingStarted = true;
+                streamStartTime = Date.now();
+                if (ttftMsVal) {
+                  totalTokens = 1;
+                }
+              }
+
+              const elapsedSec = (Date.now() - streamStartTime) / 1000;
+              liveTokensPerSec = totalTokens / Math.max(elapsedSec, 0.1);
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                if (msgs[lastIdx]) {
+                  msgs[lastIdx] = {
+                    ...msgs[lastIdx]!,
+                    content: (msgs[lastIdx] as ChatMessage).content + data.text,
+                    avgTokensPerSecond: liveTokensPerSec,
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "reasoning" && data.text) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                if (msgs[lastIdx]) {
+                  const existingReasoning = (msgs[lastIdx] as ChatMessage).reasoning ?? "";
+                  msgs[lastIdx] = {
+                    ...msgs[lastIdx]!,
+                    reasoning: existingReasoning + data.text,
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "done") {
+              const assistantMsg = data.assistantMessage as ChatMessage;
+              const finalAvgTokensPerSecond = (assistantMsg.usageCompletionTokens && data.meta?.ttftMs)
+                ? assistantMsg.usageCompletionTokens / Math.max((Date.now() - streamStartTime) / 1000, 0.1)
+                : data.meta?.avgTokensPerSecond;
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const storedMsg = {
+                  ...assistantMsg,
+                  ttftMs: data.meta?.ttftMs ?? assistantMsg.ttftMs,
+                  avgTokensPerSecond: data.meta?.avgTokensPerSecond ?? finalAvgTokensPerSecond,
+                };
+                msgs[msgs.length - 1] = storedMsg;
+                return { ...current, messages: msgs };
+              });
+
+              if (data.title) {
+                setChats((prev) =>
+                  prev.map((chat) =>
+                    chat.id === activeChat.id
+                      ? { ...chat, title: data.title, updatedAt: new Date().toISOString() }
+                      : chat,
+                  ),
+                );
+                setActiveChat((current) => {
+                  if (!current) return current;
+                  return { ...current, title: data.title };
+                });
+              }
+
+              await reloadChatsAndKeepSelection(activeChat.id);
+            }
+
+            if (eventType === "error") {
+              setError(data.message ?? "Streaming error occurred.");
+            }
+          } catch (parseErr) {
+            console.warn("Failed to parse SSE data:", dataStr, parseErr);
+          }
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Message failed.");
       setActiveChat((current) => {
         if (!current) return current;
         return {
           ...current,
-          messages: [...current.messages, response.userMessage, response.assistantMessage],
+          messages: current.messages.filter((m) => !m.id.startsWith("temp-")),
         };
       });
-
-      await reloadChatsAndKeepSelection(activeChat.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Message failed.");
     } finally {
       setSending(false);
     }
@@ -318,7 +666,7 @@ export function ChatApp() {
                 )}
               >
                 <div className="flex items-start justify-between gap-2">
-                  <div className="line-clamp-1 text-sm font-medium text-white">{chat.title}</div>
+                  <div key={`${chat.id}-${chat.title}`} className="line-clamp-1 text-sm font-medium text-white animated-title">{chat.title}</div>
                   <button
                     type="button"
                     onClick={(event) => {
@@ -443,61 +791,14 @@ export function ChatApp() {
             </div>
           </div>
 
-          <div className="border-b border-white/10 px-4 py-3">
-            <input
-              value={chatTitle}
-              onChange={(event) => setChatTitle(event.target.value)}
-              onBlur={() => {
-                if (!activeChat) return;
-                if (chatTitle.trim() && chatTitle.trim() !== activeChat.title) {
-                  void updateChat({ title: chatTitle.trim() });
-                }
-              }}
-              className="w-full rounded-xl border border-white/15 bg-slate-900/70 px-3 py-2 text-sm text-white outline-none ring-teal-300/30 focus:ring"
-              placeholder="Chat title"
-            />
-          </div>
-
           <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
             <div className="flex-1 space-y-3 overflow-y-auto">
               {activeChat?.messages.map((message) => (
-                <div
+                <MessageBubble
                   key={message.id}
-                  className={cn(
-                    "rounded-2xl border px-4 py-3",
-                    message.role === "user"
-                      ? "ml-auto max-w-[85%] border-teal-300/40 bg-teal-400/15"
-                      : "max-w-[90%] border-white/15 bg-white/5",
-                  )}
-                >
-                  <div className="mb-1 flex items-center gap-2 text-xs uppercase tracking-wide text-slate-300">
-                    {message.role === "assistant" ? <Bot className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
-                    {message.role}
-                    <span className="text-slate-500">{prettyDate(message.createdAt)}</span>
-                  </div>
-                  <div className="whitespace-pre-wrap text-sm text-slate-100">{message.content}</div>
-                  {message.reasoning ? (
-                    <details className="mt-2 rounded-xl border border-white/10 bg-slate-950/40 p-2 text-xs text-slate-300">
-                      <summary className="cursor-pointer text-teal-200">Reasoning trace</summary>
-                      <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed">
-                        {message.reasoning}
-                      </pre>
-                    </details>
-                  ) : null}
-                  {message.toolPayload ? (
-                    <details className="mt-2 rounded-xl border border-white/10 bg-slate-950/40 p-2 text-xs text-slate-300">
-                      <summary className="cursor-pointer text-amber-200">Tool payload</summary>
-                      <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed">
-                        {message.toolPayload}
-                      </pre>
-                    </details>
-                  ) : null}
-                  {(message.usagePromptTokens || message.usageCompletionTokens) && (
-                    <div className="mt-2 text-[11px] text-slate-400">
-                      usage: prompt {message.usagePromptTokens ?? 0} / completion {message.usageCompletionTokens ?? 0}
-                    </div>
-                  )}
-                </div>
+                  message={message}
+                  prettyDate={prettyDate}
+                />
               ))}
               <div ref={bottomRef} />
             </div>
@@ -525,7 +826,7 @@ export function ChatApp() {
                   disabled={sending || !messageInput.trim()}
                   className="inline-flex items-center gap-2 rounded-xl bg-teal-400 px-3 py-2 text-sm font-semibold text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CornerDownLeft className="h-4 w-4" />}
                   Send
                 </button>
               </div>

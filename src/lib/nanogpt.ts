@@ -9,6 +9,18 @@ import type { ModelInfo } from "@/lib/chat-types";
 import { env } from "@/lib/env";
 import { AGENT_TOOLS, executeAgentTool } from "@/lib/tools";
 
+const titleClient = new OpenAI({
+  apiKey: env.NANOGPT_API_KEY ?? "missing",
+  baseURL: env.NANOGPT_BASE_URL,
+});
+
+function countWords(str: string): number {
+  return str
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length > 0).length;
+}
+
 const nanoClient = new OpenAI({
   apiKey: env.NANOGPT_API_KEY ?? "missing",
   baseURL: env.NANOGPT_BASE_URL,
@@ -122,10 +134,36 @@ export async function runNanoGPTCompletion(input: {
   webSearchEnabled: boolean;
   messages: MessageInput[];
 }): Promise<CompletionResult> {
+  const ttftMs = Date.now();
+  const result = await streamCompletionWithCallbacks(input, {
+    onTTFT() {},
+    onContent() {},
+    onReasoning() {},
+    onToolStart() {},
+    onToolDone() {},
+  });
+  return result;
+}
+
+type StreamCallbacks = {
+  onContent: (text: string) => void;
+  onReasoning: (text: string) => void;
+  onTTFT: (ttftMs: number) => void;
+  onToolStart: (name: string) => void;
+  onToolDone: (name: string, ok: boolean) => void;
+};
+
+type StreamCompletionResult = CompletionResult & { ttftMs: number };
+
+export async function streamCompletionWithCallbacks(
+  input: { model: string; webSearchEnabled: boolean; messages: MessageInput[] },
+  callbacks: StreamCallbacks,
+): Promise<StreamCompletionResult> {
   if (!env.NANOGPT_API_KEY) {
     throw new Error("NANOGPT_API_KEY is not configured.");
   }
 
+  const startTime = Date.now();
   const model = applyWebSearchSuffix(input.model, input.webSearchEnabled);
   const toolEvents: Array<{ name: string; result: unknown; ok: boolean }> = [];
 
@@ -142,55 +180,138 @@ export async function runNanoGPTCompletion(input: {
     },
   }));
 
+    let finalContent = "";
+  let finalReasoning = "";
+  let providerModel: string | undefined;
+  let usagePromptTokens: number | undefined;
+  let usageCompletionTokens: number | undefined;
+  let ttftMs: number | undefined;
+  let ttftEmitted = false;
+  let currentToolCallIndex = -1;
+  let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  const accumulatedToolCalls: Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }> = [];
+
   for (let i = 0; i < 4; i += 1) {
+    accumulatedToolCalls.length = 0;
+    currentToolCallIndex = -1;
+    lastUsage = undefined;
+
     const response = await nanoClient.chat.completions.create({
       model,
       messages: conversation,
       tools,
       tool_choice: "auto",
       parallel_tool_calls: false,
+      stream: true,
     });
 
-    const choice = response.choices?.[0];
-    const message = choice?.message;
-    const toolCalls = message?.tool_calls ?? [];
-    const extractedReasoning =
-      typeof (message as { reasoning?: unknown } | undefined)?.reasoning === "string"
-        ? ((message as { reasoning?: string }).reasoning ?? undefined)
-        : undefined;
+    let contentBuffer = "";
 
-    if (!toolCalls.length) {
+    for await (const chunk of response) {
+      lastUsage = chunk.usage ?? undefined;
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
+
+      if (!ttftEmitted && (delta?.content || delta?.tool_calls || (delta as { reasoning?: unknown })?.reasoning)) {
+        ttftMs = Date.now() - startTime;
+        ttftEmitted = true;
+        callbacks.onTTFT(ttftMs);
+      }
+
+      const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
+      if (reasoningDelta) {
+        finalReasoning += reasoningDelta;
+        callbacks.onReasoning(reasoningDelta);
+      }
+
+      if (delta?.content) {
+        contentBuffer += delta.content;
+        finalContent += delta.content;
+        callbacks.onContent(delta.content);
+      }
+
+      const toolCalls = delta?.tool_calls ?? [];
+      for (const toolCall of toolCalls) {
+        const idx = toolCall.index ?? 0;
+        if (idx !== currentToolCallIndex) {
+          currentToolCallIndex = idx;
+          const id = toolCall.id;
+          const type = toolCall.type ?? "function";
+          const funcName = toolCall.function?.name ?? "";
+          const funcArgs = toolCall.function?.arguments ?? "";
+          accumulatedToolCalls[idx] = {
+            id: id ?? "",
+            type,
+            function: { name: funcName, arguments: funcArgs },
+          };
+          if (funcName) {
+            callbacks.onToolStart(funcName);
+          }
+        } else {
+          const funcArgs = toolCall.function?.arguments;
+          if (funcArgs) {
+            accumulatedToolCalls[idx].function.arguments += funcArgs;
+          }
+        }
+      }
+    }
+
+    usagePromptTokens = lastUsage?.prompt_tokens;
+    usageCompletionTokens = lastUsage?.completion_tokens;
+    providerModel = undefined;
+
+    if (accumulatedToolCalls.length === 0) {
+      const extractedReasoning =
+        typeof (finalReasoning || undefined) === "string"
+          ? (finalReasoning || undefined)
+          : undefined;
+
       return {
-        content: message?.content ?? "",
+        content: finalContent,
         reasoning: extractedReasoning,
-        providerModel: response.model,
-        usagePromptTokens: response.usage?.prompt_tokens,
-        usageCompletionTokens: response.usage?.completion_tokens,
+        providerModel,
+        usagePromptTokens,
+        usageCompletionTokens,
         toolPayload: toolEvents.length ? JSON.stringify(toolEvents, null, 2) : undefined,
+        ttftMs: ttftMs ?? Date.now() - startTime,
       };
     }
 
+    const completeToolCalls = accumulatedToolCalls
+      .filter(Boolean)
+      .map((tc) => ({
+        id: tc.id,
+        type: tc.type,
+        index: 0,
+        function: {
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        },
+      })) as ChatCompletionMessageToolCall[];
+
     conversation.push({
       role: "assistant",
-      content: message?.content ?? "",
-      tool_calls: toolCalls as ChatCompletionMessageToolCall[],
+      content: contentBuffer,
+      tool_calls: completeToolCalls,
     });
 
-    for (const toolCall of toolCalls) {
-      const toolName =
-        toolCall.type === "function" ? toolCall.function?.name : "unsupported_custom_tool";
+    for (const toolCall of completeToolCalls) {
+      const toolName = toolCall.type === "function" ? toolCall.function?.name : "unknown_tool";
       const toolArgs = toolCall.type === "function" ? toolCall.function?.arguments : undefined;
 
-      const result = await executeAgentTool(
-        toolName ?? "unknown_tool",
-        toolArgs,
-      );
+      const result = await executeAgentTool(toolName ?? "unknown_tool", toolArgs);
 
       toolEvents.push({
         name: toolName ?? "unknown_tool",
         result: result.result ?? result.error,
         ok: result.ok,
       });
+
+      callbacks.onToolDone(toolName ?? "unknown_tool", result.ok);
 
       conversation.push({
         role: "tool",
@@ -202,6 +323,60 @@ export async function runNanoGPTCompletion(input: {
 
   return {
     content: "The tool execution loop reached the safety limit.",
+    reasoning: finalReasoning || undefined,
     toolPayload: JSON.stringify(toolEvents, null, 2),
+    ttftMs: ttftMs ?? Date.now() - startTime,
   };
+}
+
+const TITLE_SYSTEM_PROMPT =
+  "You are a title generator. Given a user's first message and the AI's response, generate a concise descriptive title for this chat. Output ONLY the title - no quotes, no explanation, no extra text. Keep it to 6 words or fewer. Use title case.";
+
+export async function generateChatTitle({
+  userMessage,
+  assistantMessage,
+}: {
+  userMessage: string;
+  assistantMessage: string;
+}): Promise<string> {
+  if (!env.NANOGPT_API_KEY) {
+    return "New chat";
+  }
+
+  const maxAttempts = 3;
+  let lastResult = "";
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const response = await titleClient.chat.completions.create({
+        model: env.TITLE_MODEL,
+        messages: [
+          { role: "system", content: TITLE_SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: `User: ${userMessage.replace(/\n/g, " ")}\nAI: ${assistantMessage.replace(/\n/g, " ").slice(0, 500)}`,
+          },
+        ],
+        max_tokens: 60,
+        temperature: 0.3,
+      });
+
+      const rawTitle =
+        response.choices?.[0]?.message?.content?.trim() ?? "";
+
+      if (countWords(rawTitle) <= 1) {
+        return rawTitle || "New chat";
+      }
+
+      lastResult = rawTitle;
+    } catch {
+      lastResult = "";
+    }
+  }
+
+  if (lastResult && countWords(lastResult) <= 14) {
+    return lastResult;
+  }
+
+  return "New chat";
 }

@@ -20,6 +20,8 @@ function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
     usagePromptTokens: row.usagePromptTokens ?? undefined,
     usageCompletionTokens: row.usageCompletionTokens ?? undefined,
     providerModel: row.providerModel ?? undefined,
+    ttftMs: row.ttftMs ?? undefined,
+    avgTokensPerSecond: row.avgTokensPerSecond ?? undefined,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -169,6 +171,8 @@ export async function appendMessageToChat(input: {
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
   providerModel?: string;
+  ttftMs?: number;
+  avgTokensPerSecond?: number;
 }): Promise<ChatMessage> {
   const message = await prisma.message.create({
     data: {
@@ -184,6 +188,8 @@ export async function appendMessageToChat(input: {
       usagePromptTokens: input.usagePromptTokens,
       usageCompletionTokens: input.usageCompletionTokens,
       providerModel: input.providerModel,
+      ttftMs: input.ttftMs,
+      avgTokensPerSecond: input.avgTokensPerSecond,
     },
   });
 
