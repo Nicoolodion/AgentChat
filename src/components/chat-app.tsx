@@ -70,6 +70,9 @@ export function ChatApp() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [modelSearch, setModelSearch] = useState("");
+  const [filteredModels, setFilteredModels] = useState<ModelInfo[]>([]);
+  const modelDropdownRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (activeChat?.messages.length) {
@@ -117,6 +120,51 @@ export function ChatApp() {
     if (!activeChat) return null;
     return models.find((model) => model.id === activeChat.model) ?? null;
   }, [activeChat, models]);
+
+  const activeModelDisplay = activeModelInfo?.name ?? activeModelInfo?.displayName ?? activeChat?.model;
+
+  const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
+  const modelSearchRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (modelDropdownOpen && modelSearchRef.current) {
+      modelSearchRef.current.focus();
+    }
+  }, [modelDropdownOpen]);
+
+  useEffect(() => {
+    function handleClick(event: MouseEvent) {
+      if (
+        modelDropdownOpen &&
+        modelDropdownRef.current &&
+        !modelDropdownRef.current.contains(event.target as Node)
+      ) {
+        setModelDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [modelDropdownOpen]);
+
+  const displayModels = useMemo(() => {
+    if (filteredModels.length > 0) return filteredModels;
+    return models;
+  }, [models, filteredModels]);
+
+  useEffect(() => {
+    if (!modelSearch.trim()) {
+      setFilteredModels([]);
+      return;
+    }
+
+    const search = modelSearch.toLowerCase();
+    const filtered = models.filter(
+      (model) =>
+        model.id.toLowerCase().includes(search) ||
+        model.displayName.toLowerCase().includes(search),
+    );
+    setFilteredModels(filtered);
+  }, [modelSearch, models]);
 
   async function reloadChatsAndKeepSelection(chatId?: string) {
     const chatRows = await apiFetch<{ chats: ChatListItem[] }>("/api/chats");
@@ -251,11 +299,19 @@ export function ChatApp() {
 
           <div className="max-h-[calc(100vh-260px)] space-y-2 overflow-y-auto pr-1">
             {chats.map((chat) => (
-              <button
+              <div
                 key={chat.id}
+                role="button"
+                tabIndex={0}
                 onClick={() => openChat(chat.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    openChat(chat.id);
+                  }
+                }}
                 className={cn(
-                  "group w-full rounded-2xl border px-3 py-2 text-left transition",
+                  "group w-full rounded-2xl border px-3 py-2 text-left transition cursor-pointer",
                   activeChat?.id === chat.id
                     ? "border-teal-300/60 bg-teal-400/20"
                     : "border-white/10 bg-white/5 hover:bg-white/10",
@@ -264,6 +320,7 @@ export function ChatApp() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="line-clamp-1 text-sm font-medium text-white">{chat.title}</div>
                   <button
+                    type="button"
                     onClick={(event) => {
                       event.stopPropagation();
                       void deleteChat(chat.id);
@@ -276,7 +333,7 @@ export function ChatApp() {
                 </div>
                 <div className="mt-1 line-clamp-2 text-xs text-slate-300">{chat.lastMessagePreview}</div>
                 <div className="mt-1 text-[11px] text-slate-400">{prettyDate(chat.updatedAt)}</div>
-              </button>
+              </div>
             ))}
           </div>
         </aside>
@@ -284,19 +341,77 @@ export function ChatApp() {
         <main className="flex min-h-0 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 p-4">
             <div className="flex flex-wrap items-center gap-2">
-              <select
-                value={activeChat?.model ?? models[0]?.id ?? ""}
-                onChange={(event) => {
-                  void updateChat({ model: event.target.value });
-                }}
-                className="rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none ring-teal-300/40 focus:ring"
-              >
-                {models.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.displayName}
-                  </option>
-                ))}
-              </select>
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setModelDropdownOpen((prev) => !prev);
+                    if (!modelDropdownOpen) {
+                      setFilteredModels([]);
+                      setModelSearch("");
+                      setTimeout(() => modelSearchRef.current?.focus(), 0);
+                    }
+                  }}
+                  className="min-w-[240px] rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-left text-slate-100 outline-none ring-teal-300/40 focus:ring truncate"
+                >
+                  <span className="font-mono text-xs">{activeModelDisplay ?? "Select model"}</span>
+                </button>
+
+                {modelDropdownOpen && (
+                  <div className="absolute z-50 mt-1 w-[calc(100%+2px)] rounded-xl border border-white/10 bg-slate-900 shadow-2xl">
+                    <input
+                      ref={modelSearchRef}
+                      type="text"
+                      value={modelSearch}
+                      onChange={(event) => setModelSearch(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") {
+                          setModelDropdownOpen(false);
+                        }
+                      }}
+                      className="w-full border-b border-white/10 bg-transparent px-3 py-2 text-sm text-white outline-none placeholder:text-slate-500"
+                      placeholder="Search models..."
+                    />
+                    <div className="max-h-[280px] overflow-y-auto p-1">
+                      {displayModels.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          onClick={() => {
+                            void updateChat({ model: model.id });
+                            setModelDropdownOpen(false);
+                            setModelSearch("");
+                            setFilteredModels([]);
+                          }}
+                          className={cn(
+                            "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition",
+                            activeChat?.model === model.id
+                              ? "bg-teal-400/20 text-teal-100"
+                              : "text-slate-300 hover:bg-white/10",
+                          )}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-mono text-xs text-white">
+                              {model.name || model.id}
+                            </div>
+                            <div className="truncate text-[11px] text-slate-400">
+                              {model.displayName}
+                            </div>
+                          </div>
+                          {activeChat?.model === model.id && (
+                            <span className="text-[10px] font-semibold text-teal-300">ACTIVE</span>
+                          )}
+                        </button>
+                      ))}
+                      {displayModels.length === 0 && (
+                        <div className="px-3 py-4 text-center text-xs text-slate-500">
+                          No models found
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
 
               <button
                 onClick={() =>

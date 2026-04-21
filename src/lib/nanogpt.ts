@@ -42,12 +42,19 @@ function normalizeModelRow(row: ModelApiRow): ModelInfo {
   };
 }
 
-export async function fetchModelsFromNanoGPT(): Promise<ModelInfo[]> {
+export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo[]> {
+  const search = (filter ?? "").trim().toLowerCase();
+
   if (!env.NANOGPT_API_KEY) {
+    const placeholder = env.DEFAULT_MODEL;
+    if (search && !placeholder.toLowerCase().includes(search)) {
+      return [];
+    }
     return [
       {
-        id: env.DEFAULT_MODEL,
-        displayName: `${env.DEFAULT_MODEL} (configure NANOGPT_API_KEY for live models)`,
+        id: placeholder,
+        name: placeholder,
+        displayName: `${placeholder} (configure NANOGPT_API_KEY for live models)`,
       },
     ];
   }
@@ -65,12 +72,21 @@ export async function fetchModelsFromNanoGPT(): Promise<ModelInfo[]> {
   }
 
   const json = (await response.json()) as { data?: ModelApiRow[] };
-  const rows = Array.isArray(json.data) ? json.data : [];
+  let rows = Array.isArray(json.data) ? json.data : [];
   if (rows.length === 0) {
-    return [{ id: env.DEFAULT_MODEL, displayName: env.DEFAULT_MODEL }];
+    return [{ id: env.DEFAULT_MODEL, name: env.DEFAULT_MODEL, displayName: env.DEFAULT_MODEL }];
   }
 
-  return rows.map(normalizeModelRow);
+  const filtered = search
+    ? rows.filter(
+        (row) =>
+          row.id.toLowerCase().includes(search) ||
+          (row.name ?? "").toLowerCase().includes(search) ||
+          (row.owned_by ?? "").toLowerCase().includes(search),
+      )
+    : rows;
+
+  return filtered.map(normalizeModelRow);
 }
 
 export function applyWebSearchSuffix(modelId: string, webSearchEnabled: boolean): string {
@@ -133,7 +149,6 @@ export async function runNanoGPTCompletion(input: {
       tools,
       tool_choice: "auto",
       parallel_tool_calls: false,
-      reasoning_effort: "low",
     });
 
     const choice = response.choices?.[0];

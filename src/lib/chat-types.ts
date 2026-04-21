@@ -33,6 +33,7 @@ export type ChatDetail = {
 export type ModelInfo = {
   id: string;
   displayName: string;
+  name?: string;
   provider?: string;
   contextLength?: number;
   supportsVision?: boolean;
