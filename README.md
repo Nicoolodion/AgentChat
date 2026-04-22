@@ -5,6 +5,8 @@ A modern, secure chat interface for LLMs with:
 - Username/password accounts
 - Registration protection and feature toggles
 - Encrypted chat/message storage per user
+- Secure attachment uploads (images, PDF, DOCX/ODP/ODT/PPTX, text-like files)
+- PDF analysis with page-image + text context for multimodal models
 - NanoGPT model selection + optional web search suffix
 - Tool-capable agent loop
 - Prisma ORM with SQLite now and PostgreSQL-ready migration path
@@ -56,6 +58,7 @@ Open `http://localhost:3000`.
 
 - Passwords are hashed with Argon2id (`@node-rs/argon2`), never stored in plain text.
 - Chat content, reasoning, tool payloads, and chat titles are encrypted at rest (AES-256-GCM).
+- Uploaded attachments are encrypted at rest per user in `DATA_DIR/<userId>` and auto-expire after 30 days.
 - Session cookies are HttpOnly + SameSite and map to server-side session records.
 - Registration and auth can be toggled via env:
 	- `AUTH_REQUIRED=true|false`

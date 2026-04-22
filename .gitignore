@@ -19,10 +19,13 @@
 
 # production
 /build
+/prisma/dev.db
+/prisma/dev.db-journal
 
 # misc
 .DS_Store
 *.pem
+/data
 
 # debug
 npm-debug.log*

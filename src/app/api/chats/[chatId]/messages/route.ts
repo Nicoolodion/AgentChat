@@ -1,17 +1,27 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import {
+  appendAttachmentSummaryToMessage,
+  AttachmentError,
+  prepareAttachmentsForModel,
+} from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
+import {
+  type MessageAttachmentRef,
+  encodeUserAttachmentsPayload,
+} from "@/lib/chat-types";
 import {
   appendMessageToChat,
   getChatByIdForUser,
   getConversationForModel,
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
-import { streamCompletionWithCallbacks, generateChatTitle, runNanoGPTCompletion } from "@/lib/nanogpt";
+import { streamCompletionWithCallbacks, generateChatTitle } from "@/lib/nanogpt";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
+  attachments: z.array(z.string().min(16).max(64)).max(8).optional(),
 });
 
 const encoder = new TextEncoder();
@@ -41,10 +51,38 @@ export async function POST(
       return NextResponse.json({ error: "Chat not found" }, { status: 404 });
     }
 
+    let preparedAttachments = [];
+    try {
+      preparedAttachments = await prepareAttachmentsForModel({
+        userId: auth.userId,
+        userKey: auth.userKey,
+        attachmentIds: parsed.data.attachments ?? [],
+      });
+    } catch (error) {
+      if (error instanceof AttachmentError) {
+        return NextResponse.json({ error: error.message }, { status: error.statusCode });
+      }
+      throw error;
+    }
+
+    const persistedUserContent = appendAttachmentSummaryToMessage(
+      parsed.data.content,
+      preparedAttachments,
+    );
+
+    const attachmentRefs: MessageAttachmentRef[] = preparedAttachments.map((attachment) => ({
+      id: attachment.id,
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      kind: attachment.kind,
+    }));
+
     const userMessage = await appendMessageToChat({
       chatId: chat.id,
       role: "user",
-      content: parsed.data.content,
+      content: persistedUserContent,
+      toolPayload: attachmentRefs.length ? encodeUserAttachmentsPayload(attachmentRefs) : undefined,
       userKey: auth.userKey,
     });
 
@@ -71,6 +109,8 @@ export async function POST(
                 },
                 ...priorConversation,
               ],
+              attachments: preparedAttachments,
+              latestUserPrompt: parsed.data.content,
             },
             {
               onTTFT: (ttftMs: number) => sendSseEvent(controller, "ttft", { ttftMs }),

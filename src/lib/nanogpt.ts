@@ -5,6 +5,11 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions/completions";
 
+import {
+  buildMultimodalUserContent,
+  isOversizeModelError,
+  type PreparedAttachment,
+} from "@/lib/attachments";
 import type { ModelInfo } from "@/lib/chat-types";
 import { env } from "@/lib/env";
 import { AGENT_TOOLS, executeAgentTool } from "@/lib/tools";
@@ -84,7 +89,7 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
   }
 
   const json = (await response.json()) as { data?: ModelApiRow[] };
-  let rows = Array.isArray(json.data) ? json.data : [];
+  const rows = Array.isArray(json.data) ? json.data : [];
   if (rows.length === 0) {
     return [{ id: env.DEFAULT_MODEL, name: env.DEFAULT_MODEL, displayName: env.DEFAULT_MODEL }];
   }
@@ -120,6 +125,46 @@ type MessageInput = {
   name?: string;
 };
 
+async function buildConversationMessages(input: {
+  messages: MessageInput[];
+  attachments: PreparedAttachment[];
+  latestUserPrompt?: string;
+  compressedAttachments: boolean;
+}): Promise<ChatCompletionMessageParam[]> {
+  const baseConversation: ChatCompletionMessageParam[] = input.messages.map((msg) => ({
+    role: msg.role,
+    content: msg.content,
+  }));
+
+  if (input.attachments.length === 0) {
+    return baseConversation;
+  }
+
+  const lastUserIndex = [...input.messages]
+    .reverse()
+    .findIndex((message) => message.role === "user");
+
+  if (lastUserIndex === -1) {
+    return baseConversation;
+  }
+
+  const absoluteUserIndex = input.messages.length - 1 - lastUserIndex;
+  const prompt = input.latestUserPrompt ?? input.messages[absoluteUserIndex]?.content ?? "";
+
+  const multimodalContent = await buildMultimodalUserContent({
+    prompt,
+    attachments: input.attachments,
+    compressed: input.compressedAttachments,
+  });
+
+  baseConversation[absoluteUserIndex] = {
+    role: "user",
+    content: multimodalContent,
+  } as ChatCompletionMessageParam;
+
+  return baseConversation;
+}
+
 type CompletionResult = {
   content: string;
   reasoning?: string;
@@ -133,8 +178,9 @@ export async function runNanoGPTCompletion(input: {
   model: string;
   webSearchEnabled: boolean;
   messages: MessageInput[];
+  attachments?: PreparedAttachment[];
+  latestUserPrompt?: string;
 }): Promise<CompletionResult> {
-  const ttftMs = Date.now();
   const result = await streamCompletionWithCallbacks(input, {
     onTTFT() {},
     onContent() {},
@@ -156,7 +202,13 @@ type StreamCallbacks = {
 type StreamCompletionResult = CompletionResult & { ttftMs: number };
 
 export async function streamCompletionWithCallbacks(
-  input: { model: string; webSearchEnabled: boolean; messages: MessageInput[] },
+  input: {
+    model: string;
+    webSearchEnabled: boolean;
+    messages: MessageInput[];
+    attachments?: PreparedAttachment[];
+    latestUserPrompt?: string;
+  },
   callbacks: StreamCallbacks,
 ): Promise<StreamCompletionResult> {
   if (!env.NANOGPT_API_KEY) {
@@ -166,11 +218,14 @@ export async function streamCompletionWithCallbacks(
   const startTime = Date.now();
   const model = applyWebSearchSuffix(input.model, input.webSearchEnabled);
   const toolEvents: Array<{ name: string; result: unknown; ok: boolean }> = [];
-
-  const conversation: ChatCompletionMessageParam[] = input.messages.map((msg) => ({
-    role: msg.role,
-    content: msg.content,
-  }));
+  const attachments = input.attachments ?? [];
+  let usingCompressedAttachments = false;
+  let conversation = await buildConversationMessages({
+    messages: input.messages,
+    attachments,
+    latestUserPrompt: input.latestUserPrompt,
+    compressedAttachments: false,
+  });
   const tools: ChatCompletionTool[] = AGENT_TOOLS.map((tool) => ({
     type: "function",
     function: {
@@ -199,65 +254,87 @@ export async function streamCompletionWithCallbacks(
     accumulatedToolCalls.length = 0;
     currentToolCallIndex = -1;
     lastUsage = undefined;
-
-    const response = await nanoClient.chat.completions.create({
-      model,
-      messages: conversation,
-      tools,
-      tool_choice: "auto",
-      parallel_tool_calls: false,
-      stream: true,
-    });
-
     let contentBuffer = "";
 
-    for await (const chunk of response) {
-      lastUsage = chunk.usage ?? undefined;
-      const choice = chunk.choices?.[0];
-      const delta = choice?.delta;
+    try {
+      const response = await nanoClient.chat.completions.create({
+        model,
+        messages: conversation,
+        tools,
+        tool_choice: "auto",
+        parallel_tool_calls: false,
+        stream: true,
+      });
 
-      if (!ttftEmitted && (delta?.content || delta?.tool_calls || (delta as { reasoning?: unknown })?.reasoning)) {
-        ttftMs = Date.now() - startTime;
-        ttftEmitted = true;
-        callbacks.onTTFT(ttftMs);
-      }
+      for await (const chunk of response) {
+        lastUsage = chunk.usage ?? undefined;
+        const choice = chunk.choices?.[0];
+        const delta = choice?.delta;
 
-      const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
-      if (reasoningDelta) {
-        finalReasoning += reasoningDelta;
-        callbacks.onReasoning(reasoningDelta);
-      }
+        if (!ttftEmitted && (delta?.content || delta?.tool_calls || (delta as { reasoning?: unknown })?.reasoning)) {
+          ttftMs = Date.now() - startTime;
+          ttftEmitted = true;
+          callbacks.onTTFT(ttftMs);
+        }
 
-      if (delta?.content) {
-        contentBuffer += delta.content;
-        finalContent += delta.content;
-        callbacks.onContent(delta.content);
-      }
+        const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
+        if (reasoningDelta) {
+          finalReasoning += reasoningDelta;
+          callbacks.onReasoning(reasoningDelta);
+        }
 
-      const toolCalls = delta?.tool_calls ?? [];
-      for (const toolCall of toolCalls) {
-        const idx = toolCall.index ?? 0;
-        if (idx !== currentToolCallIndex) {
-          currentToolCallIndex = idx;
-          const id = toolCall.id;
-          const type = toolCall.type ?? "function";
-          const funcName = toolCall.function?.name ?? "";
-          const funcArgs = toolCall.function?.arguments ?? "";
-          accumulatedToolCalls[idx] = {
-            id: id ?? "",
-            type,
-            function: { name: funcName, arguments: funcArgs },
-          };
-          if (funcName) {
-            callbacks.onToolStart(funcName);
-          }
-        } else {
-          const funcArgs = toolCall.function?.arguments;
-          if (funcArgs) {
-            accumulatedToolCalls[idx].function.arguments += funcArgs;
+        if (delta?.content) {
+          contentBuffer += delta.content;
+          finalContent += delta.content;
+          callbacks.onContent(delta.content);
+        }
+
+        const toolCalls = delta?.tool_calls ?? [];
+        for (const toolCall of toolCalls) {
+          const idx = toolCall.index ?? 0;
+          if (idx !== currentToolCallIndex) {
+            currentToolCallIndex = idx;
+            const id = toolCall.id;
+            const type = toolCall.type ?? "function";
+            const funcName = toolCall.function?.name ?? "";
+            const funcArgs = toolCall.function?.arguments ?? "";
+            accumulatedToolCalls[idx] = {
+              id: id ?? "",
+              type,
+              function: { name: funcName, arguments: funcArgs },
+            };
+            if (funcName) {
+              callbacks.onToolStart(funcName);
+            }
+          } else {
+            const funcArgs = toolCall.function?.arguments;
+            if (funcArgs) {
+              accumulatedToolCalls[idx].function.arguments += funcArgs;
+            }
           }
         }
       }
+    } catch (error) {
+      if (!usingCompressedAttachments && attachments.length > 0 && i === 0 && isOversizeModelError(error)) {
+        usingCompressedAttachments = true;
+        finalContent = "";
+        finalReasoning = "";
+        ttftEmitted = false;
+        ttftMs = undefined;
+        toolEvents.length = 0;
+
+        conversation = await buildConversationMessages({
+          messages: input.messages,
+          attachments,
+          latestUserPrompt: input.latestUserPrompt,
+          compressedAttachments: true,
+        });
+
+        i = -1;
+        continue;
+      }
+
+      throw error;
     }
 
     usagePromptTokens = lastUsage?.prompt_tokens;

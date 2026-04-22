@@ -14,6 +14,26 @@ type EncryptedPayload = {
   data: string;
 };
 
+function encodePayload(iv: Buffer, tag: Buffer, encrypted: Buffer): string {
+  const payload: EncryptedPayload = {
+    v: 1,
+    iv: iv.toString("base64"),
+    tag: tag.toString("base64"),
+    data: encrypted.toString("base64"),
+  };
+
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+}
+
+function decodePayload(cipherText: string): EncryptedPayload {
+  const parsed = JSON.parse(Buffer.from(cipherText, "base64").toString("utf8")) as EncryptedPayload;
+  if (!parsed?.data || !parsed?.iv || !parsed?.tag) {
+    throw new Error("Invalid encrypted payload format.");
+  }
+
+  return parsed;
+}
+
 export function decodeKeyFromBase64(base64Key: string, label: string): Buffer {
   const decoded = Buffer.from(base64Key, "base64");
   if (decoded.length !== KEY_LENGTH) {
@@ -42,21 +62,11 @@ export function encryptString(plainText: string, key: Buffer): string {
   const encrypted = Buffer.concat([cipher.update(plainText, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
 
-  const payload: EncryptedPayload = {
-    v: 1,
-    iv: iv.toString("base64"),
-    tag: tag.toString("base64"),
-    data: encrypted.toString("base64"),
-  };
-
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+  return encodePayload(iv, tag, encrypted);
 }
 
 export function decryptString(cipherText: string, key: Buffer): string {
-  const parsed = JSON.parse(Buffer.from(cipherText, "base64").toString("utf8")) as EncryptedPayload;
-  if (!parsed?.data || !parsed?.iv || !parsed?.tag) {
-    throw new Error("Invalid encrypted payload format.");
-  }
+  const parsed = decodePayload(cipherText);
 
   const decipher = createDecipheriv(ALGO, key, Buffer.from(parsed.iv, "base64"));
   decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
@@ -75,4 +85,23 @@ export function encryptJson<T>(value: T, key: Buffer): string {
 
 export function decryptJson<T>(cipherText: string, key: Buffer): T {
   return JSON.parse(decryptString(cipherText, key)) as T;
+}
+
+export function encryptBuffer(plainBuffer: Buffer, key: Buffer): string {
+  const iv = randomBytes(IV_LENGTH);
+  const cipher = createCipheriv(ALGO, key, iv);
+  const encrypted = Buffer.concat([cipher.update(plainBuffer), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return encodePayload(iv, tag, encrypted);
+}
+
+export function decryptBuffer(cipherText: string, key: Buffer): Buffer {
+  const parsed = decodePayload(cipherText);
+  const decipher = createDecipheriv(ALGO, key, Buffer.from(parsed.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
+
+  return Buffer.concat([
+    decipher.update(Buffer.from(parsed.data, "base64")),
+    decipher.final(),
+  ]);
 }

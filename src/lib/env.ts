@@ -27,6 +27,7 @@ const envSchema = z.object({
   GUEST_USERNAME: z.string().default("local-user"),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(25),
+  DATA_DIR: z.string().default("data"),
 });
 
 export const env = envSchema.parse({
@@ -44,4 +45,5 @@ export const env = envSchema.parse({
   GUEST_USERNAME: process.env.GUEST_USERNAME,
   RATE_LIMIT_WINDOW_SECONDS: process.env.RATE_LIMIT_WINDOW_SECONDS,
   RATE_LIMIT_MAX_REQUESTS: process.env.RATE_LIMIT_MAX_REQUESTS,
+  DATA_DIR: process.env.DATA_DIR,
 });

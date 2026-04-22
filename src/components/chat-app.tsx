@@ -1,29 +1,41 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Bot,
   CornerDownLeft,
+  File,
+  FileImage,
+  FileText,
   Globe,
   KeyRound,
   Loader2,
   LogOut,
   MessageSquarePlus,
+  Paperclip,
   Search,
-  Send,
   ShieldCheck,
   Sparkles,
   Trash2,
+  Upload,
+  X,
   ChevronRight,
-  ChevronDown,
   Zap,
   Activity,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
-import type { ChatDetail, ChatListItem, ChatMessage, ModelInfo } from "@/lib/chat-types";
+import type {
+  ChatDetail,
+  ChatListItem,
+  ChatMessage,
+  MessageAttachmentRef,
+  ModelInfo,
+  UploadedAttachment,
+} from "@/lib/chat-types";
+import { decodeUserAttachmentsPayload, encodeUserAttachmentsPayload } from "@/lib/chat-types";
 import { cn } from "@/lib/ui";
 
 type MePayload = {
@@ -64,16 +76,70 @@ function prettyDate(iso: string): string {
   }).format(date);
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function MessageBubble({
   message,
   prettyDate,
+  onAttachmentPreview,
 }: {
   message: ChatMessage;
   prettyDate: (iso: string) => string;
+  onAttachmentPreview: (attachment: MessageAttachmentRef) => void;
 }) {
   const isAssistant = message.role === "assistant";
   const isStreaming = "_isStreaming" in message;
-  const isEmpty = !message.content && !message.reasoning;
+  const userAttachments = message.role === "user" ? decodeUserAttachmentsPayload(message.toolPayload) : [];
+  const displayContent =
+    message.role === "user" && userAttachments.length > 0
+      ? message.content.replace(/\n\nAttached files:[\s\S]*$/, "").trimEnd()
+      : message.content;
+  const isEmpty = !displayContent && !message.reasoning;
+  const showToolPayload = Boolean(message.toolPayload) && !(message.role === "user" && userAttachments.length > 0);
+
+  function renderAttachmentCard(attachment: MessageAttachmentRef) {
+    const isImage = attachment.kind === "image";
+    const Icon =
+      attachment.kind === "image"
+        ? FileImage
+        : attachment.kind === "pdf" || attachment.kind === "document" || attachment.kind === "text"
+          ? FileText
+          : File;
+
+    return (
+      <button
+        key={attachment.id}
+        type="button"
+        onClick={() => onAttachmentPreview(attachment)}
+        className="group overflow-hidden rounded-xl border border-white/15 bg-white/5 text-left transition hover:border-teal-300/50 hover:bg-white/10"
+      >
+        {isImage ? (
+          <div className="h-24 w-24 overflow-hidden bg-slate-900/80">
+            <img
+              src={`/api/uploads/${encodeURIComponent(attachment.id)}`}
+              alt={attachment.fileName}
+              className="h-full w-full object-cover transition group-hover:scale-105"
+            />
+          </div>
+        ) : (
+          <div className="flex h-24 w-44 items-center gap-2 px-3">
+            <Icon className="h-5 w-5 shrink-0 text-teal-200" />
+            <div className="min-w-0">
+              <div className="truncate text-xs font-medium text-slate-100" title={attachment.fileName}>
+                {attachment.fileName}
+              </div>
+              <div className="text-[10px] uppercase tracking-wide text-slate-400">{attachment.kind}</div>
+              <div className="text-[10px] text-slate-500">{formatBytes(attachment.size)}</div>
+            </div>
+          </div>
+        )}
+      </button>
+    );
+  }
 
   return (
     <div
@@ -145,7 +211,11 @@ function MessageBubble({
         </div>
       ) : null}
 
-      {message.content && (
+      {userAttachments.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-2">{userAttachments.map((attachment) => renderAttachmentCard(attachment))}</div>
+      )}
+
+      {displayContent && (
         <div className="mt-1">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
@@ -197,12 +267,12 @@ function MessageBubble({
               },
             }}
           >
-            {message.content}
+            {displayContent}
           </ReactMarkdown>
         </div>
       )}
 
-      {message.toolPayload && (
+      {showToolPayload && (
         <details className="group/details mt-2 overflow-hidden rounded-xl border border-white/10 bg-slate-950/40">
           <summary className="flex cursor-pointer items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-200 transition group-open/details:bg-white/5">
             <ChevronRight className="h-3 w-3 transition-transform group-open/details:rotate-90" />
@@ -240,6 +310,8 @@ function MessageBubble({
 export function ChatApp() {
   const router = useRouter();
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragCounterRef = useRef(0);
 
   const [me, setMe] = useState<MePayload | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -250,7 +322,10 @@ export function ChatApp() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [modelSearch, setModelSearch] = useState("");
-  const [filteredModels, setFilteredModels] = useState<ModelInfo[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<UploadedAttachment[]>([]);
+  const [uploadingAttachments, setUploadingAttachments] = useState(false);
+  const [dropOverlayActive, setDropOverlayActive] = useState(false);
+  const [previewAttachment, setPreviewAttachment] = useState<MessageAttachmentRef | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -326,23 +401,14 @@ export function ChatApp() {
   }, [modelDropdownOpen]);
 
   const displayModels = useMemo(() => {
-    if (filteredModels.length > 0) return filteredModels;
-    return models;
-  }, [models, filteredModels]);
+    const search = modelSearch.trim().toLowerCase();
+    if (!search) return models;
 
-  useEffect(() => {
-    if (!modelSearch.trim()) {
-      setFilteredModels([]);
-      return;
-    }
-
-    const search = modelSearch.toLowerCase();
-    const filtered = models.filter(
+    return models.filter(
       (model) =>
         model.id.toLowerCase().includes(search) ||
         model.displayName.toLowerCase().includes(search),
     );
-    setFilteredModels(filtered);
   }, [modelSearch, models]);
 
   async function reloadChatsAndKeepSelection(chatId?: string) {
@@ -395,14 +461,145 @@ export function ChatApp() {
     }
   }
 
+  const uploadFiles = useCallback(async (files: File[]): Promise<void> => {
+    if (files.length === 0 || uploadingAttachments) return;
+
+    setError(null);
+    setUploadingAttachments(true);
+
+    try {
+      const formData = new FormData();
+      for (const file of files) {
+        formData.append("files", file, file.name);
+      }
+
+      const response = await fetch("/api/uploads", {
+        method: "POST",
+        body: formData,
+      });
+
+      const json = (await response.json().catch(() => ({}))) as {
+        attachments?: UploadedAttachment[];
+        error?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(json.error ?? "Upload failed.");
+      }
+
+      const newItems = json.attachments ?? [];
+      setPendingAttachments((current) => {
+        const merged = [...current, ...newItems];
+        return merged.slice(0, 8);
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed.");
+    } finally {
+      setUploadingAttachments(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  }, [uploadingAttachments]);
+
+  function removeAttachment(attachmentId: string) {
+    setPendingAttachments((current) => current.filter((item) => item.id !== attachmentId));
+  }
+
+  function openAttachmentPreview(attachment: MessageAttachmentRef) {
+    setPreviewAttachment(attachment);
+  }
+
+  function closeAttachmentPreview() {
+    setPreviewAttachment(null);
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setPreviewAttachment(null);
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    function hasFiles(event: DragEvent): boolean {
+      const types = event.dataTransfer?.types;
+      return Boolean(types && Array.from(types).includes("Files"));
+    }
+
+    function onDragEnter(event: DragEvent) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragCounterRef.current += 1;
+      setDropOverlayActive(true);
+    }
+
+    function onDragLeave(event: DragEvent) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+      if (dragCounterRef.current === 0) {
+        setDropOverlayActive(false);
+      }
+    }
+
+    function onDragOver(event: DragEvent) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "copy";
+      }
+    }
+
+    function onDrop(event: DragEvent) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      dragCounterRef.current = 0;
+      setDropOverlayActive(false);
+
+      const droppedFiles = Array.from(event.dataTransfer?.files ?? []);
+      if (droppedFiles.length > 0) {
+        void uploadFiles(droppedFiles);
+      }
+    }
+
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, [uploadFiles]);
+
   async function sendMessage() {
-    if (!activeChat || !messageInput.trim() || sending) return;
+    if (!activeChat || sending) return;
+
+    const text = messageInput.trim();
+    if (!text && pendingAttachments.length === 0) return;
 
     setSending(true);
     setError(null);
 
-    const content = messageInput.trim();
+    const content = text || "Please analyze the attached files.";
+    const attachmentsForSend = [...pendingAttachments];
+    const optimisticAttachmentRefs: MessageAttachmentRef[] = attachmentsForSend.map((item) => ({
+      id: item.id,
+      fileName: item.fileName,
+      mimeType: item.mimeType,
+      size: item.size,
+      kind: item.kind,
+    }));
     setMessageInput("");
+    setPendingAttachments([]);
 
     const tempId = `temp-${Date.now()}`;
 
@@ -410,6 +607,9 @@ export function ChatApp() {
       id: `user-${tempId}`,
       role: "user",
       content,
+      toolPayload: optimisticAttachmentRefs.length
+        ? encodeUserAttachmentsPayload(optimisticAttachmentRefs)
+        : undefined,
       createdAt: new Date().toISOString(),
     };
 
@@ -439,7 +639,10 @@ export function ChatApp() {
       const response = await fetch(`/api/chats/${activeChat.id}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({
+          content,
+          attachments: attachmentsForSend.map((item) => item.id),
+        }),
       });
 
       if (!response.ok) {
@@ -588,6 +791,9 @@ export function ChatApp() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Message failed.");
+      if (attachmentsForSend.length > 0) {
+        setPendingAttachments((current) => [...attachmentsForSend, ...current]);
+      }
       setActiveChat((current) => {
         if (!current) return current;
         return {
@@ -605,6 +811,10 @@ export function ChatApp() {
     router.replace("/login");
   }
 
+  const previewUrl = previewAttachment
+    ? `/api/uploads/${encodeURIComponent(previewAttachment.id)}`
+    : null;
+
   if (loading) {
     return (
       <div className="flex h-screen items-center justify-center">
@@ -617,7 +827,16 @@ export function ChatApp() {
   }
 
   return (
-    <div className="flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5">
+    <div className="relative flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5">
+      {dropOverlayActive && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-slate-950/60 backdrop-blur-sm">
+          <div className="flex items-center gap-2 rounded-full border border-teal-300/80 bg-teal-300/10 px-5 py-3 text-sm font-medium text-teal-100 animate-drop-glow">
+            <Upload className="h-4 w-4" />
+            Drop files anywhere to attach
+          </div>
+        </div>
+      )}
+
       <div className="grid h-full w-full grid-cols-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/60 shadow-[0_30px_80px_rgba(2,6,23,.5)] backdrop-blur xl:grid-cols-[320px_1fr]">
         <aside className="border-b border-white/10 p-4 xl:border-b-0 xl:border-r">
           <div className="mb-4 flex items-center justify-between gap-3">
@@ -695,7 +914,6 @@ export function ChatApp() {
                   onClick={() => {
                     setModelDropdownOpen((prev) => !prev);
                     if (!modelDropdownOpen) {
-                      setFilteredModels([]);
                       setModelSearch("");
                       setTimeout(() => modelSearchRef.current?.focus(), 0);
                     }
@@ -729,7 +947,6 @@ export function ChatApp() {
                             void updateChat({ model: model.id });
                             setModelDropdownOpen(false);
                             setModelSearch("");
-                            setFilteredModels([]);
                           }}
                           className={cn(
                             "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition",
@@ -798,12 +1015,66 @@ export function ChatApp() {
                   key={message.id}
                   message={message}
                   prettyDate={prettyDate}
+                  onAttachmentPreview={openAttachmentPreview}
                 />
               ))}
               <div ref={bottomRef} />
             </div>
 
-            <div className="mt-3 rounded-2xl border border-white/15 bg-slate-900/70 p-2">
+            <div
+              className={cn(
+                "relative mt-3 rounded-2xl border bg-slate-900/70 p-2 transition-all duration-300",
+                "border-white/15",
+              )}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,.pdf,.docx,.odt,.odp,.pptx,.txt,.md,.csv,.json,.xml,.rtf"
+                className="hidden"
+                onChange={(event) => {
+                  const files = Array.from(event.target.files ?? []);
+                  if (files.length > 0) {
+                    void uploadFiles(files);
+                  }
+                }}
+              />
+
+              {pendingAttachments.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-2 px-2 pt-1">
+                  {pendingAttachments.map((attachment) => {
+                    const Icon =
+                      attachment.kind === "image"
+                        ? FileImage
+                        : attachment.kind === "pdf"
+                          ? FileText
+                          : File;
+
+                    return (
+                      <div
+                        key={attachment.id}
+                        className="group inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/8 px-3 py-1 text-xs text-slate-100 animate-chip-in"
+                      >
+                        <Icon className="h-3.5 w-3.5 text-teal-200" />
+                        <span className="max-w-[200px] truncate" title={attachment.fileName}>
+                          {attachment.fileName}
+                        </span>
+                        <span className="text-slate-400">{formatBytes(attachment.size)}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(attachment.id)}
+                          className="rounded-full p-0.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                          aria-label={`Remove ${attachment.fileName}`}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
               <textarea
                 value={messageInput}
                 onChange={(event) => setMessageInput(event.target.value)}
@@ -814,16 +1085,31 @@ export function ChatApp() {
                   }
                 }}
                 rows={3}
-                placeholder="Ask anything. Press Enter to send, Shift+Enter for newline."
+                placeholder="Ask anything, or drop images/docs/PDFs here. Enter sends, Shift+Enter newline."
                 className="w-full resize-none bg-transparent px-2 py-1 text-sm text-slate-100 outline-none"
               />
-              <div className="flex items-center justify-between px-2 pb-1 pt-2">
-                <div className="text-xs text-slate-400">
-                  Tools enabled • Secure storage • {activeChat?.webSearchEnabled ? "Web search on" : "Web search off"}
+              <div className="flex flex-wrap items-center justify-between gap-2 px-2 pb-1 pt-2">
+                <div className="flex items-center gap-2 text-xs text-slate-400">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploadingAttachments || pendingAttachments.length >= 8}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-2 py-1 text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
+                  >
+                    {uploadingAttachments ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Paperclip className="h-3.5 w-3.5" />
+                    )}
+                    Attach
+                  </button>
+                  <span>
+                    Tools enabled • 30-day encrypted files • {activeChat?.webSearchEnabled ? "Web search on" : "Web search off"}
+                  </span>
                 </div>
                 <button
                   onClick={() => void sendMessage()}
-                  disabled={sending || !messageInput.trim()}
+                  disabled={sending || (!messageInput.trim() && pendingAttachments.length === 0)}
                   className="inline-flex items-center gap-2 rounded-xl bg-teal-400 px-3 py-2 text-sm font-semibold text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CornerDownLeft className="h-4 w-4" />}
@@ -840,6 +1126,67 @@ export function ChatApp() {
           </div>
         </main>
       </div>
+
+      {previewAttachment && previewUrl && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur"
+          onClick={closeAttachmentPreview}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Attachment preview"
+        >
+          <div
+            className="max-h-[92vh] w-full max-w-5xl overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-slate-100">{previewAttachment.fileName}</div>
+                <div className="text-xs text-slate-400">{previewAttachment.mimeType} • {formatBytes(previewAttachment.size)}</div>
+              </div>
+              <button
+                type="button"
+                onClick={closeAttachmentPreview}
+                className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-300 transition hover:bg-white/10 hover:text-white"
+                aria-label="Close preview"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="max-h-[calc(92vh-64px)] overflow-auto bg-slate-950 p-3">
+              {previewAttachment.kind === "image" ? (
+                <img
+                  src={previewUrl}
+                  alt={previewAttachment.fileName}
+                  className="mx-auto max-h-[calc(92vh-96px)] w-auto max-w-full rounded-lg"
+                />
+              ) : previewAttachment.kind === "pdf" ? (
+                <iframe
+                  src={previewUrl}
+                  className="h-[78vh] w-full rounded-lg border border-white/10 bg-white"
+                  title={previewAttachment.fileName}
+                />
+              ) : (
+                <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 text-center">
+                  <File className="h-10 w-10 text-teal-200" />
+                  <p className="max-w-lg text-sm text-slate-300">
+                    This file type cannot be previewed inline. Open it in a new tab.
+                  </p>
+                  <a
+                    href={previewUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center rounded-lg border border-teal-300/60 bg-teal-300/10 px-3 py-2 text-sm font-medium text-teal-100 transition hover:bg-teal-300/20"
+                  >
+                    Open file
+                  </a>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

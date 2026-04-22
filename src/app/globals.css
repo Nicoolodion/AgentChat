@@ -40,3 +40,21 @@ body {
 .animated-title {
   animation: title-fade-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
+
+@keyframes drop-glow {
+  0% { opacity: 0.45; transform: scale(0.99); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes chip-in {
+  0% { opacity: 0; transform: translateY(4px) scale(0.96); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.animate-drop-glow {
+  animation: drop-glow 160ms ease-out both;
+}
+
+.animate-chip-in {
+  animation: chip-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
