@@ -15,6 +15,7 @@ import {
   LogOut,
   MessageSquarePlus,
   Paperclip,
+  RefreshCw,
   Search,
   ShieldCheck,
   Sparkles,
@@ -86,10 +87,16 @@ function MessageBubble({
   message,
   prettyDate,
   onAttachmentPreview,
+  isNewest,
+  activeModelContextLength,
+  onReroll,
 }: {
   message: ChatMessage;
   prettyDate: (iso: string) => string;
   onAttachmentPreview: (attachment: MessageAttachmentRef) => void;
+  isNewest: boolean;
+  activeModelContextLength?: number;
+  onReroll?: () => void;
 }) {
   const isAssistant = message.role === "assistant";
   const isStreaming = "_isStreaming" in message;
@@ -294,6 +301,29 @@ function MessageBubble({
           {message.providerModel && (
             <span className="font-mono">{message.providerModel}</span>
           )}
+        </div>
+      )}
+
+      {isNewest && message.role === "assistant" && !isStreaming && activeModelContextLength && (
+        <div className="mt-2 flex items-center gap-2 border-t border-white/5 pt-2 text-[10px] text-slate-500">
+          <span className="font-mono">
+            {(message.usagePromptTokens ?? 0) + (message.usageCompletionTokens ?? 0)}k / {Math.round(activeModelContextLength / 1000)}k
+          </span>
+          <span className="text-slate-600">context used</span>
+        </div>
+      )}
+
+      {!isStreaming && message.role === "assistant" && onReroll && (
+        <div className="mt-2 flex items-center justify-end">
+          <button
+            type="button"
+            onClick={onReroll}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 transition hover:bg-white/10 hover:text-white"
+            title="Regenerate response"
+          >
+            <RefreshCw className="h-3 w-3" />
+            Reroll
+          </button>
         </div>
       )}
 
@@ -599,7 +629,7 @@ export function ChatApp() {
       kind: item.kind,
     }));
     setMessageInput("");
-    setPendingAttachments([]);
+    // NOTE: We do NOT clear pendingAttachments here to keep files in context for the next message
 
     const tempId = `temp-${Date.now()}`;
 
@@ -811,6 +841,225 @@ export function ChatApp() {
     router.replace("/login");
   }
 
+  async function handleReroll(assistantMessageIndex: number) {
+    if (!activeChat || sending) return;
+
+    const messages = activeChat.messages;
+    const assistantMsg = messages[assistantMessageIndex];
+    if (!assistantMsg || assistantMsg.role !== "assistant") return;
+
+    // Find the preceding user message
+    let userMsgIndex = -1;
+    for (let i = assistantMessageIndex - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        userMsgIndex = i;
+        break;
+      }
+    }
+    if (userMsgIndex === -1) return;
+
+    const userMsg = messages[userMsgIndex];
+
+    // Extract attachment refs from user's toolPayload if any
+    const userAttachments = decodeUserAttachmentsPayload(userMsg.toolPayload);
+    const attachmentIds = userAttachments.map((a) => a.id);
+
+    // Remove the assistant message optimistically
+    setActiveChat((current) => {
+      if (!current) return current;
+      const newMessages = current.messages.filter((_, idx) => idx !== assistantMessageIndex);
+      return { ...current, messages: newMessages };
+    });
+
+    // Delete the assistant message from server
+    try {
+      await apiFetch(`/api/chats/${activeChat.id}/messages/${assistantMsg.id}`, {
+        method: "DELETE",
+      });
+    } catch {
+      // Continue even if delete fails
+    }
+
+    setSending(true);
+    setError(null);
+
+    const tempId = `temp-${Date.now()}`;
+    const tempAsstMsg: ChatMessage & { _isStreaming: true } = {
+      id: tempId,
+      role: "assistant",
+      content: "",
+      createdAt: new Date().toISOString(),
+      _isStreaming: true,
+    };
+
+    setActiveChat((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        messages: [...current.messages, tempAsstMsg],
+      };
+    });
+
+    let ttftMsVal: number | undefined;
+    let liveTokensPerSec: number | undefined;
+    let totalTokens = 0;
+    let streamingStarted = false;
+    let streamStartTime = Date.now();
+
+    try {
+      const response = await fetch(`/api/chats/${activeChat.id}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: userMsg.content.replace(/\n\nAttached files:[\s\S]*$/, "").trimEnd(),
+          attachments: attachmentIds,
+        }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error((errData as { error?: string }).error ?? "Request failed");
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const lines = part.split("\n");
+          let eventType = "data";
+          let dataStr = "";
+
+          for (const line of lines) {
+            if (line.startsWith("event: ")) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              dataStr += line.slice(6) + "\n";
+            }
+          }
+
+          if (!dataStr.trim()) continue;
+
+          try {
+            const data = JSON.parse(dataStr.trim());
+
+            if (eventType === "ttft" && !streamingStarted) {
+              ttftMsVal = data.ttftMs;
+              streamingStarted = true;
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                msgs[lastIdx] = {
+                  ...msgs[lastIdx]!,
+                  content: "",
+                  ttftMs: data.ttftMs,
+                  _isStreaming: true,
+                };
+                return { ...current, messages: msgs };
+              });
+              continue;
+            }
+
+            if (eventType === "content" && data.text) {
+              totalTokens += data.text.length;
+              if (!streamingStarted) {
+                streamingStarted = true;
+                streamStartTime = Date.now();
+                if (ttftMsVal) {
+                  totalTokens = 1;
+                }
+              }
+
+              const elapsedSec = (Date.now() - streamStartTime) / 1000;
+              liveTokensPerSec = totalTokens / Math.max(elapsedSec, 0.1);
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                if (msgs[lastIdx]) {
+                  msgs[lastIdx] = {
+                    ...msgs[lastIdx]!,
+                    content: (msgs[lastIdx] as ChatMessage).content + data.text,
+                    avgTokensPerSecond: liveTokensPerSec,
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "reasoning" && data.text) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                if (msgs[lastIdx]) {
+                  const existingReasoning = (msgs[lastIdx] as ChatMessage).reasoning ?? "";
+                  msgs[lastIdx] = {
+                    ...msgs[lastIdx]!,
+                    reasoning: existingReasoning + data.text,
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "done") {
+              const assistantMsg = data.assistantMessage as ChatMessage;
+              const finalAvgTokensPerSecond = (assistantMsg.usageCompletionTokens && data.meta?.ttftMs)
+                ? assistantMsg.usageCompletionTokens / Math.max((Date.now() - streamStartTime) / 1000, 0.1)
+                : data.meta?.avgTokensPerSecond;
+
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const storedMsg = {
+                  ...assistantMsg,
+                  ttftMs: data.meta?.ttftMs ?? assistantMsg.ttftMs,
+                  avgTokensPerSecond: data.meta?.avgTokensPerSecond ?? finalAvgTokensPerSecond,
+                };
+                msgs[msgs.length - 1] = storedMsg;
+                return { ...current, messages: msgs };
+              });
+
+              await reloadChatsAndKeepSelection(activeChat.id);
+            }
+
+            if (eventType === "error") {
+              setError(data.message ?? "Streaming error occurred.");
+            }
+          } catch (parseErr) {
+            console.warn("Failed to parse SSE data:", dataStr, parseErr);
+          }
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reroll failed.");
+      setActiveChat((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          messages: current.messages.filter((m) => !m.id.startsWith("temp-")),
+        };
+      });
+    } finally {
+      setSending(false);
+    }
+  }
+
   const previewUrl = previewAttachment
     ? `/api/uploads/${encodeURIComponent(previewAttachment.id)}`
     : null;
@@ -1010,12 +1259,15 @@ export function ChatApp() {
 
           <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
             <div className="flex-1 space-y-3 overflow-y-auto">
-              {activeChat?.messages.map((message) => (
+              {activeChat?.messages.map((message, index) => (
                 <MessageBubble
                   key={message.id}
                   message={message}
                   prettyDate={prettyDate}
                   onAttachmentPreview={openAttachmentPreview}
+                  isNewest={index === activeChat.messages.length - 1}
+                  activeModelContextLength={activeModelInfo?.contextLength}
+                  onReroll={message.role === "assistant" && !message._isStreaming ? () => handleReroll(index) : undefined}
                 />
               ))}
               <div ref={bottomRef} />

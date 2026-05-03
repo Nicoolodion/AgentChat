@@ -200,6 +200,16 @@ export async function getChatByIdForUser(userId: string, chatId: string): Promis
   return prisma.chat.findFirst({ where: { id: chatId, userId } });
 }
 
+export async function deleteMessageForUser(userId: string, chatId: string, messageId: string): Promise<boolean> {
+  const message = await prisma.message.findFirst({
+    where: { id: messageId, chatId, chat: { userId } },
+  });
+  if (!message) return false;
+
+  await prisma.message.delete({ where: { id: messageId } });
+  return true;
+}
+
 export async function getConversationForModel(input: {
   userId: string;
   chatId: string;
