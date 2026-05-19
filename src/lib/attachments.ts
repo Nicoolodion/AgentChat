@@ -230,7 +230,7 @@ async function analyzePdf(buffer: Buffer): Promise<PdfAnalysis> {
     disableWorker: true,
     isEvalSupported: false,
     useWorkerFetch: false,
-  });
+  } as unknown as ArrayBuffer);
 
   const doc = await loadingTask.promise;
   const images: Array<{ label: string; mimeType: string; buffer: Buffer }> = [];
@@ -259,7 +259,7 @@ async function analyzePdf(buffer: Buffer): Promise<PdfAnalysis> {
       await page.render({
         canvasContext: context as unknown as CanvasRenderingContext2D,
         viewport,
-      }).promise;
+      } as unknown as Parameters<typeof page.render>[0]).promise;
 
       images.push({
         label: `Page ${pageIndex}`,

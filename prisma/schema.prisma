@@ -7,16 +7,17 @@ datasource db {
 }
 
 model User {
-  id                String    @id @default(cuid())
-  username          String    @unique
+  id                String          @id @default(cuid())
+  username          String          @unique
   passwordHash      String
   keyDerivationSalt String
   wrappedUserKey    String
-  isSystem          Boolean   @default(false)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  isSystem          Boolean         @default(false)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
   sessions          Session[]
   chats             Chat[]
+  agentSessions     AgentSession[]
 }
 
 model Session {
@@ -34,15 +35,16 @@ model Session {
 }
 
 model Chat {
-  id                String    @id @default(cuid())
+  id                String          @id @default(cuid())
   userId            String
   encryptedTitle    String
   model             String
-  webSearchEnabled  Boolean   @default(false)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  webSearchEnabled  Boolean         @default(false)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages          Message[]
+  agentSession      AgentSession?
 
   @@index([userId, updatedAt])
 }
@@ -63,4 +65,59 @@ model Message {
   chat                  Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
 
   @@index([chatId, createdAt])
+}
+
+model AgentSession {
+  id             String          @id @default(cuid())
+  chatId         String          @unique
+  userId         String
+  status         String          // "idle" | "thinking" | "executing" | "completed" | "error"
+  workspacePath  String
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  completedAt    DateTime?
+  errorMessage   String?
+
+  chat           Chat            @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  toolCalls      AgentToolCall[]
+  artifacts      AgentArtifact[]
+
+  @@index([userId])
+  @@index([chatId])
+  @@index([status])
+}
+
+model AgentToolCall {
+  id          String   @id @default(cuid())
+  sessionId   String
+  toolName    String
+  arguments   String   // JSON string
+  result      String?  // JSON string
+  error       String?
+  durationMs  Int?
+  status      String   // "pending" | "running" | "success" | "error"
+  createdAt   DateTime @default(now())
+  completedAt DateTime?
+
+  session     AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([createdAt])
+}
+
+model AgentArtifact {
+  id          String   @id @default(cuid())
+  sessionId   String
+  fileName    String
+  mimeType    String
+  size        Int      // bytes
+  kind        String   // "document" | "pdf" | "image" | "code" | "spreadsheet" | "presentation" | "archive" | "other"
+  storagePath String   // Relative path within workspace
+  description String?
+  createdAt   DateTime @default(now())
+
+  session     AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
 }

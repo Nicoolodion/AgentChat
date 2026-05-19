@@ -18,10 +18,15 @@ import {
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
 import { streamCompletionWithCallbacks, generateChatTitle } from "@/lib/nanogpt";
+import { prisma } from "@/lib/prisma";
+import { runAgentExecution } from "@/lib/agent/orchestrator";
+import type { AgentSseEvent } from "@/lib/agent/types";
+import { sandboxCreateWorkspace } from "@/lib/agent/sandbox";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
   attachments: z.array(z.string().min(16).max(64)).max(8).optional(),
+  agentEnabled: z.boolean().optional(),
 });
 
 const encoder = new TextEncoder();
@@ -49,6 +54,18 @@ export async function POST(
     const chat = await getChatByIdForUser(auth.userId, chatId);
     if (!chat) {
       return NextResponse.json({ error: "Chat not found" }, { status: 404 });
+    }
+
+    // ── Agent Mode Routing ─────────────────────────────────────────────────
+    if (parsed.data.agentEnabled) {
+      return handleAgentMessage({
+        request,
+        auth,
+        chat,
+        chatId,
+        content: parsed.data.content,
+        attachments: parsed.data.attachments ?? [],
+      });
     }
 
     let preparedAttachments = [];
@@ -233,4 +250,140 @@ export async function POST(
       { status: 500 },
     );
   }
+}
+
+// ── Agent Mode Handler ───────────────────────────────────────────────────────
+
+async function handleAgentMessage(input: {
+  request: Request;
+  auth: { userId: string; userKey: Buffer };
+  chat: { id: string; userId: string; model: string; webSearchEnabled: boolean };
+  chatId: string;
+  content: string;
+  attachments: string[];
+}) {
+  const { auth, chat, chatId, content, attachments } = input;
+
+  // Find or create agent session
+  let agentSession = await prisma.agentSession.findUnique({
+    where: { chatId },
+  });
+
+  if (!agentSession || ["completed", "error"].includes(agentSession.status)) {
+    agentSession = await prisma.agentSession.create({
+      data: {
+        chatId,
+        userId: auth.userId,
+        status: "idle",
+        workspacePath: `/workspace/${chatId}`,
+      },
+    });
+  }
+
+  const sessionId = agentSession.id;
+
+  // Ensure workspace directories exist in sandbox
+  try {
+    await sandboxCreateWorkspace(sessionId);
+  } catch (err) {
+    console.error("[Agent] Failed to create workspace:", err);
+  }
+
+  // Persist user message
+  await appendMessageToChat({
+    chatId: chat.id,
+    role: "user",
+    content,
+    userKey: auth.userKey,
+  });
+
+  const priorConversation = await getConversationForModel({
+    userId: auth.userId,
+    chatId: chat.id,
+    userKey: auth.userKey,
+    maxMessages: 30,
+  });
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
+
+      try {
+        completionResult = await runAgentExecution({
+          sessionId,
+          userMessage: content,
+          priorConversation,
+          model: chat.model,
+          sendEvent: (event: AgentSseEvent) => {
+            sendSseEvent(controller, event.type, event.data);
+          },
+        });
+      } catch (error) {
+        console.error("[Agent Execution Error]", error);
+        const errMsg = error instanceof Error ? error.message : "Agent execution failed";
+        sendSseEvent(controller, "error", { message: errMsg });
+        sendSseEvent(controller, "done", {
+          session: { ...agentSession!, status: "error" },
+          artifacts: [],
+          meta: { totalToolCalls: 0, totalDurationMs: 0 },
+        });
+        controller.close();
+        return;
+      }
+
+      // Persist assistant message
+      let assistantMessage;
+      try {
+        assistantMessage = await appendMessageToChat({
+          chatId: chat.id,
+          role: "assistant",
+          content: completionResult.content,
+          reasoning: completionResult.reasoning,
+          userKey: auth.userKey,
+        });
+      } catch (dbError) {
+        console.error("[DB Write Error]", dbError);
+        sendSseEvent(controller, "error", { message: "Failed to save response." });
+      }
+
+      const artifacts = await prisma.agentArtifact.findMany({
+        where: { sessionId },
+      });
+
+      const updatedSession = await prisma.agentSession.findUnique({
+        where: { id: sessionId },
+      });
+
+      sendSseEvent(controller, "done", {
+        session: updatedSession,
+        artifacts: artifacts.map((a) => ({
+          id: a.id,
+          sessionId: a.sessionId,
+          fileName: a.fileName,
+          mimeType: a.mimeType,
+          size: a.size,
+          kind: a.kind,
+          storagePath: a.storagePath,
+          description: a.description ?? undefined,
+          createdAt: a.createdAt.toISOString(),
+        })),
+        meta: {
+          totalToolCalls: completionResult.toolCallsCount,
+          totalDurationMs: 0,
+        },
+        assistantMessage: assistantMessage ?? undefined,
+      });
+
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }

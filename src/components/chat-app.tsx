@@ -25,8 +25,17 @@ import {
   ChevronRight,
   Zap,
   Activity,
+  Menu,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
+
+import {
+  AgentModeToggle,
+  AgentProgressBar,
+  AgentMessageBadge,
+  AgentSidebar,
+  useAgent,
+} from "@/components/agent";
 
 import type {
   ChatDetail,
@@ -358,6 +367,8 @@ export function ChatApp() {
   const [previewAttachment, setPreviewAttachment] = useState<MessageAttachmentRef | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
 
+  const agent = useAgent(activeChat?.id);
+
   useEffect(() => {
     if (activeChat?.messages.length) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -672,6 +683,7 @@ export function ChatApp() {
         body: JSON.stringify({
           content,
           attachments: attachmentsForSend.map((item) => item.id),
+          agentEnabled: agent.isAgentMode,
         }),
       });
 
@@ -777,22 +789,35 @@ export function ChatApp() {
             }
 
             if (eventType === "done") {
-              const assistantMsg = data.assistantMessage as ChatMessage;
-              const finalAvgTokensPerSecond = (assistantMsg.usageCompletionTokens && data.meta?.ttftMs)
+              const assistantMsg = (data.assistantMessage ?? data.assistantMessage) as ChatMessage | undefined;
+              const finalAvgTokensPerSecond = (assistantMsg?.usageCompletionTokens && data.meta?.ttftMs)
                 ? assistantMsg.usageCompletionTokens / Math.max((Date.now() - streamStartTime) / 1000, 0.1)
                 : data.meta?.avgTokensPerSecond;
 
-              setActiveChat((current) => {
-                if (!current) return current;
-                const msgs = [...current.messages];
-                const storedMsg = {
-                  ...assistantMsg,
-                  ttftMs: data.meta?.ttftMs ?? assistantMsg.ttftMs,
-                  avgTokensPerSecond: data.meta?.avgTokensPerSecond ?? finalAvgTokensPerSecond,
-                };
-                msgs[msgs.length - 1] = storedMsg;
-                return { ...current, messages: msgs };
-              });
+              if (assistantMsg) {
+                setActiveChat((current) => {
+                  if (!current) return current;
+                  const msgs = [...current.messages];
+                  const storedMsg = {
+                    ...assistantMsg,
+                    ttftMs: data.meta?.ttftMs ?? assistantMsg.ttftMs,
+                    avgTokensPerSecond: data.meta?.avgTokensPerSecond ?? finalAvgTokensPerSecond,
+                  };
+                  msgs[msgs.length - 1] = storedMsg;
+                  return { ...current, messages: msgs };
+                });
+              } else {
+                // Agent mode: finalize the streaming message without server-returned assistantMessage
+                setActiveChat((current) => {
+                  if (!current) return current;
+                  const msgs = [...current.messages];
+                  const last = msgs[msgs.length - 1];
+                  if (last && last._isStreaming) {
+                    msgs[msgs.length - 1] = { ...last, _isStreaming: false };
+                  }
+                  return { ...current, messages: msgs };
+                });
+              }
 
               if (data.title) {
                 setChats((prev) =>
@@ -1086,7 +1111,10 @@ export function ChatApp() {
         </div>
       )}
 
-      <div className="grid h-full w-full grid-cols-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/60 shadow-[0_30px_80px_rgba(2,6,23,.5)] backdrop-blur xl:grid-cols-[320px_1fr]">
+      <div className={cn(
+        "grid h-full w-full grid-cols-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/60 shadow-[0_30px_80px_rgba(2,6,23,.5)] backdrop-blur",
+        agent.isAgentMode && agent.sidebarOpen ? "xl:grid-cols-[320px_1fr_360px]" : "xl:grid-cols-[320px_1fr]"
+      )}>
         <aside className="border-b border-white/10 p-4 xl:border-b-0 xl:border-r">
           <div className="mb-4 flex items-center justify-between gap-3">
             <div>
@@ -1241,6 +1269,12 @@ export function ChatApp() {
                 {activeChat?.webSearchEnabled ? <Globe className="h-4 w-4" /> : <Search className="h-4 w-4" />}
                 Web Search
               </button>
+
+              <AgentModeToggle
+                isOn={agent.isAgentMode}
+                isInitializing={agent.isInitializing}
+                onToggle={() => void agent.toggleAgentMode()}
+              />
             </div>
 
             <div className="flex items-center gap-2">
@@ -1256,6 +1290,8 @@ export function ChatApp() {
               </button>
             </div>
           </div>
+
+          <AgentProgressBar visible={agent.isAgentMode && agent.isExecuting} />
 
           <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
             <div className="flex-1 space-y-3 overflow-y-auto">
@@ -1337,7 +1373,11 @@ export function ChatApp() {
                   }
                 }}
                 rows={3}
-                placeholder="Ask anything, or drop images/docs/PDFs here. Enter sends, Shift+Enter newline."
+                placeholder={
+                  agent.isAgentMode
+                    ? "Ask the agent to create documents, analyze files, write code, search the web..."
+                    : "Ask anything, or drop images/docs/PDFs here. Enter sends, Shift+Enter newline."
+                }
                 className="w-full resize-none bg-transparent px-2 py-1 text-sm text-slate-100 outline-none"
               />
               <div className="flex flex-wrap items-center justify-between gap-2 px-2 pb-1 pt-2">
@@ -1356,7 +1396,7 @@ export function ChatApp() {
                     Attach
                   </button>
                   <span>
-                    Tools enabled • 30-day encrypted files • {activeChat?.webSearchEnabled ? "Web search on" : "Web search off"}
+                    {agent.isAgentMode ? "Agent mode active" : "Tools enabled"} • 30-day encrypted files • {activeChat?.webSearchEnabled ? "Web search on" : "Web search off"}
                   </span>
                 </div>
                 <button
@@ -1364,8 +1404,8 @@ export function ChatApp() {
                   disabled={sending || (!messageInput.trim() && pendingAttachments.length === 0)}
                   className="inline-flex items-center gap-2 rounded-xl bg-teal-400 px-3 py-2 text-sm font-semibold text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <CornerDownLeft className="h-4 w-4" />}
-                  Send
+                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : agent.isAgentMode ? <Bot className="h-4 w-4" /> : <CornerDownLeft className="h-4 w-4" />}
+                  {agent.isAgentMode ? "Run Agent" : "Send"}
                 </button>
               </div>
             </div>
@@ -1377,6 +1417,20 @@ export function ChatApp() {
             ) : null}
           </div>
         </main>
+
+        {agent.isAgentMode && agent.agentSession && (
+          <AgentSidebar
+            open={agent.sidebarOpen}
+            onClose={agent.closeSidebar}
+            activeTab={agent.activeTab}
+            onSetTab={agent.setActiveTab}
+            sessionId={agent.agentSession.id}
+            terminalEntries={agent.terminalEntries}
+            isExecuting={agent.isExecuting}
+            artifacts={agent.artifacts}
+            onClearTerminal={agent.clearTerminal}
+          />
+        )}
       </div>
 
       {previewAttachment && previewUrl && (

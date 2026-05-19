@@ -25,7 +25,7 @@ export async function GET(
       attachmentId,
     });
 
-    return new NextResponse(bytes, {
+    return new NextResponse(bytes.buffer as ArrayBuffer, {
       headers: {
         "Content-Type": meta.mimeType || "application/octet-stream",
         "Content-Length": String(bytes.length),

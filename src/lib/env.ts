@@ -28,6 +28,10 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(25),
   DATA_DIR: z.string().default("data"),
+  // Agent configuration
+  AGENT_ENABLED: boolLike.default(true),
+  AGENT_SANDBOX_URL: z.string().default("http://127.0.0.1:18080"),
+  AGENT_MAX_TOOL_CALLS: z.coerce.number().int().positive().default(20),
 });
 
 export const env = envSchema.parse({
@@ -46,4 +50,7 @@ export const env = envSchema.parse({
   RATE_LIMIT_WINDOW_SECONDS: process.env.RATE_LIMIT_WINDOW_SECONDS,
   RATE_LIMIT_MAX_REQUESTS: process.env.RATE_LIMIT_MAX_REQUESTS,
   DATA_DIR: process.env.DATA_DIR,
+  AGENT_ENABLED: process.env.AGENT_ENABLED,
+  AGENT_SANDBOX_URL: process.env.AGENT_SANDBOX_URL,
+  AGENT_MAX_TOOL_CALLS: process.env.AGENT_MAX_TOOL_CALLS,
 });

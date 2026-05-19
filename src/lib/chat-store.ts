@@ -81,7 +81,15 @@ export async function listChatsForUser(userId: string, userKey: Buffer): Promise
     },
   });
 
-  return chats.map((chat) => chatToListItem(chat, userKey));
+  return chats
+    .map((chat) => {
+      try {
+        return chatToListItem(chat, userKey);
+      } catch {
+        return null;
+      }
+    })
+    .filter((c): c is ChatListItem => c !== null);
 }
 
 export async function getChatDetailForUser(
@@ -107,7 +115,15 @@ export async function getChatDetailForUser(
     webSearchEnabled: chat.webSearchEnabled,
     createdAt: chat.createdAt.toISOString(),
     updatedAt: chat.updatedAt.toISOString(),
-    messages: chat.messages.map((msg) => decryptMessage(msg, userKey)),
+    messages: chat.messages
+      .map((msg) => {
+        try {
+          return decryptMessage(msg, userKey);
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is ChatMessage => m !== null),
   };
 }
 
@@ -198,6 +214,13 @@ export async function appendMessageToChat(input: {
 
 export async function getChatByIdForUser(userId: string, chatId: string): Promise<Chat | null> {
   return prisma.chat.findFirst({ where: { id: chatId, userId } });
+}
+
+export async function getChatWithAgentSessionByIdForUser(userId: string, chatId: string): Promise<(Chat & { agentSession: { id: string; status: string } | null }) | null> {
+  return prisma.chat.findFirst({
+    where: { id: chatId, userId },
+    include: { agentSession: { select: { id: true, status: true } } },
+  });
 }
 
 export async function deleteMessageForUser(userId: string, chatId: string, messageId: string): Promise<boolean> {

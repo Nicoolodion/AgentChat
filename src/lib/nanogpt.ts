@@ -26,7 +26,7 @@ function countWords(str: string): number {
     .filter((w) => w.length > 0).length;
 }
 
-const nanoClient = new OpenAI({
+export const nanoClient = new OpenAI({
   apiKey: env.NANOGPT_API_KEY ?? "missing",
   baseURL: env.NANOGPT_BASE_URL,
 });
