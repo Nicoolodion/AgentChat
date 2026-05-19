@@ -8,6 +8,7 @@ import {
 } from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
 import {
+  type ChatToolCall,
   type MessageAttachmentRef,
   encodeUserAttachmentsPayload,
 } from "@/lib/chat-types";
@@ -21,7 +22,8 @@ import { streamCompletionWithCallbacks, generateChatTitle } from "@/lib/nanogpt"
 import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
-import { sandboxCreateWorkspace } from "@/lib/agent/sandbox";
+import { sandboxCreateWorkspace, sandboxFileWrite } from "@/lib/agent/sandbox";
+import { getAttachmentForUser } from "@/lib/attachments";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
@@ -56,8 +58,28 @@ export async function POST(
       return NextResponse.json({ error: "Chat not found" }, { status: 404 });
     }
 
+    // ── Mode Locking ────────────────────────────────────────────────────────
+    // If the chat has messages, the mode is already locked. Respect it.
+    // If this is the first message, lock the mode to whatever the client sent.
+    const messageCount = await prisma.message.count({
+      where: { chatId: chat.id },
+    });
+
+    let agentEnabled = parsed.data.agentEnabled ?? false;
+
+    if (chat.agentModeLocked !== null) {
+      // Chat is already locked — respect the stored mode
+      agentEnabled = chat.agentModeLocked;
+    } else if (messageCount === 0) {
+      // First message — lock the mode
+      await prisma.chat.update({
+        where: { id: chat.id },
+        data: { agentModeLocked: agentEnabled },
+      });
+    }
+
     // ── Agent Mode Routing ─────────────────────────────────────────────────
-    if (parsed.data.agentEnabled) {
+    if (agentEnabled) {
       return handleAgentMessage({
         request,
         auth,
@@ -264,21 +286,21 @@ async function handleAgentMessage(input: {
 }) {
   const { auth, chat, chatId, content, attachments } = input;
 
-  // Find or create agent session
-  let agentSession = await prisma.agentSession.findUnique({
+  // Find or create/reset agent session (upsert avoids unique constraint violation on chatId)
+  const agentSession = await prisma.agentSession.upsert({
     where: { chatId },
+    create: {
+      chatId,
+      userId: auth.userId,
+      status: "idle",
+      workspacePath: `/workspace/${chatId}`,
+    },
+    update: {
+      status: "idle",
+      errorMessage: null,
+      completedAt: null,
+    },
   });
-
-  if (!agentSession || ["completed", "error"].includes(agentSession.status)) {
-    agentSession = await prisma.agentSession.create({
-      data: {
-        chatId,
-        userId: auth.userId,
-        status: "idle",
-        workspacePath: `/workspace/${chatId}`,
-      },
-    });
-  }
 
   const sessionId = agentSession.id;
 
@@ -289,11 +311,39 @@ async function handleAgentMessage(input: {
     console.error("[Agent] Failed to create workspace:", err);
   }
 
-  // Persist user message
+  // ── Copy user attachments into agent workspace upload/ ──────────────────
+  const attachmentRefs: MessageAttachmentRef[] = [];
+  for (const attachmentId of attachments) {
+    try {
+      const { meta, bytes } = await getAttachmentForUser({
+        userId: auth.userId,
+        userKey: auth.userKey,
+        attachmentId,
+      });
+      const destPath = `upload/${meta.fileName}`;
+      // Write to sandbox
+      await sandboxFileWrite(sessionId, destPath, bytes.toString("base64"), "base64");
+
+      attachmentRefs.push({
+        id: meta.id,
+        fileName: meta.fileName,
+        mimeType: meta.mimeType,
+        size: meta.size,
+        kind: meta.kind,
+      });
+    } catch (err) {
+      console.warn("[Agent] Failed to copy attachment to workspace:", attachmentId, err);
+    }
+  }
+
+  // Persist user message (with attachment refs so the UI can render them)
   await appendMessageToChat({
     chatId: chat.id,
     role: "user",
     content,
+    toolPayload: attachmentRefs.length
+      ? encodeUserAttachmentsPayload(attachmentRefs)
+      : undefined,
     userKey: auth.userKey,
   });
 
@@ -306,7 +356,43 @@ async function handleAgentMessage(input: {
 
   const stream = new ReadableStream({
     async start(controller) {
+      const toolCallMap = new Map<string, ChatToolCall>();
       let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
+
+      // wrap sendEvent to intercept tool_start / tool_done and build ChatToolCalls
+      const wrappedSendEvent = (event: AgentSseEvent) => {
+        if (event.type === "tool_start") {
+          const d = event.data as { toolCallId?: string; toolName?: string };
+          const toolCallId = d.toolCallId ?? `tc-${Date.now()}`;
+          toolCallMap.set(toolCallId, {
+            toolCallId,
+            toolName: d.toolName ?? "unknown",
+            status: "running",
+          });
+        }
+        if (event.type === "tool_done") {
+          const d = event.data as {
+            toolCallId?: string;
+            toolName?: string;
+            ok?: boolean;
+            durationMs?: number;
+          };
+          const toolCallId = d.toolCallId ?? "";
+          const existing = toolCallMap.get(toolCallId);
+          if (existing) {
+            existing.status = d.ok ? "success" : "error";
+            existing.durationMs = d.durationMs;
+          } else {
+            toolCallMap.set(toolCallId, {
+              toolCallId,
+              toolName: d.toolName ?? "unknown",
+              status: d.ok ? "success" : "error",
+              durationMs: d.durationMs,
+            });
+          }
+        }
+        sendSseEvent(controller, event.type, event.data);
+      };
 
       try {
         completionResult = await runAgentExecution({
@@ -314,9 +400,7 @@ async function handleAgentMessage(input: {
           userMessage: content,
           priorConversation,
           model: chat.model,
-          sendEvent: (event: AgentSseEvent) => {
-            sendSseEvent(controller, event.type, event.data);
-          },
+          sendEvent: wrappedSendEvent,
         });
       } catch (error) {
         console.error("[Agent Execution Error]", error);
@@ -331,14 +415,16 @@ async function handleAgentMessage(input: {
         return;
       }
 
-      // Persist assistant message
+      // Persist assistant message with toolCalls
       let assistantMessage;
+      const finalToolCalls = Array.from(toolCallMap.values());
       try {
         assistantMessage = await appendMessageToChat({
           chatId: chat.id,
           role: "assistant",
           content: completionResult.content,
           reasoning: completionResult.reasoning,
+          toolCalls: finalToolCalls.length ? finalToolCalls : undefined,
           userKey: auth.userKey,
         });
       } catch (dbError) {

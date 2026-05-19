@@ -40,6 +40,7 @@ model Chat {
   encryptedTitle    String
   model             String
   webSearchEnabled  Boolean         @default(false)
+  agentModeLocked   Boolean?        // true = agent, false = normal, null = undecided
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
   user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -56,6 +57,7 @@ model Message {
   encryptedContent      String
   encryptedReasoning    String?
   encryptedToolPayload  String?
+  encryptedToolCalls    String?  // JSON array of ChatToolCall[]
   usagePromptTokens     Int?
   usageCompletionTokens Int?
   providerModel         String?

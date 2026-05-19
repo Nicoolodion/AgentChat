@@ -40,7 +40,15 @@ export async function GET(
       return NextResponse.json({ error: "Invalid path" }, { status: 400 });
     }
 
-    const files = await sandboxFileList(sessionId, path);
+    const rawFiles = await sandboxFileList(sessionId, path);
+    const files = rawFiles.map((f) => ({
+      name: f.name,
+      path: f.path,
+      isDirectory: f.is_directory,
+      size: f.size,
+      mimeType: f.mime_type,
+      modifiedAt: f.modified_at,
+    }));
     return NextResponse.json({ files });
   } catch (error) {
     console.error("[Agent Files GET Error]", error);

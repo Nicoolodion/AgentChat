@@ -33,10 +33,24 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Chat not found" }, { status: 404 });
     }
 
-    // Check if chat already has an active agent session
+    // If chat mode is locked to agent, reactivate an existing session instead of deleting it
     const existing = await prisma.agentSession.findUnique({
       where: { chatId },
     });
+
+    if (existing && chat.agentModeLocked === true) {
+      // Reactivate — preserves tool calls and artifacts history
+      const reactivated = await prisma.agentSession.update({
+        where: { id: existing.id },
+        data: {
+          status: "idle",
+          errorMessage: null,
+          completedAt: null,
+        },
+      });
+      return NextResponse.json({ session: reactivated }, { status: 200 });
+    }
+
     if (existing && !["completed", "error"].includes(existing.status)) {
       return NextResponse.json({ session: existing }, { status: 200 });
     }

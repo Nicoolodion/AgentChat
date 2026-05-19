@@ -47,7 +47,7 @@ RUN groupadd -r sandbox -g 1000 \
 # ── Python packages ───────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
     jupyter ipython ipykernel \
-    python-docx docxtpl lxml \
+    python-docx docxtpl python-pptx openpyxl lxml \
     pikepdf pdfplumber weasyprint \
     Pillow matplotlib opencv-python \
     numpy pandas requests beautifulsoup4 \

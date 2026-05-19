@@ -1,12 +1,15 @@
 import type { Chat, Message } from "@prisma/client";
 
 import { decryptString, encryptString } from "@/lib/crypto";
-import type { ChatDetail, ChatListItem, ChatMessage } from "@/lib/chat-types";
+import type { ChatDetail, ChatListItem, ChatMessage, ChatToolCall } from "@/lib/chat-types";
 import { prisma } from "@/lib/prisma";
 
 type ChatWithLatestMessage = Chat & { messages: Message[] };
 
 function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
+  const rawToolCalls = row.encryptedToolCalls
+    ? decryptString(row.encryptedToolCalls, userKey)
+    : undefined;
   return {
     id: row.id,
     role: row.role as ChatMessage["role"],
@@ -17,6 +20,7 @@ function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
     toolPayload: row.encryptedToolPayload
       ? decryptString(row.encryptedToolPayload, userKey)
       : undefined,
+    toolCalls: rawToolCalls ? (JSON.parse(rawToolCalls) as ChatMessage["toolCalls"]) : undefined,
     usagePromptTokens: row.usagePromptTokens ?? undefined,
     usageCompletionTokens: row.usageCompletionTokens ?? undefined,
     providerModel: row.providerModel ?? undefined,
@@ -37,6 +41,7 @@ function chatToListItem(chat: ChatWithLatestMessage, userKey: Buffer): ChatListI
     title: decryptString(chat.encryptedTitle, userKey),
     model: chat.model,
     webSearchEnabled: chat.webSearchEnabled,
+    agentModeLocked: chat.agentModeLocked,
     createdAt: chat.createdAt.toISOString(),
     updatedAt: chat.updatedAt.toISOString(),
     lastMessagePreview: preview,
@@ -103,6 +108,9 @@ export async function getChatDetailForUser(
       messages: {
         orderBy: { createdAt: "asc" },
       },
+      agentSession: {
+        select: { id: true, status: true },
+      },
     },
   });
 
@@ -113,6 +121,7 @@ export async function getChatDetailForUser(
     title: decryptString(chat.encryptedTitle, userKey),
     model: chat.model,
     webSearchEnabled: chat.webSearchEnabled,
+    agentModeLocked: chat.agentModeLocked,
     createdAt: chat.createdAt.toISOString(),
     updatedAt: chat.updatedAt.toISOString(),
     messages: chat.messages
@@ -124,6 +133,9 @@ export async function getChatDetailForUser(
         }
       })
       .filter((m): m is ChatMessage => m !== null),
+    agentSession: chat.agentSession
+      ? { id: chat.agentSession.id, status: chat.agentSession.status }
+      : null,
   };
 }
 
@@ -137,7 +149,7 @@ export async function updateChatSettingsForUser(input: {
 }): Promise<ChatDetail | null> {
   const existing = await prisma.chat.findFirst({
     where: { id: input.chatId, userId: input.userId },
-    include: { messages: { orderBy: { createdAt: "asc" } } },
+    include: { messages: { orderBy: { createdAt: "asc" } }, agentSession: { select: { id: true, status: true } } },
   });
 
   if (!existing) return null;
@@ -155,7 +167,7 @@ export async function updateChatSettingsForUser(input: {
           ? encryptString(input.title.trim() || "New chat", input.userKey)
           : existing.encryptedTitle,
     },
-    include: { messages: { orderBy: { createdAt: "asc" } } },
+    include: { messages: { orderBy: { createdAt: "asc" } }, agentSession: { select: { id: true, status: true } } },
   });
 
   return {
@@ -163,9 +175,13 @@ export async function updateChatSettingsForUser(input: {
     title: decryptString(updated.encryptedTitle, input.userKey),
     model: updated.model,
     webSearchEnabled: updated.webSearchEnabled,
+    agentModeLocked: updated.agentModeLocked,
     createdAt: updated.createdAt.toISOString(),
     updatedAt: updated.updatedAt.toISOString(),
     messages: updated.messages.map((msg) => decryptMessage(msg, input.userKey)),
+    agentSession: updated.agentSession
+      ? { id: updated.agentSession.id, status: updated.agentSession.status }
+      : null,
   };
 }
 
@@ -184,6 +200,7 @@ export async function appendMessageToChat(input: {
   userKey: Buffer;
   reasoning?: string;
   toolPayload?: string;
+  toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
   providerModel?: string;
@@ -200,6 +217,9 @@ export async function appendMessageToChat(input: {
         : null,
       encryptedToolPayload: input.toolPayload
         ? encryptString(input.toolPayload, input.userKey)
+        : null,
+      encryptedToolCalls: input.toolCalls?.length
+        ? encryptString(JSON.stringify(input.toolCalls), input.userKey)
         : null,
       usagePromptTokens: input.usagePromptTokens,
       usageCompletionTokens: input.usageCompletionTokens,

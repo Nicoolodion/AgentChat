@@ -14,6 +14,7 @@ export type TerminalEntry =
 export type AgentUIState = {
   agentSession: AgentSession | null;
   isAgentMode: boolean;
+  modeLocked: boolean;
   isInitializing: boolean;
   sidebarOpen: boolean;
   activeTab: "terminal" | "files" | "artifacts";
@@ -28,8 +29,9 @@ export function useAgent(chatId: string | undefined) {
   const [state, setState] = useState<AgentUIState>({
     agentSession: null,
     isAgentMode: false,
+    modeLocked: false,
     isInitializing: false,
-    sidebarOpen: false,
+    sidebarOpen: false, // default minimized
     activeTab: "terminal",
     terminalEntries: [],
     artifacts: [],
@@ -39,13 +41,18 @@ export function useAgent(chatId: string | undefined) {
   });
 
   const abortRef = useRef<AbortController | null>(null);
+  const restoringRef = useRef(false);
 
   const toggleAgentMode = useCallback(async () => {
     if (!chatId) return;
+
+    // Don't allow toggling if mode is already locked
+    if (state.modeLocked) return;
+
     const next = !state.isAgentMode;
 
     if (next) {
-      setState((s) => ({ ...s, isInitializing: true, isAgentMode: true, error: null }));
+      setState((s) => ({ ...s, isInitializing: true, isAgentMode: true, sidebarOpen: true, error: null }));
       try {
         const res = await fetch("/api/agent/sessions", {
           method: "POST",
@@ -67,13 +74,14 @@ export function useAgent(chatId: string | undefined) {
           ...s,
           isInitializing: false,
           isAgentMode: false,
+          sidebarOpen: false,
           error: err instanceof Error ? err.message : "Agent initialization failed",
         }));
       }
     } else {
       setState((s) => ({ ...s, isAgentMode: false, sidebarOpen: false }));
     }
-  }, [chatId, state.isAgentMode]);
+  }, [chatId, state.isAgentMode, state.modeLocked]);
 
   const setActiveTab = useCallback((tab: AgentUIState["activeTab"]) => {
     setState((s) => ({ ...s, activeTab: tab }));
@@ -107,40 +115,161 @@ export function useAgent(chatId: string | undefined) {
         toolCalls: AgentToolCall[];
         artifacts: AgentArtifact[];
       };
+
+      const entries: TerminalEntry[] = [];
+      for (const tc of data.toolCalls) {
+        const ts = new Date(tc.createdAt).getTime();
+        entries.push({
+          type: "tool_start",
+          toolName: tc.toolName,
+          arguments: safeParseArgs(tc.arguments),
+          timestamp: ts,
+        });
+
+        // Inject stored result as tool_output so users can inspect it on refresh
+        if (tc.result) {
+          entries.push({
+            type: "tool_output",
+            toolCallId: tc.id,
+            output: tc.result.slice(0, 4000),
+            timestamp: ts + 1,
+          });
+        }
+        if (tc.error && tc.status !== "error") {
+          entries.push({
+            type: "tool_output",
+            toolCallId: tc.id,
+            output: tc.error.slice(0, 4000),
+            timestamp: ts + 1,
+          });
+        }
+
+        if (tc.status === "success") {
+          entries.push({
+            type: "tool_done",
+            toolCallId: tc.id,
+            toolName: tc.toolName,
+            ok: true,
+            durationMs: tc.durationMs ?? 0,
+            timestamp: new Date(tc.completedAt ?? tc.createdAt).getTime(),
+          });
+        } else if (tc.status === "error") {
+          entries.push({
+            type: "error",
+            message: tc.error ?? `${tc.toolName} failed`,
+            timestamp: new Date(tc.completedAt ?? tc.createdAt).getTime(),
+          });
+        }
+      }
+
       setState((s) => ({
         ...s,
         agentSession: data.session,
         artifacts: data.artifacts,
-        terminalEntries: data.toolCalls.map((tc): TerminalEntry => {
-          if (tc.status === "success") {
-            return {
-              type: "tool_done",
-              toolCallId: tc.id,
-              toolName: tc.toolName,
-              ok: true,
-              durationMs: tc.durationMs ?? 0,
-              timestamp: new Date(tc.createdAt).getTime(),
-            };
-          }
-          if (tc.status === "error") {
-            return {
-              type: "error",
-              message: tc.error ?? `${tc.toolName} failed`,
-              timestamp: new Date(tc.createdAt).getTime(),
-            };
-          }
-          return {
-            type: "tool_start",
-            toolName: tc.toolName,
-            arguments: safeParseArgs(tc.arguments),
-            timestamp: new Date(tc.createdAt).getTime(),
-          };
-        }),
+        terminalEntries: entries,
       }));
     } catch {
       // ignore
     }
   }, []);
+
+  const syncChatMode = useCallback(
+    async (chat: {
+      id: string;
+      agentModeLocked: boolean | null;
+      agentSession: { id: string; status: string } | null;
+      messages: Array<unknown>;
+    }) => {
+      if (!chatId) return;
+
+      const hasMessages = chat.messages.length > 0;
+      const isLocked = chat.agentModeLocked !== null;
+      const lockedToAgent = chat.agentModeLocked === true;
+
+      if (isLocked) {
+        // Mode is locked — force to correct mode
+        if (lockedToAgent) {
+          // Agent mode locked in — restore session
+          if (chat.agentSession) {
+            setState((s) => ({
+              ...s,
+              isAgentMode: true,
+              modeLocked: true,
+              agentSession: chat.agentSession as AgentSession,
+            }));
+            void loadSession(chat.agentSession!.id);
+          } else {
+            // No session yet but locked to agent — initialize
+            setState((s) => ({ ...s, isAgentMode: true, modeLocked: true, isInitializing: true }));
+            try {
+              const res = await fetch("/api/agent/sessions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chatId }),
+              });
+              const data = (await res.json().catch(() => ({}))) as { session?: AgentSession; error?: string };
+              setState((s) => ({
+                ...s,
+                agentSession: data.session ?? null,
+                isInitializing: false,
+              }));
+              if (data.session) {
+                void loadSession(data.session.id);
+              }
+            } catch {
+              setState((s) => ({ ...s, isInitializing: false }));
+            }
+          }
+        } else {
+          // Locked to normal mode
+          setState((s) => ({
+            ...s,
+            isAgentMode: false,
+            modeLocked: true,
+            sidebarOpen: false,
+            agentSession: null,
+            terminalEntries: [],
+            artifacts: [],
+          }));
+        }
+      } else if (hasMessages) {
+        // Has messages but mode is NOT locked (backward compat / unexpected)
+        // Determine from whether there is an agentSession
+        if (chat.agentSession) {
+          setState((s) => ({
+            ...s,
+            isAgentMode: true,
+            modeLocked: true,
+            sidebarOpen: true,
+            agentSession: chat.agentSession as AgentSession,
+          }));
+          void loadSession(chat.agentSession!.id);
+        } else {
+          setState((s) => ({
+            ...s,
+            isAgentMode: false,
+            modeLocked: true,
+            sidebarOpen: false,
+            agentSession: null,
+            terminalEntries: [],
+            artifacts: [],
+          }));
+        }
+      } else {
+        // Empty chat — mode is free to choose
+        setState((s) => ({
+          ...s,
+          isAgentMode: false,
+          modeLocked: false,
+          sidebarOpen: false,
+          agentSession: null,
+          terminalEntries: [],
+          artifacts: [],
+        }));
+      }
+    },
+    [chatId, loadSession]
+  );
 
   const executeAgent = useCallback(
     async (message: string, attachments?: string[]) => {
@@ -221,20 +350,105 @@ export function useAgent(chatId: string | undefined) {
     [state.agentSession]
   );
 
-  // Load existing session on mount if agent mode was previously enabled
+  // Auto-restore agent mode on mount / chatId change
   useEffect(() => {
-    if (!chatId) return;
-    // Check if there's an agent session for this chat
+    if (!chatId || restoringRef.current) return;
+    restoringRef.current = true;
+
     fetch(`/api/chats/${chatId}`)
       .then((r) => r.json().catch(() => null))
       .then((data) => {
-        const session = (data as { chat?: { agentSession?: AgentSession } } | null)?.chat?.agentSession;
-        if (session && !["completed", "error"].includes(session.status)) {
-          setState((s) => ({ ...s, isAgentMode: true, agentSession: session, sidebarOpen: false }));
-          void loadSession(session.id);
+        const chat = (data as { chat?: { agentModeLocked?: boolean | null; agentSession?: { id: string; status: string } | null; messages?: unknown[] } } | null)?.chat;
+        if (!chat) {
+          restoringRef.current = false;
+          return;
         }
+
+        const hasMessages = (chat.messages?.length ?? 0) > 0;
+        const isLocked = chat.agentModeLocked !== null && chat.agentModeLocked !== undefined;
+        const lockedToAgent = chat.agentModeLocked === true;
+
+      if (isLocked) {
+        if (lockedToAgent) {
+          if (chat.agentSession) {
+            setState((s) => ({
+              ...s,
+              isAgentMode: true,
+              modeLocked: true,
+              sidebarOpen: true,
+              agentSession: chat.agentSession as AgentSession,
+            }));
+            void loadSession(chat.agentSession!.id);
+          } else {
+              setState((s) => ({ ...s, isAgentMode: true, modeLocked: true, sidebarOpen: true, isInitializing: true }));
+              fetch("/api/agent/sessions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chatId }),
+              })
+                .then((r) => r.json().catch(() => ({})))
+                .then((d: { session?: AgentSession }) => {
+                  setState((s) => ({
+                    ...s,
+                    agentSession: d.session ?? null,
+                    isInitializing: false,
+                  }));
+                  if (d.session) void loadSession(d.session.id);
+                })
+                .catch(() => setState((s) => ({ ...s, isInitializing: false })))
+                .finally(() => {
+                  restoringRef.current = false;
+                });
+              return;
+            }
+          } else {
+            setState((s) => ({
+              ...s,
+              isAgentMode: false,
+              modeLocked: true,
+              sidebarOpen: false,
+              agentSession: null,
+              terminalEntries: [],
+              artifacts: [],
+            }));
+          }
+        } else if (hasMessages) {
+          if (chat.agentSession) {
+            setState((s) => ({
+              ...s,
+              isAgentMode: true,
+              modeLocked: true,
+              sidebarOpen: true,
+              agentSession: chat.agentSession as AgentSession,
+            }));
+            void loadSession(chat.agentSession.id);
+          } else {
+            setState((s) => ({
+              ...s,
+              isAgentMode: false,
+              modeLocked: true,
+              sidebarOpen: false,
+              agentSession: null,
+              terminalEntries: [],
+              artifacts: [],
+            }));
+          }
+        } else {
+          setState((s) => ({
+            ...s,
+            isAgentMode: false,
+            modeLocked: false,
+            sidebarOpen: false,
+            agentSession: null,
+            terminalEntries: [],
+            artifacts: [],
+          }));
+        }
+        restoringRef.current = false;
       })
-      .catch(() => {});
+      .catch(() => {
+        restoringRef.current = false;
+      });
   }, [chatId, loadSession]);
 
   return {
@@ -248,6 +462,7 @@ export function useAgent(chatId: string | undefined) {
     setArtifacts,
     addArtifact,
     loadSession,
+    syncChatMode,
     executeAgent,
   };
 }

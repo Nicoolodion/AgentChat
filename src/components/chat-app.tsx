@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import {
   Bot,
   CornerDownLeft,
+  Download,
   File,
   FileImage,
   FileText,
@@ -184,7 +185,16 @@ function MessageBubble({
         )}
       </div>
 
-      {message.reasoning && (
+      {/* Live reasoning shown while streaming */}
+      {isStreaming && message.reasoning && !message.content && (
+        <div className="mb-2 flex items-center gap-1.5 rounded-xl border border-teal-300/20 bg-teal-400/5 px-3 py-1.5 text-xs text-teal-200">
+          <div className="h-1.5 w-1.5 animate-pulse rounded-full bg-teal-300" />
+          Reasoning… ({message.reasoning.length} chars)
+        </div>
+      )}
+
+      {/* Collapsed reasoning block (shown once content arrives or message is done) */}
+      {message.reasoning && (!isStreaming || message.content) && (
         <details className="group/details mb-2 overflow-hidden rounded-xl border border-white/10 bg-slate-950/40">
           <summary className="flex cursor-pointer items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-200 transition group-open/details:bg-white/5">
             <ChevronRight className="h-3 w-3 transition-transform group-open/details:rotate-90" />
@@ -216,6 +226,33 @@ function MessageBubble({
             </ReactMarkdown>
           </div>
         </details>
+      )}
+
+      {/* Tool call badges */}
+      {message.toolCalls && message.toolCalls.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-1.5">
+          {message.toolCalls.map((tc) => (
+            <span
+              key={tc.toolCallId}
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                tc.status === "running"
+                  ? "border-amber-300/40 bg-amber-400/10 text-amber-200"
+                  : tc.status === "success"
+                    ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-200"
+                    : "border-rose-300/40 bg-rose-400/10 text-rose-200"
+              }`}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${
+                tc.status === "running" ? "animate-pulse bg-amber-300" :
+                tc.status === "success" ? "bg-emerald-300" : "bg-rose-300"
+              }`} />
+              {tc.toolName}
+              {tc.durationMs && (
+                <span className="text-[9px] opacity-70">{tc.durationMs}ms</span>
+              )}
+            </span>
+          ))}
+        </div>
       )}
 
       {isStreaming && isEmpty ? (
@@ -365,6 +402,11 @@ export function ChatApp() {
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [dropOverlayActive, setDropOverlayActive] = useState(false);
   const [previewAttachment, setPreviewAttachment] = useState<MessageAttachmentRef | null>(null);
+  const [agentFilePreview, setAgentFilePreview] = useState<{
+    path: string;
+    name: string;
+    mimeType: string;
+  } | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
 
   const agent = useAgent(activeChat?.id);
@@ -465,6 +507,7 @@ export function ChatApp() {
   async function openChat(chatId: string) {
     const detail = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${chatId}`);
     setActiveChat(detail.chat);
+    void agent.syncChatMode(detail.chat);
   }
 
   async function createChat(modelId?: string) {
@@ -555,10 +598,19 @@ export function ChatApp() {
     setPreviewAttachment(null);
   }
 
+  function openAgentFilePreview(file: { path: string; name: string; mimeType: string }) {
+    setAgentFilePreview(file);
+  }
+
+  function closeAgentFilePreview() {
+    setAgentFilePreview(null);
+  }
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setPreviewAttachment(null);
+        setAgentFilePreview(null);
       }
     }
 
@@ -640,7 +692,7 @@ export function ChatApp() {
       kind: item.kind,
     }));
     setMessageInput("");
-    // NOTE: We do NOT clear pendingAttachments here to keep files in context for the next message
+    setPendingAttachments([]);
 
     const tempId = `temp-${Date.now()}`;
 
@@ -788,6 +840,49 @@ export function ChatApp() {
               });
             }
 
+            // Track tool calls in the streaming assistant message for agent mode
+            if (eventType === "tool_start" && data.toolName) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                const last = msgs[lastIdx] as ChatMessage;
+                if (last && last.role === "assistant") {
+                  const existing = last.toolCalls ?? [];
+                  msgs[lastIdx] = {
+                    ...last,
+                    toolCalls: [
+                      ...existing,
+                      { toolCallId: data.toolCallId ?? `tc-${Date.now()}`, toolName: data.toolName, status: "running" },
+                    ],
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "tool_done" && data.toolName) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                const last = msgs[lastIdx] as ChatMessage;
+                if (last && last.role === "assistant" && last.toolCalls) {
+                  msgs[lastIdx] = {
+                    ...last,
+                    toolCalls: last.toolCalls.map((tc) =>
+                      tc.toolCallId === data.toolCallId || tc.toolName === data.toolName
+                        ? { ...tc, status: data.ok ? "success" : "error", durationMs: data.durationMs }
+                        : tc
+                    ),
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
             if (eventType === "done") {
               const assistantMsg = (data.assistantMessage ?? data.assistantMessage) as ChatMessage | undefined;
               const finalAvgTokensPerSecond = (assistantMsg?.usageCompletionTokens && data.meta?.ttftMs)
@@ -798,10 +893,14 @@ export function ChatApp() {
                 setActiveChat((current) => {
                   if (!current) return current;
                   const msgs = [...current.messages];
+                  const last = msgs[msgs.length - 1] as ChatMessage;
                   const storedMsg = {
                     ...assistantMsg,
                     ttftMs: data.meta?.ttftMs ?? assistantMsg.ttftMs,
                     avgTokensPerSecond: data.meta?.avgTokensPerSecond ?? finalAvgTokensPerSecond,
+                    // Prefer server-supplied toolCalls; fall back to client-side streamed ones
+                    toolCalls: assistantMsg.toolCalls ?? last?.toolCalls,
+                    reasoning: assistantMsg.reasoning ?? last?.reasoning,
                   };
                   msgs[msgs.length - 1] = storedMsg;
                   return { ...current, messages: msgs };
@@ -1042,6 +1141,48 @@ export function ChatApp() {
               });
             }
 
+            if (eventType === "tool_start" && data.toolName) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                const last = msgs[lastIdx] as ChatMessage;
+                if (last && last.role === "assistant") {
+                  const existing = last.toolCalls ?? [];
+                  msgs[lastIdx] = {
+                    ...last,
+                    toolCalls: [
+                      ...existing,
+                      { toolCallId: data.toolCallId ?? `tc-${Date.now()}`, toolName: data.toolName, status: "running" },
+                    ],
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
+            if (eventType === "tool_done" && data.toolName) {
+              setActiveChat((current) => {
+                if (!current) return current;
+                const msgs = [...current.messages];
+                const lastIdx = msgs.length - 1;
+                const last = msgs[lastIdx] as ChatMessage;
+                if (last && last.role === "assistant" && last.toolCalls) {
+                  msgs[lastIdx] = {
+                    ...last,
+                    toolCalls: last.toolCalls.map((tc) =>
+                      tc.toolCallId === data.toolCallId || tc.toolName === data.toolName
+                        ? { ...tc, status: data.ok ? "success" : "error", durationMs: data.durationMs }
+                        : tc
+                    ),
+                    _isStreaming: true,
+                  };
+                }
+                return { ...current, messages: msgs };
+              });
+            }
+
             if (eventType === "done") {
               const assistantMsg = data.assistantMessage as ChatMessage;
               const finalAvgTokensPerSecond = (assistantMsg.usageCompletionTokens && data.meta?.ttftMs)
@@ -1113,7 +1254,9 @@ export function ChatApp() {
 
       <div className={cn(
         "grid h-full w-full grid-cols-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/60 shadow-[0_30px_80px_rgba(2,6,23,.5)] backdrop-blur",
-        agent.isAgentMode && agent.sidebarOpen ? "xl:grid-cols-[320px_1fr_360px]" : "xl:grid-cols-[320px_1fr]"
+        agent.isAgentMode && agent.sidebarOpen ? "xl:grid-cols-[320px_minmax(0,1fr)_360px]" :
+        agent.isAgentMode ? "xl:grid-cols-[320px_minmax(0,1fr)_48px]" :
+        "xl:grid-cols-[320px_minmax(0,1fr)]"
       )}>
         <aside className="border-b border-white/10 p-4 xl:border-b-0 xl:border-r">
           <div className="mb-4 flex items-center justify-between gap-3">
@@ -1182,7 +1325,7 @@ export function ChatApp() {
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col">
+        <main className="relative flex min-h-0 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 p-4">
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative">
@@ -1273,6 +1416,7 @@ export function ChatApp() {
               <AgentModeToggle
                 isOn={agent.isAgentMode}
                 isInitializing={agent.isInitializing}
+                locked={agent.modeLocked}
                 onToggle={() => void agent.toggleAgentMode()}
               />
             </div>
@@ -1416,12 +1560,91 @@ export function ChatApp() {
               </div>
             ) : null}
           </div>
+
+          {/* Agent file preview (inside main, sidebar untouched) */}
+          {agentFilePreview && (
+            <div
+              className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur"
+              onClick={closeAgentFilePreview}
+              role="dialog"
+              aria-modal="true"
+              aria-label="File preview"
+            >
+              <div
+                className="max-h-[92vh] w-full max-w-4xl overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium text-slate-100">
+                      {agentFilePreview.name}
+                    </div>
+                    <div className="text-xs text-slate-400">{agentFilePreview.mimeType}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={`/api/agent/sessions/${agent.agentSession!.id}/files/download?path=${encodeURIComponent(agentFilePreview.path)}${agentFilePreview.mimeType ? `&mimeType=${encodeURIComponent(agentFilePreview.mimeType)}` : ""}`}
+                      download
+                      className="inline-flex items-center rounded-lg border border-teal-300/60 bg-teal-300/10 px-3 py-1.5 text-xs font-medium text-teal-100 transition hover:bg-teal-300/20"
+                    >
+                      <Download className="mr-1.5 h-3.5 w-3.5" />
+                      Download
+                    </a>
+                    <button
+                      type="button"
+                      onClick={closeAgentFilePreview}
+                      className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-300 transition hover:bg-white/10 hover:text-white"
+                      aria-label="Close preview"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-[calc(92vh-64px)] overflow-auto bg-slate-950 p-3">
+                  {agentFilePreview.mimeType.startsWith("image/") ? (
+                    <img
+                      src={`/api/agent/sessions/${agent.agentSession!.id}/files/download?path=${encodeURIComponent(agentFilePreview.path)}&preview=1${agentFilePreview.mimeType ? `&mimeType=${encodeURIComponent(agentFilePreview.mimeType)}` : ""}`}
+                      alt={agentFilePreview.name}
+                      className="mx-auto max-h-[calc(92vh-96px)] w-auto max-w-full rounded-lg"
+                    />
+                  ) : agentFilePreview.mimeType === "application/pdf" ? (
+                    <iframe
+                      src={`/api/agent/sessions/${agent.agentSession!.id}/files/download?path=${encodeURIComponent(agentFilePreview.path)}&preview=1${agentFilePreview.mimeType ? `&mimeType=${encodeURIComponent(agentFilePreview.mimeType)}` : ""}`}
+                      className="h-[78vh] w-full rounded-lg border border-white/10 bg-white"
+                      title={agentFilePreview.name}
+                    />
+                  ) : agentFilePreview.mimeType.startsWith("text/") || agentFilePreview.mimeType === "application/json" ? (
+                    <iframe
+                      src={`/api/agent/sessions/${agent.agentSession!.id}/files/download?path=${encodeURIComponent(agentFilePreview.path)}&preview=1${agentFilePreview.mimeType ? `&mimeType=${encodeURIComponent(agentFilePreview.mimeType)}` : ""}`}
+                      className="h-[78vh] w-full rounded-lg border border-white/10 bg-white"
+                      title={agentFilePreview.name}
+                    />
+                  ) : (
+                    <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 text-center">
+                      <File className="h-10 w-10 text-teal-200" />
+                      <p className="max-w-lg text-sm text-slate-300">
+                        This file type cannot be previewed inline.
+                      </p>
+                      <a
+                        href={`/api/agent/sessions/${agent.agentSession!.id}/files/download?path=${encodeURIComponent(agentFilePreview.path)}${agentFilePreview.mimeType ? `&mimeType=${encodeURIComponent(agentFilePreview.mimeType)}` : ""}`}
+                        download
+                        className="inline-flex items-center rounded-lg border border-teal-300/60 bg-teal-300/10 px-3 py-2 text-sm font-medium text-teal-100 transition hover:bg-teal-300/20"
+                      >
+                        <Download className="mr-1.5 h-4 w-4" />
+                        Download
+                      </a>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </main>
 
         {agent.isAgentMode && agent.agentSession && (
           <AgentSidebar
             open={agent.sidebarOpen}
-            onClose={agent.closeSidebar}
+            onToggle={agent.sidebarOpen ? agent.closeSidebar : agent.openSidebar}
             activeTab={agent.activeTab}
             onSetTab={agent.setActiveTab}
             sessionId={agent.agentSession.id}
@@ -1429,6 +1652,7 @@ export function ChatApp() {
             isExecuting={agent.isExecuting}
             artifacts={agent.artifacts}
             onClearTerminal={agent.clearTerminal}
+            onPreviewFile={openAgentFilePreview}
           />
         )}
       </div>

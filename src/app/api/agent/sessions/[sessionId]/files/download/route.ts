@@ -1,6 +1,6 @@
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { sandboxFileRead } from "@/lib/agent/sandbox";
+import { sandboxFileRead, sandboxFileInfo, sandboxExecShell, sandboxFileDelete } from "@/lib/agent/sandbox";
 
 function notFound() {
   return new Response(JSON.stringify({ error: "Session not found" }), {
@@ -18,7 +18,7 @@ function forbidden() {
 
 /**
  * GET /api/agent/sessions/:sessionId/files/download?path=...
- * Download a file from the workspace.
+ * Download a file or a zipped folder from the workspace.
  */
 export async function GET(
   request: Request,
@@ -40,6 +40,7 @@ export async function GET(
 
     const { searchParams } = new URL(request.url);
     const path = searchParams.get("path") ?? "";
+    const isPreview = searchParams.get("preview") === "1";
 
     if (!path || path.includes("..")) {
       return new Response(JSON.stringify({ error: "Invalid path" }), {
@@ -48,8 +49,58 @@ export async function GET(
       });
     }
 
+    // Determine if the path is a directory
+    let isDirectory = false;
+    try {
+      const info = await sandboxFileInfo(sessionId, path);
+      isDirectory = info.is_directory;
+    } catch {
+      // If we can't get info, fall through and try reading as a file
+    }
+
+    if (isDirectory) {
+      const folderName = path.replace(/\/$/, "").split("/").pop() ?? "download";
+      const zipName = `${folderName}.zip`;
+      const tempZipPath = `/tmp/download-${sessionId}-${Date.now()}.zip`;
+
+      const shellRes = await sandboxExecShell(
+        sessionId,
+        `cd '${encodeShellArg(path)}' && zip -r '${tempZipPath}' .`,
+        "/",
+        60
+      );
+
+      if (shellRes.exit_code !== 0) {
+        return new Response(JSON.stringify({ error: "Failed to create archive" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      const res = await sandboxFileRead(sessionId, tempZipPath, "base64");
+      const binary = Buffer.from(res.content, "base64");
+
+      // Clean up temp zip
+      try {
+        await sandboxFileDelete(sessionId, tempZipPath);
+      } catch {
+        // ignore cleanup failure
+      }
+
+      return new Response(binary, {
+        headers: {
+          "Content-Type": "application/zip",
+          "Content-Disposition": `attachment; filename="${zipName}"`,
+          "Content-Length": String(binary.length),
+        },
+      });
+    }
+
+    // Single file download
     const fileName = path.split("/").pop() ?? "download";
-    const mimeType = getMimeType(fileName);
+    const mimeType = searchParams.get("mimeType")
+      ? decodeURIComponent(searchParams.get("mimeType")!)
+      : getMimeType(fileName);
 
     const res = await sandboxFileRead(sessionId, path, "base64");
     const binary = Buffer.from(res.content, "base64");
@@ -57,7 +108,7 @@ export async function GET(
     return new Response(binary, {
       headers: {
         "Content-Type": mimeType,
-        "Content-Disposition": `attachment; filename="${fileName}"`,
+        "Content-Disposition": `${isPreview ? "inline" : "attachment"}; filename="${fileName}"`,
         "Content-Length": String(binary.length),
       },
     });
@@ -68,6 +119,10 @@ export async function GET(
       headers: { "Content-Type": "application/json" },
     });
   }
+}
+
+function encodeShellArg(arg: string): string {
+  return arg.replace(/'/g, "'\"'\"'");
 }
 
 function getMimeType(fileName: string): string {

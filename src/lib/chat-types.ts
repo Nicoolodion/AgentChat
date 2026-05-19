@@ -3,9 +3,17 @@ export type ChatListItem = {
   title: string;
   model: string;
   webSearchEnabled: boolean;
+  agentModeLocked: boolean | null;
   createdAt: string;
   updatedAt: string;
   lastMessagePreview: string;
+};
+
+export type ChatToolCall = {
+  toolCallId: string;
+  toolName: string;
+  status: "running" | "success" | "error";
+  durationMs?: number;
 };
 
 export type ChatMessage = {
@@ -14,6 +22,7 @@ export type ChatMessage = {
   content: string;
   reasoning?: string;
   toolPayload?: string;
+  toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
   providerModel?: string;
@@ -28,9 +37,11 @@ export type ChatDetail = {
   title: string;
   model: string;
   webSearchEnabled: boolean;
+  agentModeLocked: boolean | null;
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
+  agentSession: { id: string; status: string } | null;
 };
 
 export type ModelInfo = {

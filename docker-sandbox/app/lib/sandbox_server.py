@@ -148,6 +148,12 @@ from contextlib import redirect_stdout, redirect_stderr
 os.chdir({str(session_workspace)!r})
 os.environ["WORKSPACE_DIR"] = {str(session_workspace)!r}
 
+# Add session-local pip install target to sys.path so packages installed via
+# pip_install --target are importable
+local_libs = os.path.join({str(session_workspace)!r}, "python_libs")
+if local_libs not in sys.path:
+    sys.path.insert(0, local_libs)
+
 # Redirect stdout/stderr
 out_buffer = io.StringIO()
 err_buffer = io.StringIO()
@@ -712,19 +718,22 @@ def convert_docx_to_pdf() -> Response:
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use LibreOffice headless conversion
+    # Use LibreOffice headless conversion (writable HOME avoids dconf errors)
     out_dir = out_file.parent
     cmd = [
         "libreoffice",
         "--headless",
+        "--nologo",
         "--convert-to", "pdf",
         "--outdir", str(out_dir),
         str(in_file),
     ]
+    env = os.environ.copy()
+    env["HOME"] = "/tmp"
 
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
         duration_ms = int((time.time() - start) * 1000)
 
         # LibreOffice names output based on input filename

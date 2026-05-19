@@ -102,223 +102,39 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "file_move",
-      description: "Move or rename a file within the workspace.",
-      parameters: {
-        type: "object",
-        properties: {
-          source: { type: "string", description: "Source path relative to workspace" },
-          destination: { type: "string", description: "Destination path relative to workspace" },
-        },
-        required: ["source", "destination"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "file_info",
-      description: "Get file metadata (size, mime type, modified time).",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-        },
-        required: ["path"],
-      },
-    },
-  },
-  // ── Code Execution Tools ───────────────────────────────────────────────────
-  {
-    type: "function",
-    function: {
-      name: "ipython",
-      description: "Execute Python code with persistent session state. Matplotlib, Pillow, pandas, numpy, opencv, openpyxl, python-docx, pikepdf are available.",
-      parameters: {
-        type: "object",
-        properties: {
-          code: { type: "string", description: "Python code to execute" },
-          timeout: { type: "number", default: 60, description: "Max execution time in seconds" },
-        },
-        required: ["code"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "shell",
-      description: "Execute a shell command in the workspace.",
-      parameters: {
-        type: "object",
-        properties: {
-          command: { type: "string", description: "Shell command" },
-          working_dir: { type: "string", default: "/", description: "Working directory relative to workspace" },
-          timeout: { type: "number", default: 30 },
-        },
-        required: ["command"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "pip_install",
-      description: "Install a Python package via pip in the sandbox.",
-      parameters: {
-        type: "object",
-        properties: {
-          package: { type: "string", description: "Package name (e.g. 'openpyxl', 'requests')" },
-        },
-        required: ["package"],
-      },
-    },
-  },
-  // ── Document Generation Tools ──────────────────────────────────────────────
-  {
-    type: "function",
-    function: {
-      name: "pdf_from_html",
-      description: "Convert an HTML file to PDF using Playwright + Paged.js.",
-      parameters: {
-        type: "object",
-        properties: {
-          html_path: { type: "string", description: "Relative path to HTML file" },
-          output_path: { type: "string", description: "Relative path for output PDF" },
-        },
-        required: ["html_path", "output_path"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "docx_to_pdf",
-      description: "Convert a DOCX file to PDF using LibreOffice.",
-      parameters: {
-        type: "object",
-        properties: {
-          input_path: { type: "string" },
-          output_path: { type: "string" },
-        },
-        required: ["input_path", "output_path"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "docx_create",
-      description: "Create a Word document using python-docx. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.docx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
-      parameters: {
-        type: "object",
-        properties: {
-          output_path: { type: "string", description: "Relative path for output DOCX (e.g. 'output/report.docx')" },
-          python_code: { type: "string", description: "Python code using python-docx to build the document. Use relative paths or WORKSPACE_DIR for absolute paths." },
-        },
-        required: ["output_path", "python_code"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "xlsx_create",
-      description: "Create an Excel spreadsheet using openpyxl. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.xlsx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
-      parameters: {
-        type: "object",
-        properties: {
-          output_path: { type: "string", description: "Relative path for output XLSX (e.g. 'output/data.xlsx')" },
-          python_code: { type: "string", description: "Python code using openpyxl to build the spreadsheet. Use relative paths or WORKSPACE_DIR for absolute paths." },
-        },
-        required: ["output_path", "python_code"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "pptx_create",
-      description: "Create a PowerPoint presentation using python-pptx. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.pptx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
-      parameters: {
-        type: "object",
-        properties: {
-          output_path: { type: "string", description: "Relative path for output PPTX (e.g. 'output/slides.pptx')" },
-          python_code: { type: "string", description: "Python code using python-pptx to build the presentation. Use relative paths or WORKSPACE_DIR for absolute paths." },
-        },
-        required: ["output_path", "python_code"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "libreoffice_convert",
-      description: "Convert between office formats using LibreOffice (e.g. docx to pdf, pptx to pdf, etc).",
-      parameters: {
-        type: "object",
-        properties: {
-          input_path: { type: "string" },
-          output_format: { type: "string", description: "Target format extension e.g. 'pdf', 'docx', 'html'" },
-          output_path: { type: "string" },
-        },
-        required: ["input_path", "output_format"],
-      },
-    },
-  },
-  // ── Web & Search Tools ─────────────────────────────────────────────────────
-  {
-    type: "function",
-    function: {
-      name: "web_search",
-      description: "Search the web using DuckDuckGo. Returns a list of search results with title, URL, and snippet.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search query" },
-          max_results: { type: "number", default: 5, description: "Maximum number of results (1-10)" },
-        },
-        required: ["query"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "web_fetch",
-      description: "Fetch a webpage and return its content as text, HTML, or markdown.",
-      parameters: {
-        type: "object",
-        properties: {
-          url: { type: "string" },
-          format: { type: "string", enum: ["html", "text", "markdown"], default: "text" },
-        },
-        required: ["url"],
-      },
-    },
-  },
-  // ── Image & Chart Tools ────────────────────────────────────────────────────
-  {
-    type: "function",
-    function: {
       name: "chart_create",
-      description: "Create a chart using matplotlib and save it as an image. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/chart.png'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
+      description: "Create a chart or image using matplotlib / Pillow. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/chart.png').",
       parameters: {
         type: "object",
         properties: {
-          python_code: { type: "string", description: "Python code using matplotlib to create the chart. Use relative paths or WORKSPACE_DIR for absolute paths." },
-          output_path: { type: "string", description: "Relative path for output image (e.g. output/chart.png)" },
+          python_code: { type: "string", description: "Python code using matplotlib or Pillow to generate the image/chart. Save to a relative path." },
+          output_path: { type: "string", description: "Relative path for output image (e.g. 'output/chart.png')" },
         },
         required: ["python_code", "output_path"],
       },
     },
   },
-  // ── Todo / Project Management Tools ────────────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "image_analyze",
+      description: "Analyze an image file using the current vision-capable model. Returns a textual description or answers a question about the image.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to the image file in the workspace (e.g. 'upload/photo.jpg')" },
+          prompt: { type: "string", description: "What to ask about the image. Default: 'Describe this image in detail.'", default: "Describe this image in detail." },
+          detail: { type: "string", enum: ["high", "low"], description: "Vision detail level. Use 'low' for a faster, cheaper overview. Default: 'high'", default: "high" },
+        },
+        required: ["path"],
+      },
+    },
+  },
   {
     type: "function",
     function: {
       name: "todo_create",
-      description: "Create a todo list in the workspace for tracking progress.",
+      description: "Create a todo list in the workspace.",
       parameters: {
         type: "object",
         properties: {
@@ -333,10 +149,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     function: {
       name: "todo_read",
       description: "Read the current todo list from the workspace.",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
+      parameters: { type: "object", properties: {} },
     },
   },
 ];
@@ -384,6 +197,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ### Charts & Images
 - chart_create(python_code, output_path) — create matplotlib chart
+- image_analyze(path, prompt?, detail?) — analyze an image with a vision model (high/low detail). Good for OCR, diagrams, or photo descriptions.
 
 ### Project Management
 - todo_create(items) — create a todo list
@@ -642,7 +456,9 @@ async function executeSandboxTool(
     }
     case "pip_install": {
       const pkg = String(args.package ?? args.packages ?? "");
-      const res = await sandboxExecShell(sessionId, `pip install ${pkg}`, "/", 120);
+      const workspaceRes = await sandboxExecShell(sessionId, `mkdir -p /workspace/${sessionId}/python_libs`, "/", 10);
+      const cmd = `pip install --target /workspace/${sessionId}/python_libs ${pkg}`;
+      const res = await sandboxExecShell(sessionId, cmd, "/", 120);
       return {
         ok: res.exit_code === 0 && !res.error,
         result: res,
@@ -704,7 +520,7 @@ async function executeSandboxTool(
       const outputFormat = String(args.output_format ?? "pdf");
       const outputPath = String(args.output_path ?? "");
       const outDir = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
-      const cmd = `libreoffice --headless --convert-to ${outputFormat} --outdir ${outDir} ${inputPath}`;
+      const cmd = `HOME=/tmp libreoffice --headless --nologo --convert-to ${outputFormat} --outdir ${outDir} ${inputPath}`;
       const res = await sandboxExecShell(sessionId, cmd, "/", 120);
       return {
         ok: res.exit_code === 0 && !res.error,
@@ -799,6 +615,33 @@ except Exception as e:
         error: res.error ?? undefined,
         stdout: res.stdout || `Chart saved to ${outputPath}`,
       };
+    }
+    case "image_analyze": {
+      const imagePath = String(args.path ?? "");
+      const prompt = String(args.prompt ?? "Describe this image in detail.");
+      const detail = (args.detail as "high" | "low") ?? "high";
+      const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
+      const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
+      const mimeMap: Record<string, string> = {
+        jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+      };
+      const mime = mimeMap[ext] ?? "image/png";
+      const dataUrl = `data:${mime};base64,${fileRes.content}`;
+      const response = await nanoClient.chat.completions.create({
+        model: env.DEFAULT_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: dataUrl, detail } },
+            ],
+          },
+        ],
+        max_tokens: 2048,
+      });
+      const content = response.choices[0]?.message?.content ?? "";
+      return { ok: true, result: { content }, stdout: content };
     }
     // ── Todo Tools ──────────────────────────────────────────────────────────
     case "todo_create": {
