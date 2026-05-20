@@ -1,17 +1,15 @@
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { sandboxFileRead, sandboxFileInfo, sandboxExecShell, sandboxFileDelete } from "@/lib/agent/sandbox";
+import {
+  resolveHostWorkspaceFile,
+  getHostWorkspacePath,
+} from "@/lib/agent/workspace";
+import { readFile, stat, readdir } from "node:fs/promises";
+import path from "node:path";
 
-function notFound() {
-  return new Response(JSON.stringify({ error: "Session not found" }), {
-    status: 404,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function forbidden() {
-  return new Response(JSON.stringify({ error: "Access denied" }), {
-    status: 403,
+function jsonError(message: string, status: number) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
     headers: { "Content-Type": "application/json" },
   });
 }
@@ -19,6 +17,9 @@ function forbidden() {
 /**
  * GET /api/agent/sessions/:sessionId/files/download?path=...
  * Download a file or a zipped folder from the workspace.
+ *
+ * Reads directly from the host filesystem (data/agent-workspaces/)
+ * so it works even when the sandbox container is offline.
  */
 export async function GET(
   request: Request,
@@ -27,83 +28,64 @@ export async function GET(
   try {
     const auth = await resolveAuthContext(request);
     if (!auth) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
+      return jsonError("Unauthorized", 401);
     }
 
     const { sessionId } = await context.params;
     const session = await prisma.agentSession.findUnique({ where: { id: sessionId } });
-    if (!session) return notFound();
-    if (session.userId !== auth.userId) return forbidden();
+    if (!session) return jsonError("Session not found", 404);
+    if (session.userId !== auth.userId) return jsonError("Access denied", 403);
 
     const { searchParams } = new URL(request.url);
-    const path = searchParams.get("path") ?? "";
+    const filePath = searchParams.get("path") ?? "";
     const isPreview = searchParams.get("preview") === "1";
 
-    if (!path || path.includes("..")) {
-      return new Response(JSON.stringify({ error: "Invalid path" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+    if (!filePath || filePath.includes("..")) {
+      return jsonError("Invalid path", 400);
     }
 
-    // Determine if the path is a directory
-    let isDirectory = false;
-    try {
-      const info = await sandboxFileInfo(sessionId, path);
-      isDirectory = info.is_directory;
-    } catch {
-      // If we can't get info, fall through and try reading as a file
+    const resolvedPath = resolveHostWorkspaceFile(sessionId, filePath);
+    const pathStat = await stat(resolvedPath).catch(() => null);
+    if (!pathStat) {
+      return jsonError("File not found", 404);
     }
 
-    if (isDirectory) {
-      const folderName = path.replace(/\/$/, "").split("/").pop() ?? "download";
-      const zipName = `${folderName}.zip`;
-      const tempZipPath = `/tmp/download-${sessionId}-${Date.now()}.zip`;
+    // Directory → zip it
+    if (pathStat.isDirectory()) {
+      const folderName = filePath.replace(/\/$/, "").split("/").pop() ?? "download";
+      const { spawn } = await import("node:child_process");
+      const { tmpdir } = await import("node:os");
+      const tmpZip = path.join(tmpdir(), `agent-${sessionId}-${Date.now()}.zip`);
 
-      const shellRes = await sandboxExecShell(
-        sessionId,
-        `cd '${encodeShellArg(path)}' && zip -r '${tempZipPath}' .`,
-        "/",
-        60
-      );
-
-      if (shellRes.exit_code !== 0) {
-        return new Response(JSON.stringify({ error: "Failed to create archive" }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
+      await new Promise<void>((resolve, reject) => {
+        const zip = spawn("powershell", [
+          "-Command",
+          `Compress-Archive -Path '${resolvedPath.replace(/'/g, "''")}\*' -DestinationPath '${tmpZip.replace(/'/g, "''")}' -Force`,
+        ]);
+        zip.on("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`zip exited ${code}`));
         });
-      }
+        zip.on("error", reject);
+      });
 
-      const res = await sandboxFileRead(sessionId, tempZipPath, "base64");
-      const binary = Buffer.from(res.content, "base64");
-
-      // Clean up temp zip
-      try {
-        await sandboxFileDelete(sessionId, tempZipPath);
-      } catch {
-        // ignore cleanup failure
-      }
+      const binary = await readFile(tmpZip);
+      await import("node:fs/promises").then((fs) => fs.rm(tmpZip, { force: true }));
 
       return new Response(binary, {
         headers: {
           "Content-Type": "application/zip",
-          "Content-Disposition": `attachment; filename="${zipName}"`,
+          "Content-Disposition": `attachment; filename="${folderName}.zip"`,
           "Content-Length": String(binary.length),
         },
       });
     }
 
-    // Single file download
-    const fileName = path.split("/").pop() ?? "download";
-    const mimeType = searchParams.get("mimeType")
-      ? decodeURIComponent(searchParams.get("mimeType")!)
-      : getMimeType(fileName);
-
-    const res = await sandboxFileRead(sessionId, path, "base64");
-    const binary = Buffer.from(res.content, "base64");
+    // Single file
+    const binary = await readFile(resolvedPath);
+    const fileName = filePath.split("/").pop() ?? "download";
+    const mimeType =
+      searchParams.get("mimeType") ?? getMimeType(fileName);
 
     return new Response(binary, {
       headers: {
@@ -114,15 +96,8 @@ export async function GET(
     });
   } catch (error) {
     console.error("[Agent Files Download Error]", error);
-    return new Response(JSON.stringify({ error: "Internal server error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
+    return jsonError("Internal server error", 500);
   }
-}
-
-function encodeShellArg(arg: string): string {
-  return arg.replace(/'/g, "'\"'\"'");
 }
 
 function getMimeType(fileName: string): string {

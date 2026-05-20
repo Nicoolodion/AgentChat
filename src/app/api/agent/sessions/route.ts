@@ -5,6 +5,7 @@ import { resolveAuthContext } from "@/lib/auth";
 import { getChatByIdForUser } from "@/lib/chat-store";
 import { prisma } from "@/lib/prisma";
 import { sandboxCreateWorkspace, sandboxHealthCheck } from "@/lib/agent/sandbox";
+import { createHostWorkspace } from "@/lib/agent/workspace";
 
 const createSchema = z.object({
   chatId: z.string().min(1),
@@ -13,6 +14,12 @@ const createSchema = z.object({
 /**
  * POST /api/agent/sessions
  * Creates a new agent session for a chat.
+ *
+ * Workspace layout on the host (mirrored inside the sandbox):
+ *   data/agent-workspaces/{sessionId}/
+ *     upload/    ← user files copied here
+ *     output/    ← agent artifacts
+ *     temp/      ← scratch space
  */
 export async function POST(request: Request) {
   try {
@@ -59,12 +66,13 @@ export async function POST(request: Request) {
       await prisma.agentSession.delete({ where: { id: existing.id } });
     }
 
-    // Health check sandbox before creating
+    // Create the workspace on the host filesystem first.
+    // The docker-compose binds ../data/agent-workspaces:/workspace,
+    // so the sandbox sees the exact same files.
+    const workspacePath = await createHostWorkspace(chatId);
+
+    // Also tell the sandbox to create its dirs (idempotent if already present)
     const sandboxHealthy = await sandboxHealthCheck().catch(() => false);
-
-    const workspacePath = `/workspace/${chatId}`;
-
-    // Create workspace directories in sandbox
     if (sandboxHealthy) {
       await sandboxCreateWorkspace(chatId).catch(() => {
         // Non-critical for creation — will retry later

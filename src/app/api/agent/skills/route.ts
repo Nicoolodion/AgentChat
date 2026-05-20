@@ -6,7 +6,7 @@ import { resolveAuthContext } from "@/lib/auth";
 import { sandboxHealthCheck } from "@/lib/agent/sandbox";
 import type { SkillInfo } from "@/lib/agent/types";
 
-const SKILLS_DIR = path.resolve(process.cwd(), ".kilo", "skills");
+const SKILLS_DIR = path.resolve(process.cwd(), "skills");
 
 /**
  * GET /api/agent/skills

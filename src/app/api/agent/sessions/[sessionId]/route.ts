@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { deleteHostWorkspace } from "@/lib/agent/workspace";
 
 const patchSchema = z.object({
   status: z.enum(["idle", "thinking", "executing", "completed", "error"]).optional(),
@@ -74,6 +75,14 @@ export async function DELETE(
     });
     if (!session) return notFound();
     if (session.userId !== auth.userId) return forbidden();
+
+    // Clean up the host workspace directory
+    try {
+      await deleteHostWorkspace(session.chatId);
+    } catch (cleanupErr) {
+      console.error("[Agent Workspace Cleanup Error]", cleanupErr);
+      // Continue even if cleanup fails — DB record is more important
+    }
 
     await prisma.agentSession.update({
       where: { id: sessionId },

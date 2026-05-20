@@ -12,7 +12,7 @@ const envSchema = z.object({
   DATABASE_URL: z.string().default("file:./prisma/dev.db"),
   NANOGPT_API_KEY: z.string().optional(),
   NANOGPT_BASE_URL: z.string().url().default("https://nano-gpt.com/api"),
-  DEFAULT_MODEL: z.string().default("gpt-4o-mini"),
+  DEFAULT_MODEL: z.string().default("moonshotai/kimi-k2.6:thinking"),
   TITLE_MODEL: z.string().default("Qwen/Qwen3.6-35B-A3B"),
   AUTH_REQUIRED: boolLike.default(true),
   REGISTRATION_ENABLED: boolLike.default(true),
@@ -32,6 +32,7 @@ const envSchema = z.object({
   AGENT_ENABLED: boolLike.default(true),
   AGENT_SANDBOX_URL: z.string().default("http://127.0.0.1:18080"),
   AGENT_MAX_TOOL_CALLS: z.coerce.number().int().positive().default(20),
+  AGENT_WORKSPACE_DIR: z.string().default("data/agent-workspaces"),
 });
 
 export const env = envSchema.parse({
@@ -53,4 +54,5 @@ export const env = envSchema.parse({
   AGENT_ENABLED: process.env.AGENT_ENABLED,
   AGENT_SANDBOX_URL: process.env.AGENT_SANDBOX_URL,
   AGENT_MAX_TOOL_CALLS: process.env.AGENT_MAX_TOOL_CALLS,
+  AGENT_WORKSPACE_DIR: process.env.AGENT_WORKSPACE_DIR,
 });

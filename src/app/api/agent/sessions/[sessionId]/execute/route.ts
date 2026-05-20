@@ -5,6 +5,8 @@ import { getChatByIdForUser, getConversationForModel, appendMessageToChat } from
 import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
+import { getAttachmentForUser } from "@/lib/attachments";
+import { copyFileToWorkspaceUpload, createHostWorkspace } from "@/lib/agent/workspace";
 
 const executeSchema = z.object({
   message: z.string().min(1).max(20_000),
@@ -24,6 +26,11 @@ function sendSseEvent(
 /**
  * POST /api/agent/sessions/:sessionId/execute
  * SSE stream for agent execution.
+ *
+ * Before the agent runs, any user attachments referenced by ID are:
+ *  1. Decrypted from the encrypted host data store
+ *  2. Copied into the session's workspace upload/ directory on the host
+ *  3. Visible inside the sandbox via the bind-mounted workspace volume
  */
 export async function POST(
   request: Request,
@@ -70,7 +77,7 @@ export async function POST(
       });
     }
 
-    const { message } = parsed.data;
+    const { message, attachments } = parsed.data;
 
     const chat = await getChatByIdForUser(auth.userId, session.chatId);
     if (!chat) {
@@ -78,6 +85,38 @@ export async function POST(
         status: 404,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // ── Ensure host workspace exists ────────────────────────────────────────
+    await createHostWorkspace(session.chatId).catch(() => undefined);
+
+    // ── Copy decrypted attachments into workspace upload/ ───────────────────
+    if (attachments && attachments.length > 0) {
+      for (const attachmentId of attachments) {
+        try {
+          const { meta, bytes } = await getAttachmentForUser({
+            userId: auth.userId,
+            userKey: auth.userKey,
+            attachmentId,
+          });
+
+          // Write to a temporary file on the host, then copy into workspace
+          const { writeFile, rm } = await import("node:fs/promises");
+          const { tmpdir } = await import("node:os");
+          const path = await import("node:path");
+          const tmpPath = path.join(tmpdir(), `agent-${session.chatId}-${attachmentId}`);
+          await writeFile(tmpPath, bytes);
+
+          try {
+            await copyFileToWorkspaceUpload(session.chatId, tmpPath, meta.fileName);
+          } finally {
+            await rm(tmpPath, { force: true });
+          }
+        } catch (attachErr) {
+          console.error("[Agent Attachment Copy Error]", attachErr);
+          // Continue execution — the agent may still work without this file
+        }
+      }
     }
 
     // Persist user message

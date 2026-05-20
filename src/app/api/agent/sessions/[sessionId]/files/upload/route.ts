@@ -1,6 +1,8 @@
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { sandboxFileWrite } from "@/lib/agent/sandbox";
+import { resolveHostWorkspaceFile, createHostWorkspace } from "@/lib/agent/workspace";
+import { writeFile, mkdir } from "node:fs/promises";
+import path from "node:path";
 
 function jsonError(message: string, status: number) {
   return new Response(JSON.stringify({ error: message }), {
@@ -12,6 +14,10 @@ function jsonError(message: string, status: number) {
 /**
  * POST /api/agent/sessions/:sessionId/files/upload
  * Upload files into the workspace via multipart/form-data.
+ *
+ * Files are written directly to the host filesystem under
+ * data/agent-workspaces/{sessionId}/upload/ so the sandbox
+ * can see them immediately via the bind-mounted volume.
  */
 export async function POST(
   request: Request,
@@ -39,6 +45,9 @@ export async function POST(
       return jsonError("Max 8 files per upload", 413);
     }
 
+    // Ensure workspace exists
+    await createHostWorkspace(session.chatId).catch(() => undefined);
+
     const uploaded: Array<{ name: string; path: string; size: number }> = [];
 
     for (const file of files) {
@@ -49,14 +58,13 @@ export async function POST(
       }
 
       const buffer = Buffer.from(await file.arrayBuffer());
-      const base64 = buffer.toString("base64");
-      const destPath = `upload/${file.name}`;
-
-      await sandboxFileWrite(sessionId, destPath, base64, "base64");
+      const destPath = resolveHostWorkspaceFile(sessionId, `upload/${file.name}`);
+      await mkdir(path.dirname(destPath), { recursive: true });
+      await writeFile(destPath, buffer);
 
       uploaded.push({
         name: file.name,
-        path: `/workspace/${sessionId}/upload/${file.name}`,
+        path: `upload/${file.name}`,
         size: file.size,
       });
     }

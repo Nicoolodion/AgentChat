@@ -5,7 +5,7 @@ import path from "node:path";
 import { resolveAuthContext } from "@/lib/auth";
 import type { SkillDetail } from "@/lib/agent/types";
 
-const SKILLS_DIR = path.resolve(process.cwd(), ".kilo", "skills");
+const SKILLS_DIR = path.resolve(process.cwd(), "skills");
 
 /**
  * GET /api/agent/skills/:skillName

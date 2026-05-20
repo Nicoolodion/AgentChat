@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { sandboxFileList } from "@/lib/agent/sandbox";
+import { listHostWorkspaceFiles, createHostWorkspace } from "@/lib/agent/workspace";
 
 function notFound() {
   return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -16,6 +16,9 @@ function forbidden() {
 /**
  * GET /api/agent/sessions/:sessionId/files?path=/
  * List files in the workspace.
+ *
+ * Reads directly from the host filesystem so the file explorer
+ * works even when the sandbox container is offline.
  */
 export async function GET(
   request: Request,
@@ -36,19 +39,14 @@ export async function GET(
     const path = searchParams.get("path") ?? "/";
 
     // Security: validate path is within workspace
-    if (path.includes("..") || path.startsWith("/") === false && path !== ".") {
+    if (path.includes("..")) {
       return NextResponse.json({ error: "Invalid path" }, { status: 400 });
     }
 
-    const rawFiles = await sandboxFileList(sessionId, path);
-    const files = rawFiles.map((f) => ({
-      name: f.name,
-      path: f.path,
-      isDirectory: f.is_directory,
-      size: f.size,
-      mimeType: f.mime_type,
-      modifiedAt: f.modified_at,
-    }));
+    // Ensure workspace exists
+    await createHostWorkspace(session.chatId).catch(() => undefined);
+
+    const files = await listHostWorkspaceFiles(sessionId, path);
     return NextResponse.json({ files });
   } catch (error) {
     console.error("[Agent Files GET Error]", error);

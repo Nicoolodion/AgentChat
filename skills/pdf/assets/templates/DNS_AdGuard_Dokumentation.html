@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS - Theorie und AdGuard Implementierung</title>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif:wght@400;700&family=Noto+Sans:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        /* Reset and Base */
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Noto Serif', Georgia, serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: #333;
+            text-align: justify;
+            text-align-last: left;
+        }
+
+        /* Page Setup */
+        @page {
+            size: A4;
+            margin: 2.5cm 2cm;
+            @top-center { content: string(doctitle); font-size: 9pt; color: #666; }
+            @bottom-center { content: counter(page); font-size: 9pt; }
+        }
+        @page :first { margin: 0; }
+        @page cover { @top-center { content: none; } @bottom-center { content: none; } }
+        @page toc { @top-center { content: none; } @bottom-center { content: none; } }
+
+        body { string-set: doctitle ""; }
+        h1 { string-set: doctitle content(); }
+
+        /* Cover Page - Swiss Style */
+        .cover {
+            page: cover;
+            width: 210mm;
+            height: 297mm;
+            margin: 0;
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            page-break-after: always;
+        }
+
+        .cover::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 8mm;
+            height: 100%;
+            background: linear-gradient(180deg, #495057 0%, #6c757d 100%);
+        }
+
+        .cover::after {
+            content: '';
+            position: absolute;
+            bottom: 40mm;
+            right: 20mm;
+            width: 60mm;
+            height: 60mm;
+            border: 2px solid rgba(73, 80, 87, 0.2);
+            border-radius: 50%;
+        }
+
+        .cover-accent {
+            position: absolute;
+            top: 30mm;
+            right: 25mm;
+            width: 40mm;
+            height: 40mm;
+            background: rgba(73, 80, 87, 0.1);
+            border-radius: 50%;
+        }
+
+        .cover-line {
+            position: absolute;
+            bottom: 80mm;
+            left: 30mm;
+            width: 80mm;
+            height: 2px;
+            background: #495057;
+        }
+
+        .cover-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            width: 75%;
+            padding-left: 8mm;
+        }
+
+        .cover-title {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 32pt;
+            font-weight: 700;
+            color: #212529;
+            margin-bottom: 0.8cm;
+            letter-spacing: -0.5pt;
+        }
+
+        .cover-subtitle {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 14pt;
+            color: #495057;
+            margin-bottom: 3cm;
+            font-weight: 400;
+        }
+
+        .cover-meta {
+            font-size: 11pt;
+            color: #495057;
+            line-height: 2;
+        }
+
+        .cover-meta p { margin: 0.3em 0; }
+
+        /* Table of Contents */
+        .toc-page {
+            page: toc;
+            page-break-after: always;
+        }
+
+        .toc-title {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 20pt;
+            font-weight: 700;
+            color: #212529;
+            margin-bottom: 1.5cm;
+            padding-bottom: 0.3cm;
+            border-bottom: 2px solid #495057;
+        }
+
+        .toc {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .toc li {
+            margin: 0.6em 0;
+            font-size: 11pt;
+        }
+
+        .toc a {
+            color: #333;
+            text-decoration: none;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .toc a::after {
+            content: leader('.') target-counter(attr(href url), page);
+        }
+
+        .toc-l1 { font-weight: 600; }
+        .toc-l2 { padding-left: 1.5em; }
+
+        /* Content Styles */
+        h1 {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 20pt;
+            font-weight: 700;
+            color: #212529;
+            margin-top: 0;
+            margin-bottom: 0.8cm;
+            padding-bottom: 0.3cm;
+            border-bottom: 2px solid #495057;
+            page-break-after: avoid;
+        }
+
+        h2 {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 14pt;
+            font-weight: 600;
+            color: #343a40;
+            margin-top: 1cm;
+            margin-bottom: 0.5cm;
+            page-break-after: avoid;
+        }
+
+        h3 {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 12pt;
+            font-weight: 600;
+            color: #495057;
+            margin-top: 0.8cm;
+            margin-bottom: 0.4cm;
+            page-break-after: avoid;
+        }
+
+        p {
+            margin: 0.6em 0;
+            orphans: 2;
+            widows: 2;
+        }
+
+        /* Definition Box */
+        .definition {
+            border-left: 3px solid #495057;
+            padding: 0.8em 1em;
+            margin: 1em 0;
+            background: #f8f9fa;
+        }
+
+        .definition-title {
+            font-weight: 700;
+            font-family: 'Noto Sans', sans-serif;
+            margin-bottom: 0.3em;
+            color: #212529;
+        }
+
+        /* Code Blocks */
+        pre {
+            background: #f5f5f5;
+            padding: 1em;
+            border-radius: 3px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 9.5pt;
+            line-height: 1.4;
+            margin: 1em 0;
+            max-width: 100%;
+        }
+
+        code {
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 9.5pt;
+            background: #f5f5f5;
+            padding: 0.1em 0.3em;
+            border-radius: 2px;
+            word-break: break-word;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+        }
+
+        /* Figures */
+        figure {
+            margin: 1.5em 0;
+            text-align: center;
+            page-break-inside: avoid;
+        }
+
+        figure img {
+            max-width: 100%;
+            max-height: 50vh;
+            height: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 3px;
+        }
+
+        figcaption {
+            font-size: 10pt;
+            color: #666;
+            margin-top: 0.5em;
+            font-style: italic;
+        }
+
+        figcaption::before {
+            content: attr(data-label) ": ";
+            font-weight: 600;
+            font-style: normal;
+        }
+
+        /* Tables - Three-line style */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5em 0;
+            font-size: 10pt;
+            max-width: 100%;
+        }
+
+        caption {
+            font-size: 10pt;
+            margin-bottom: 0.5em;
+            text-align: left;
+            font-weight: 600;
+        }
+
+        caption::before {
+            content: attr(data-label) ": ";
+        }
+
+        thead {
+            display: table-header-group;
+        }
+
+        thead tr {
+            border-top: 2px solid #333;
+            border-bottom: 1px solid #333;
+        }
+
+        th {
+            padding: 0.6em 0.8em;
+            text-align: left;
+            font-weight: 600;
+            background: #f8f9fa;
+        }
+
+        td {
+            padding: 0.5em 0.8em;
+            border-bottom: 1px solid #dee2e6;
+        }
+
+        tbody tr:last-child {
+            border-bottom: 2px solid #333;
+        }
+
+        tr { page-break-inside: avoid; }
+
+        /* Lists */
+        ul, ol {
+            margin: 0.8em 0;
+            padding-left: 1.5em;
+        }
+
+        li {
+            margin: 0.3em 0;
+        }
+
+        /* Strong emphasis */
+        strong {
+            font-weight: 700;
+            color: #212529;
+        }
+
+        /* Step boxes for implementation */
+        .step {
+            border: 1px solid #dee2e6;
+            padding: 1em;
+            margin: 1em 0;
+            background: #fff;
+            page-break-inside: avoid;
+        }
+
+        .step-header {
+            font-family: 'Noto Sans', sans-serif;
+            font-weight: 600;
+            color: #495057;
+            margin-bottom: 0.5em;
+            padding-bottom: 0.3em;
+            border-bottom: 1px solid #dee2e6;
+        }
+
+        /* Opinion section */
+        .opinion-box {
+            background: #f8f9fa;
+            border-left: 4px solid #28a745;
+            padding: 1em 1.2em;
+            margin: 1em 0;
+        }
+
+        .opinion-box h3 {
+            margin-top: 0;
+            color: #28a745;
+        }
+
+        /* Rating stars */
+        .rating {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 10pt;
+            margin: 0.3em 0;
+        }
+
+        .rating-label {
+            display: inline-block;
+            width: 120px;
+            font-weight: 600;
+        }
+
+        /* Section breaks */
+        .section {
+            page-break-before: always;
+        }
+
+        .section:first-of-type {
+            page-break-before: auto;
+        }
+
+        /* Prevent overflow */
+        pre, table, figure, img, svg, blockquote {
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+
+        a { word-break: break-all; color: #495057; }
+
+        /* Two-column for comparison */
+        .two-col {
+            display: flex;
+            gap: 1em;
+            margin: 1em 0;
+        }
+
+        .two-col > div {
+            flex: 1;
+        }
+
+        @media print {
+            .two-col { display: block; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Cover Page -->
+<div class="cover">
+    <div class="cover-accent"></div>
+    <div class="cover-line"></div>
+    <div class="cover-content">
+        <h1 class="cover-title">Domain Name System (DNS)</h1>
+        <p class="cover-subtitle">Theorie und praktische Implementierung mit AdGuard</p>
+        <div class="cover-meta">
+            <p>Server-/Client-Testumgebung</p>
+            <p>Docker Compose Deployment</p>
+            <p>April 2025</p>
+        </div>
+    </div>
+</div>
+
+<!-- Table of Contents -->
+<div class="toc-page">
+    <h2 class="toc-title">Inhaltsverzeichnis</h2>
+    <ul class="toc">
+        <li class="toc-l1"><a href="#sec1">1. DNS - Theoretische Grundlagen</a></li>
+        <li class="toc-l2"><a href="#sec1-1">1.1 Was ist DNS?</a></li>
+        <li class="toc-l2"><a href="#sec1-2">1.2 DNS-Aufloesung</a></li>
+        <li class="toc-l2"><a href="#sec1-3">1.3 DNS-Record-Typen</a></li>
+        <li class="toc-l2"><a href="#sec1-4">1.4 DNS-Server-Typen</a></li>
+        <li class="toc-l1"><a href="#sec2">2. AdGuard DNS-Server Implementierung</a></li>
+        <li class="toc-l2"><a href="#sec2-1">2.1 Ueberblick ueber AdGuard</a></li>
+        <li class="toc-l2"><a href="#sec2-2">2.2 Docker Compose Konfiguration</a></li>
+        <li class="toc-l2"><a href="#sec2-3">2.3 Installation und Einrichtung</a></li>
+        <li class="toc-l2"><a href="#sec2-4">2.4 Windows Client-Konfiguration</a></li>
+        <li class="toc-l2"><a href="#sec2-5">2.5 Funktionstest und Ergebnisse</a></li>
+        <li class="toc-l1"><a href="#sec3">3. Persoenliche Stellungnahme</a></li>
+        <li class="toc-l2"><a href="#sec3-1">3.1 Uebersicht und Funktionsumfang</a></li>
+        <li class="toc-l2"><a href="#sec3-2">3.2 Einfachheit der Konfiguration</a></li>
+        <li class="toc-l2"><a href="#sec3-3">3.3 Fazit und Empfehlung</a></li>
+    </ul>
+</div>
+
+<!-- Section 1: DNS Theory -->
+<div class="section" id="sec1">
+    <h1>1. DNS - Theoretische Grundlagen</h1>
+    
+    <h2 id="sec1-1">1.1 Was ist DNS?</h2>
+    
+    <div class="definition">
+        <div class="definition-title">Definition: Domain Name System (DNS)</div>
+        <p>Das Domain Name System (DNS) ist ein hierarchisches, dezentralisiertes Namenssystem fuer Computer, Dienste und andere Ressourcen, die mit dem Internet oder einem privaten Netzwerk verbunden sind. Es uebersetzt menschenlesbare Domainnamen (wie www.example.com) in IP-Adressen (wie 192.168.1.1 oder 2001:db8::1), die fuer die Netzwerkkommunikation erforderlich sind.</p>
+    </div>
+    
+    <p>Das DNS ist einer der fundamentalen Bausteine des Internets und funktioniert als das "Telefonbuch des Internets". Ohne DNS muessten Benutzer sich komplexe numerische IP-Adressen merken, um auf Websites zuzugreifen. Das System wurde 1983 von Paul Mockapetris entwickelt und hat sich seitdem zu einem kritischen Infrastrukturelement entwickelt.</p>
+    
+    <h3>Kernfunktionen des DNS</h3>
+    <ul>
+        <li><strong>Namensaufloesung:</strong> Umwandlung von Domainnamen in IP-Adressen</li>
+        <li><strong>Reverse-DNS:</strong> Umwandlung von IP-Adressen in Domainnamen</li>
+        <li><strong>Lastverteilung:</strong> Verteilung von Anfragen auf mehrere Server</li>
+        <li><strong>Mail-Routing:</strong> Steuerung von E-Mail-Zustellung durch MX-Records</li>
+        <li><strong>Service-Discovery:</strong> Auffinden von Diensten im Netzwerk</li>
+    </ul>
+    
+    <h2 id="sec1-2">1.2 DNS-Aufloesung</h2>
+    
+    <p>Der Prozess der DNS-Aufloesung umfasst mehrere Schritte und involviert verschiedene Server-Typen. Bei einer typischen Anfrage durchlaeuft das System folgende Phasen:</p>
+    
+    <table>
+        <caption data-label="Tabelle 1">Phasen der DNS-Aufloesung</caption>
+        <thead>
+            <tr>
+                <th>Phase</th>
+                <th>Beschreibung</th>
+                <th>Beteiligter Server</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>1. Cache-Pruefung</td>
+                <td>Pruefung des lokalen DNS-Caches</td>
+                <td>Resolver/Client</td>
+            </tr>
+            <tr>
+                <td>2. Rekursive Anfrage</td>
+                <td>Anfrage an den rekursiven DNS-Resolver</td>
+                <td>DNS-Resolver</td>
+            </tr>
+            <tr>
+                <td>3. Root-Server</td>
+                <td>Anfrage an Root-Nameserver</td>
+                <td>Root-Server (13 weltweit)</td>
+            </tr>
+            <tr>
+                <td>4. TLD-Server</td>
+                <td>Weiterleitung an TLD-Nameserver</td>
+                <td>TLD-Server (.com, .de, etc.)</td>
+            </tr>
+            <tr>
+                <td>5. Autoritaerer Server</td>
+                <td>Anfrage beim autoritaeren Nameserver</td>
+                <td>Domain-Nameserver</td>
+            </tr>
+            <tr>
+                <td>6. Antwort</td>
+                <td>Rueckgabe der IP-Adresse</td>
+                <td>Resolver an Client</td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <h3>DNS-Cache</h3>
+    <p>DNS-Informationen werden auf verschiedenen Ebenen zwischengespeichert, um die Effizienz zu steigern und die Serverlast zu reduzieren:</p>
+    <ul>
+        <li><strong>Browser-Cache:</strong> Speichert DNS-Eintraege im Webbrowser</li>
+        <li><strong>Betriebssystem-Cache:</strong> Systemweiter DNS-Cache</li>
+        <li><strong>Resolver-Cache:</strong> Cache des DNS-Resolvers (oft beim ISP)</li>
+        <li><strong>CDN-Cache:</strong> Content Delivery Network Caching</li>
+    </ul>
+    
+    <p>Die Lebensdauer von Cache-Eintraegen wird durch den <strong>TTL-Wert (Time To Live)</strong> im DNS-Record bestimmt. Nach Ablauf der TTL wird der Eintrag neu abgefragt.</p>
+    
+    <h2 id="sec1-3">1.3 DNS-Record-Typen</h2>
+    
+    <p>DNS-Records speichern verschiedene Arten von Informationen. Die wichtigsten Record-Typen sind:</p>
+    
+    <table>
+        <caption data-label="Tabelle 2">Wichtige DNS-Record-Typen</caption>
+        <thead>
+            <tr>
+                <th>Record-Typ</th>
+                <th>Zweck</th>
+                <th>Beispiel</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>A</strong></td>
+                <td>IPv4-Adresse zuweisen</td>
+                <td>example.com -> 93.184.216.34</td>
+            </tr>
+            <tr>
+                <td><strong>AAAA</strong></td>
+                <td>IPv6-Adresse zuweisen</td>
+                <td>example.com -> 2606:2800:220:1::</td>
+            </tr>
+            <tr>
+                <td><strong>CNAME</strong></td>
+                <td>Alias/Weiterleitung</td>
+                <td>www.example.com -> example.com</td>
+            </tr>
+            <tr>
+                <td><strong>MX</strong></td>
+                <td>Mail-Server festlegen</td>
+                <td>mail.example.com (Prioritaet 10)</td>
+            </tr>
+            <tr>
+                <td><strong>NS</strong></td>
+                <td>Nameserver definieren</td>
+                <td>ns1.example.com, ns2.example.com</td>
+            </tr>
+            <tr>
+                <td><strong>TXT</strong></td>
+                <td>Textinformationen</td>
+                <td>SPF, DKIM, Verifikation</td>
+            </tr>
+            <tr>
+                <td><strong>PTR</strong></td>
+                <td>Reverse-DNS</td>
+                <td>34.216.184.93.in-addr.arpa</td>
+            </tr>
+            <tr>
+                <td><strong>SOA</strong></td>
+                <td>Start of Authority</td>
+                <td>Zonen-Administrationsdaten</td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <h2 id="sec1-4">1.4 DNS-Server-Typen</h2>
+    
+    <h3>Autoritaere Nameserver</h3>
+    <p>Autoritaere Nameserver enthalten die tatsaechlichen DNS-Records fuer eine Domain. Sie sind die ultimative Quelle der Wahrheit fuer DNS-Informationen einer bestimmten Zone. Jede Domain muss mindestens zwei autoritaere Nameserver haben (Primaer und Sekundaer).</p>
+    
+    <h3>Rekursive Resolver</h3>
+    <p>Rekursive Resolver (auch Caching-Nameserver genannt) beantworten DNS-Anfragen von Clients, indem sie die hierarchische DNS-Struktur durchlaufen. Sie speichern die Ergebnisse zwischen, um zukuenftige Anfragen schneller zu beantworten.</p>
+    
+    <h3>Forwarding Server</h3>
+    <p>Forwarding-Server leiten alle Anfragen an einen anderen DNS-Server weiter, anstatt selbst die Aufloesung durchzufuehren. Dies wird oft in Unternehmensnetzwerken verwendet, um zentrale Kontrolle und Filterung zu ermoeglichen.</p>
+    
+    <h3>DNS-Filter und Ad-Blocker</h3>
+    <p>Moderne DNS-Server wie AdGuard, Pi-hole oder NextDNS bieten zusaetzliche Funktionen:</p>
+    <ul>
+        <li><strong>Werbeblockierung:</strong> Blockieren von Werbe- und Tracking-Domains</li>
+        <li><strong>Malware-Schutz:</strong> Filterung boesartiger Domains</li>
+        <li><strong>Kindersicherung:</strong> Sperrung unangemessener Inhalte</li>
+        <li><strong>DoH/DoT:</strong> Verschluesselte DNS-Anfragen (DNS over HTTPS/TLS)</li>
+    </ul>
+</div>
+
+<!-- Section 2: AdGuard Implementation -->
+<div class="section" id="sec2">
+    <h1>2. AdGuard DNS-Server Implementierung</h1>
+    
+    <h2 id="sec2-1">2.1 Ueberblick ueber AdGuard</h2>
+    
+    <p>AdGuard Home ist ein netzwerkweiter Werbeblocker, der als DNS-Server fungiert. Im Gegensatz zu browserbasierten Ad-Blockern filtert AdGuard den Datenverkehr fuer alle Geraete im Netzwerk, ohne dass auf jedem Geraet Software installiert werden muss.</p>
+    
+    <h3>Hauptfunktionen von AdGuard</h3>
+    <ul>
+        <li>Netzwerkweite Werbe- und Tracker-Blockierung</li>
+        <li>Schutz vor Phishing und Malware-Domains</li>
+        <li>Elternkontrolle und Content-Filterung</li>
+        <li>Detaillierte Statistiken und Query-Logs</li>
+        <li>Unterstuetzung fuer DNS-over-HTTPS (DoH) und DNS-over-TLS (DoT)</li>
+        <li>Eigene Filterlisten und Whitelist-Konfiguration</li>
+        <li>Benutzerfreundliches Webinterface</li>
+    </ul>
+    
+    <h2 id="sec2-2">2.2 Docker Compose Konfiguration</h2>
+    
+    <p>Fuer die Implementierung wurde AdGuard Home als Docker-Container auf einem Homeserver bereitgestellt. Docker Compose bietet eine einfache und reproduzierbare Methode zur Bereitstellung.</p>
+    
+    <div class="step">
+        <div class="step-header">Schritt 1: Docker Compose Datei erstellen</div>
+        <p>Die folgende <code>docker-compose.yml</code> Datei wurde fuer die AdGuard-Installation verwendet:</p>
+        <pre><code>version: "3"
+services:
+  adguardhome:
+    image: adguard/adguardhome:latest
+    container_name: adguardhome
+    ports:
+      - 53:53/tcp
+      - 53:53/udp
+      - 784:784/udp
+      - 853:853/tcp
+      - 3000:3000/tcp
+      - 8040:80/tcp
+    volumes:
+      - ./workdir:/opt/adguardhome/work
+      - ./confdir:/opt/adguardhome/conf
+    restart: unless-stopped</code></pre>
+    </div>
+    
+    <figure id="fig-1">
+        <img src="dns_images/screenshot_1.png" alt="Docker Compose Konfiguration">
+        <figcaption data-label="Abbildung 1">Docker Compose Konfiguration fuer AdGuard Home</figcaption>
+    </figure>
+    
+    <h3>Port-Erklaerung</h3>
+    <table>
+        <caption data-label="Tabelle 3">Verwendete Ports in der Docker-Konfiguration</caption>
+        <thead>
+            <tr>
+                <th>Port</th>
+                <th>Protokoll</th>
+                <th>Verwendung</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>53</td>
+                <td>TCP/UDP</td>
+                <td>Standard DNS-Port</td>
+            </tr>
+            <tr>
+                <td>784</td>
+                <td>UDP</td>
+                <td>DNS-over-QUIC</td>
+            </tr>
+            <tr>
+                <td>853</td>
+                <td>TCP</td>
+                <td>DNS-over-TLS</td>
+            </tr>
+            <tr>
+                <td>3000</td>
+                <td>TCP</td>
+                <td>Erstkonfiguration (Setup-Wizard)</td>
+            </tr>
+            <tr>
+                <td>8040</td>
+                <td>TCP</td>
+                <td>Webinterface fuer Administration</td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <h2 id="sec2-3">2.3 Installation und Einrichtung</h2>
+    
+    <div class="step">
+        <div class="step-header">Schritt 2: Container starten und Erstkonfiguration</div>
+        <p>Nach dem Start des Containers mit <code>docker-compose up -d</code> wird das Webinterface ueber Port 3000 fuer die Erstkonfiguration aufgerufen. Der Setup-Wizard fuehrt durch die grundlegende Konfiguration:</p>
+        <ul>
+            <li>Admin-Benutzername und Passwort festlegen</li>
+            <li>DNS-Ports konfigurieren (hier: 53 fuer DNS)</li>
+            <li>Webinterface-Port festlegen (hier: 8040)</li>
+        </ul>
+    </div>
+    
+    <figure id="fig-2">
+        <img src="dns_images/screenshot_2.png" alt="AdGuard Setup Wizard">
+        <figcaption data-label="Abbildung 2">AdGuard Setup Wizard - Erstkonfiguration</figcaption>
+    </figure>
+    
+    <div class="step">
+        <div class="step-header">Schritt 3: DNS-Server Einstellungen</div>
+        <p>Im naechsten Schritt werden die Upstream-DNS-Server konfiguriert. AdGuard leitet Anfragen fuer nicht blockierte Domains an diese Server weiter. Empfohlene Optionen sind:</p>
+        <ul>
+            <li><strong>Cloudflare:</strong> 1.1.1.1 und 1.0.0.1 (schnell, datenschutzfreundlich)</li>
+            <li><strong>Quad9:</strong> 9.9.9.9 (mit Malware-Schutz)</li>
+            <li><strong>Google:</strong> 8.8.8.8 und 8.8.4.4 (sehr zuverlaessig)</li>
+        </ul>
+    </div>
+    
+    <figure id="fig-3">
+        <img src="dns_images/screenshot_3.png" alt="DNS-Server Konfiguration">
+        <figcaption data-label="Abbildung 3">Upstream DNS-Server Konfiguration</figcaption>
+    </figure>
+    
+    <div class="step">
+        <div class="step-header">Schritt 4: Filterlisten konfigurieren</div>
+        <p>AdGuard verwendet Filterlisten, um Werbung, Tracker und unerwuenschte Inhalte zu blockieren. Standardmaessig sind mehrere Listen aktiviert:</p>
+        <ul>
+            <li>AdGuard DNS Filter</li>
+            <li>AdAway Default Blocklist</li>
+            <li>MalwareDomainList.com Hosts List</li>
+        </ul>
+        <p>Zusaetzliche Listen koennen nach Bedarf hinzugefuegt werden.</p>
+    </div>
+    
+    <figure id="fig-4">
+        <img src="dns_images/screenshot_4.png" alt="Filterlisten Konfiguration">
+        <figcaption data-label="Abbildung 4">Filterlisten fuer Werbe- und Tracker-Blockierung</figcaption>
+    </figure>
+    
+    <h2 id="sec2-4">2.4 Windows Client-Konfiguration</h2>
+    
+    <div class="step">
+        <div class="step-header">Schritt 5: Windows DNS-Einstellungen anpassen</div>
+        <p>Um den Windows-Client fuer die Verwendung des AdGuard DNS-Servers zu konfigurieren, muessen die DNS-Einstellungen der Netzwerkverbindung angepasst werden:</p>
+        <ol>
+            <li>Netzwerk- und Freigabecenter oeffnen</li>
+            <li>Aktive Netzwerkverbindung auswaehlen</li>
+            <li>Eigenschaften -> Internetprotokoll Version 4 (TCP/IPv4)</li>
+            <li>"Folgende DNS-Serveradressen verwenden" auswaehlen</li>
+            <li>IP-Adresse des AdGuard-Servers als bevorzugten DNS-Server eingeben</li>
+        </ol>
+    </div>
+    
+    <figure id="fig-5">
+        <img src="dns_images/screenshot_5.png" alt="Windows DNS Konfiguration">
+        <figcaption data-label="Abbildung 5">Windows DNS-Einstellungen fuer AdGuard-Server</figcaption>
+    </figure>
+    
+    <h2 id="sec2-5">2.5 Funktionstest und Ergebnisse</h2>
+    
+    <div class="step">
+        <div class="step-header">Schritt 6: Funktionsueberpruefung</div>
+        <p>Nach der Konfiguration wird die Funktionalitaet durch Browsen verschiedener Websites und durch Ping-Tests ueberprueft. Das AdGuard Dashboard zeigt detaillierte Statistiken:</p>
+        <ul>
+            <li>Anzahl der verarbeiteten DNS-Anfragen</li>
+            <li>Anzahl der blockierten Anfragen</li>
+            <li>Top blockierte Domains</li>
+            <li>Top angefragte Domains</li>
+            <li>Query-Logs fuer detaillierte Analyse</li>
+        </ul>
+    </div>
+    
+    <figure id="fig-6">
+        <img src="dns_images/screenshot_6.png" alt="AdGuard Dashboard">
+        <figcaption data-label="Abbildung 6">AdGuard Dashboard mit Statistiken und Query-Logs</figcaption>
+    </figure>
+    
+    <p>Das Dashboard zeigt, dass AdGuard erfolgreich DNS-Anfragen verarbeitet und Werbe- sowie Tracking-Domains effektiv blockiert. Die blockierten Anfragen werden in Echtzeit angezeigt, was eine transparente Kontrolle ermoeglicht.</p>
+</div>
+
+<!-- Section 3: Personal Opinion -->
+<div class="section" id="sec3">
+    <h1>3. Persoenliche Stellungnahme</h1>
+    
+    <h2 id="sec3-1">3.1 Uebersicht und Funktionsumfang</h2>
+    
+    <p>AdGuard Home bietet einen umfassenden Funktionsumfang fuer ein netzwerkweites DNS-Filtering. Die wichtigsten Staerken sind:</p>
+    
+    <div class="opinion-box">
+        <h3>Funktionsbewertung</h3>
+        <div class="rating"><span class="rating-label">Werbeblockierung:</span> Hervorragend</div>
+        <div class="rating"><span class="rating-label">Tracker-Schutz:</span> Hervorragend</div>
+        <div class="rating"><span class="rating-label">Malware-Schutz:</span> Gut</div>
+        <div class="rating"><span class="rating-label">Elternkontrolle:</span> Gut</div>
+        <div class="rating"><span class="rating-label">Statistiken:</span> Sehr gut</div>
+        <div class="rating"><span class="rating-label">DoH/DoT Support:</span> Hervorragend</div>
+    </div>
+    
+    <p>Im Vergleich zu Alternativen wie Pi-hole bietet AdGuard eine modernere Benutzeroberflaeche und integrierte Verschluesselungsoptionen (DoH/DoT) ohne zusaetzliche Konfiguration. Die vorinstallierten Filterlisten decken die meisten Anwendungsfaelle ab, koennen aber bei Bedarf erweitert werden.</p>
+    
+    <h2 id="sec3-2">3.2 Einfachheit der Konfiguration</h2>
+    
+    <p>Die Docker-basierte Installation erheblich vereinfacht die Bereitstellung. Die wichtigsten Vorteile der Docker-Implementierung:</p>
+    
+    <table>
+        <caption data-label="Tabelle 4">Bewertung der Konfiguration</caption>
+        <thead>
+            <tr>
+                <th>Aspekt</th>
+                <th>Bewertung</th>
+                <th>Anmerkung</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Installation</td>
+                <td>Sehr einfach</td>
+                <td>Docker Compose startet alles automatisch</td>
+            </tr>
+            <tr>
+                <td>Erstkonfiguration</td>
+                <td>Einfach</td>
+                <td>Setup-Wizard fuehrt durch alle Schritte</td>
+            </tr>
+            <tr>
+                <td>Port-Konfiguration</td>
+                <td>Mittel</td>
+                <td>Port 53 erfordert ggf. root-Rechte</td>
+            </tr>
+            <tr>
+                <td>Filterlisten</td>
+                <td>Sehr einfach</td>
+                <td>Vorkonfiguriert, einfach anpassbar</td>
+            </tr>
+            <tr>
+                <td>Client-Konfiguration</td>
+                <td>Einfach</td>
+                <td>DNS-Einstellung auf Client-Geraeten</td>
+            </tr>
+            <tr>
+                <td>Wartung</td>
+                <td>Sehr einfach</td>
+                <td>Automatische Updates via Docker</td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <p>Die Konfiguration ueber das Webinterface ist intuitiv und gut strukturiert. Besonders hilfreich ist die Moeglichkeit, Einstellungen ohne Neustart des Dienstes zu aendern. Die Query-Logs bieten wertvolle Einblicke in das Netzwerkverhalten.</p>
+    
+    <h3>Herausforderungen</h3>
+    <ul>
+        <li><strong>Port 53:</strong> Auf einigen Systemen ist Port 53 bereits durch systemd-resolved belegt und muss freigegeben werden</li>
+        <li><strong>IPv6:</strong> Die Konfiguration fuer IPv6-Netzwerke erfordert zusaetzliche Aufmerksamkeit</li>
+        <li><strong>Router-Konfiguration:</strong> Fuer netzwerkweite Nutzung muss der Router auf den AdGuard-Server zeigen</li>
+    </ul>
+    
+    <h2 id="sec3-3">3.3 Fazit und Empfehlung</h2>
+    
+    <p>AdGuard Home ist eine ausgezeichnete Wahl fuer alle, die netzwerkweite Werbeblockierung und verbesserte Privatsphaere suchen. Die Docker-basierte Installation auf einem Homeserver bietet maximale Flexibilitaet und einfache Wartung.</p>
+    
+    <div class="opinion-box">
+        <h3>Gesamtbewertung</h3>
+        <p><strong>Gesamtnote: 9/10</strong></p>
+        <p>AdGuard Home ueberzeugt durch einfache Installation, umfangreiche Funktionen und eine moderne Benutzeroberflaeche. Besonders fuer Docker-erfahrene Nutzer ist die Einrichtung im Homeserver-Umfeld optimal geeignet. Die Kombination aus Werbeblockierung, Tracker-Schutz und verschluesselten DNS-Anfragen bietet einen deutlichen Mehrwert fuer die gesamte Netzwerkinfrastruktur.</p>
+    </div>
+    
+    <h3>Empfohlene Einsatzszenarien</h3>
+    <ul>
+        <li><strong>Homeserver-Umgebungen:</strong> Ideale Ergaenzung fuer bestehende Docker-Setup</li>
+        <li><strong>Smart-Home-Netzwerke:</strong> Schutz von IoT-Geraeten vor Tracking</li>
+        <li><strong>Familiennetzwerke:</strong> Elternkontrolle und kindersicheres Internet</li>
+        <li><strong>Privacy-fokussierte Nutzer:</strong> DoH/DoT fuer verschluesselte DNS-Anfragen</li>
+    </ul>
+    
+    <p>Die Entscheidung fuer AdGuard gegenueber Alternativen wie Pi-hole oder BIND mit Blocklisten ist durch die moderne Oberflaeche und die integrierte Verschluesselungsunterstuetzung gerechtfertigt. Fuer reine DNS-Aufloesung ohne Filterfunktionen waeren BIND oder dnsmasq leichtgewichtigere Alternativen.</p>
+</div>
+
+</body>
+</html>
