@@ -10,7 +10,7 @@ import { copyFileToWorkspaceUpload, createHostWorkspace } from "@/lib/agent/work
 
 const executeSchema = z.object({
   message: z.string().min(1).max(20_000),
-  attachments: z.array(z.string().min(16).max(64)).max(8).optional(),
+  attachments: z.array(z.string().min(16).max(64)).max(40).optional(),
 });
 
 const encoder = new TextEncoder();

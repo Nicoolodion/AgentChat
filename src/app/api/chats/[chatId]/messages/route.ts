@@ -27,7 +27,7 @@ import { getAttachmentForUser } from "@/lib/attachments";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
-  attachments: z.array(z.string().min(16).max(64)).max(8).optional(),
+  attachments: z.array(z.string().min(16).max(64)).max(40).optional(),
   agentEnabled: z.boolean().optional(),
 });
 

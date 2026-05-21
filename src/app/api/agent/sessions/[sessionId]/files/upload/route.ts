@@ -41,8 +41,8 @@ export async function POST(
       return jsonError("No files provided", 400);
     }
 
-    if (files.length > 8) {
-      return jsonError("Max 8 files per upload", 413);
+    if (files.length > 40) {
+      return jsonError("Max 40 files per upload", 413);
     }
 
     // Ensure workspace exists

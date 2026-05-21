@@ -23,7 +23,7 @@ If you do NOT have `create_subagent` / `task` tools, you are not an Orchestrator
 
 **3. Create** (`references/openxml-sdk-reference.md`) — Neither of the above.
 
-No target .docx, no upstream .md. Build the document from scratch using C# + OpenXML SDK via `./scripts/docx build`.
+No target .docx, no upstream .md. Build the document from scratch using C# + OpenXML SDK via the `docx_build` tool. Do NOT run `./scripts/docx` via `shell`.
 
 ---
 
@@ -58,7 +58,7 @@ docx/
 
 ## Validation
 
-- **Creation**: `./scripts/docx build` runs the full pipeline (compile → generate → auto-fix element order → OpenXML validate → business rules)
+- **Creation**: The `docx_build` tool runs the full pipeline (compile → generate → auto-fix element order → OpenXML validate → business rules)
 - **Editing**: The engine validates internally; after saving, spot-check high-risk areas
 
 ## Hard Rules

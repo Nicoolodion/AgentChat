@@ -272,3 +272,20 @@ export async function sandboxConvertDocxToPdf(
   })) as { output_path: string; size: number };
   return res;
 }
+
+export async function sandboxDocxBuild(
+  sessionId: string,
+  outputPath: string,
+  programCs?: string
+): Promise<{ output_path: string; size: number; stdout: string }> {
+  const res = (await sandboxFetch("/docx/build", {
+    method: "POST",
+    body: JSON.stringify({
+      output_path: outputPath,
+      program_cs: programCs,
+      session_id: sessionId,
+    }),
+    timeout: 310_000,
+  })) as { output_path: string; size: number; stdout: string };
+  return res;
+}

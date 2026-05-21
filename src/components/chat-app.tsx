@@ -574,7 +574,7 @@ export function ChatApp() {
       const newItems = json.attachments ?? [];
       setPendingAttachments((current) => {
         const merged = [...current, ...newItems];
-        return merged.slice(0, 8);
+        return merged.slice(0, 40);
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
@@ -1529,7 +1529,7 @@ export function ChatApp() {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={uploadingAttachments || pendingAttachments.length >= 8}
+                    disabled={uploadingAttachments || pendingAttachments.length >= 40}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-2 py-1 text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
                   >
                     {uploadingAttachments ? (

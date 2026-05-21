@@ -26,6 +26,7 @@ import {
 import {
   sandboxConvertDocxToPdf,
   sandboxConvertHtmlToPdf,
+  sandboxDocxBuild,
   sandboxExecPython,
   sandboxExecShell,
   sandboxFileDelete,
@@ -223,6 +224,21 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "docx_build",
+      description: "Build a high-quality Word document using the DOCX skill's C# + OpenXML SDK pipeline. This is the preferred route for creating professional DOCX files from scratch. Reads SKILL.md from /app/skills/docx for routing rules. Provide a complete C# Program.cs source that uses DocumentFormat.OpenXml.",
+      parameters: {
+        type: "object",
+        properties: {
+          output_path: { type: "string", description: "Relative path for output DOCX (e.g. 'output/report.docx')" },
+          program_cs: { type: "string", description: "Complete C# source code for Program.cs using DocumentFormat.OpenXml. The skill will compile, run, validate, and produce the docx." },
+        },
+        required: ["output_path", "program_cs"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "xlsx_create",
       description: "Create an Excel spreadsheet using openpyxl. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.xlsx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
       parameters: {
@@ -408,12 +424,24 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ## Skills
 Skills are mounted at /app/skills/ and provide domain expertise:
-- /app/skills/docx/ — Word document creation (read SKILL.md for routing rules)
+- /app/skills/docx/ — Word document creation via C# + OpenXML SDK
 - /app/skills/pdf/ — PDF generation from HTML (read SKILL.md for routing rules)
 - /app/skills/xlsx/ — Spreadsheet creation
 - /app/skills/pptx/ — Presentation creation
 
 To read a skill file, use file_read with the path /app/skills/<skill>/SKILL.md.
+
+### DOCX Skill (Important)
+For Word document tasks, ALWAYS read /app/skills/docx/SKILL.md FIRST before writing any code. It contains routing rules:
+- **WIR route** — If an existing .docx template/format matters, use the WIR engine (read references/wir-reference.md).
+- **Create route** — If building from scratch, use the \`docx_build\` tool. Write C# code using DocumentFormat.OpenXml, then call docx_build with program_cs and output_path.
+- **md2docx route** — If you have upstream .md files from sub-agents, use the md2docx pipeline (references/md2docx-reference.md).
+
+Quality standards from the DOCX skill:
+- Low-saturation color palette; never pure red/blue.
+- Headers, footers, and page numbers must be present.
+- No placeholder text remains.
+- Cover/backcover backgrounds must contrast with text.
 
 ## Quality Standards
 - Place all final deliverables in the output/ directory.
@@ -453,7 +481,7 @@ export async function runAgentExecution(input: {
   let toolCallsCount = 0;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "20");
 
-  for (let iteration = 0; iteration < 4; iteration++) {
+  for (let iteration = 0; iteration < 50 && toolCallsCount < maxToolCalls; iteration++) {
     const accumulatedToolCalls: Array<{
       id: string;
       type: string;
@@ -462,7 +490,7 @@ export async function runAgentExecution(input: {
     let currentToolCallIndex = -1;
     let contentBuffer = "";
 
-    const response = await nanoClient.chat.completions.create({
+        const response = await nanoClient.chat.completions.create({
       model,
       messages,
       tools: AGENT_TOOL_SCHEMAS,
@@ -687,13 +715,24 @@ async function executeSandboxTool(
     case "docx_create": {
       const outputPath = String(args.output_path ?? "");
       const pythonCode = String(args.python_code ?? "");
-      await sandboxExecShell(sessionId, `mkdir -p "$(dirname '${outputPath.replace(/'/g, "'\\'")}')"`, "/", 10);
+      await sandboxExecShell(sessionId, `mkdir -p "$(dirname '${outputPath.replace(/'/g, "'\'")}')"`, "/", 10);
       const res = await sandboxExecPython(sessionId, pythonCode, 120);
       return {
         ok: !res.error,
         result: res,
         error: res.error ?? undefined,
         stdout: res.stdout || `DOCX created: ${outputPath}`,
+      };
+    }
+    case "docx_build": {
+      const outputPath = String(args.output_path ?? "");
+      const programCs = String(args.program_cs ?? "");
+      await sandboxExecShell(sessionId, `mkdir -p "$(dirname '${outputPath.replace(/'/g, "'\'")}')"`, "/", 10);
+      const res = await sandboxDocxBuild(sessionId, outputPath, programCs || undefined);
+      return {
+        ok: true,
+        result: res,
+        stdout: res.stdout || `DOCX built: ${outputPath} (${res.size} bytes)`,
       };
     }
     case "xlsx_create": {
@@ -923,7 +962,7 @@ async function scanForArtifacts(
   sendEvent: (event: AgentSseEvent) => void
 ): Promise<void> {
   // After file write or conversion tools, scan the output directory for new artifacts
-  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "xlsx_create", "pptx_create", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
+  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "xlsx_create", "pptx_create", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
 
   try {
     const files = await sandboxFileList(sessionId, "output/");

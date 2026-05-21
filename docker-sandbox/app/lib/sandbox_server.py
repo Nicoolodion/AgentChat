@@ -639,6 +639,98 @@ def file_info() -> Response:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DOCX Build (C# + OpenXML SDK creation route)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/docx/build", methods=["POST"])
+def docx_build() -> Response:
+    """Build a DOCX file using the docx skill's C# + OpenXML SDK pipeline."""
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id", "default")
+    output_path = data.get("output_path", "")
+    program_cs = data.get("program_cs", "")
+
+    if not output_path:
+        return make_error("Missing 'output_path' field", 400)
+
+    session_workspace = ensure_session_dirs(session_id)
+
+    try:
+        out_file = resolve_workspace_path(session_id, output_path)
+    except ValueError:
+        return make_error("Invalid output_path", 400)
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Determine absolute output path for the script
+    abs_output = str(out_file)
+
+    # Use the session workspace as the build work dir (writable + executable volume)
+    work_dir = session_workspace / ".docx-work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # If program_cs is provided, write it to the work dir
+    if program_cs:
+        skill_dir = SKILLS_ROOT / "docx"
+        # Copy template files if they don't exist
+        csproj_src = skill_dir / "assets" / "templates" / "Docx.csproj"
+        program_src = skill_dir / "assets" / "templates" / "Program.cs"
+        csproj_dst = work_dir / "Docx.csproj"
+        program_dst = work_dir / "Program.cs"
+        if csproj_src.exists() and not csproj_dst.exists():
+            csproj_dst.write_text(csproj_src.read_text(encoding="utf-8"), encoding="utf-8")
+        if program_src.exists() and not program_dst.exists():
+            program_dst.write_text(program_src.read_text(encoding="utf-8"), encoding="utf-8")
+        program_dst.write_text(program_cs, encoding="utf-8")
+
+    docx_script = SKILLS_ROOT / "docx" / "scripts" / "docx"
+    if not docx_script.exists():
+        return make_error("docx skill script not found at /app/skills/docx/scripts/docx", 500)
+
+    cmd = ["bash", str(docx_script), "build", abs_output]
+
+    env = os.environ.copy()
+    env["DOCX_WORK_DIR"] = str(work_dir)
+    env["HOME"] = "/tmp"
+    env["DOTNET_CLI_HOME"] = "/tmp"
+    env["NUGET_PACKAGES"] = "/tmp/nuget"
+    env["NUGET_HTTP_CACHE_PATH"] = "/tmp/nuget-http-cache"
+    env["NUGET_SCRATCH"] = "/tmp/nuget-scratch"
+    env["TMPDIR"] = "/tmp"
+
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(work_dir),
+            env=env,
+        )
+        duration_ms = int((time.time() - start) * 1000)
+
+        if proc.returncode != 0:
+            return make_error(
+                f"DOCX build failed:\n{proc.stdout}\n{proc.stderr}", 500
+            )
+
+        if not out_file.exists():
+            return make_error("DOCX was not generated", 500)
+
+        return make_success({
+            "output_path": str(out_file),
+            "size": out_file.stat().st_size,
+            "duration_ms": duration_ms,
+            "stdout": proc.stdout[-MAX_OUTPUT_SIZE:] if len(proc.stdout) > MAX_OUTPUT_SIZE else proc.stdout,
+        })
+    except subprocess.TimeoutExpired:
+        return make_error("DOCX build timed out", 504)
+    except Exception as e:
+        return make_error(f"DOCX build error: {e}", 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Conversions
 # ═══════════════════════════════════════════════════════════════════════════════
 
