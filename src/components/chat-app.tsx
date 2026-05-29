@@ -775,6 +775,11 @@ export function ChatApp() {
           try {
             const data = JSON.parse(dataStr.trim());
 
+            // Forward agent-relevant SSE events to the agent hook for live terminal updates
+            if (agent.isAgentMode) {
+              agent.processSseEvent(eventType, data);
+            }
+
             if (eventType === "ttft" && !streamingStarted) {
               ttftMsVal = data.ttftMs;
               streamingStarted = true;
@@ -1075,6 +1080,11 @@ export function ChatApp() {
 
           try {
             const data = JSON.parse(dataStr.trim());
+
+            // Forward agent-relevant SSE events to the agent hook for live terminal updates
+            if (agent.isAgentMode) {
+              agent.processSseEvent(eventType, data);
+            }
 
             if (eventType === "ttft" && !streamingStarted) {
               ttftMsVal = data.ttftMs;

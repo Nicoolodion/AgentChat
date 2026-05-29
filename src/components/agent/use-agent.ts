@@ -464,6 +464,7 @@ export function useAgent(chatId: string | undefined) {
     loadSession,
     syncChatMode,
     executeAgent,
+    processSseEvent: (eventType: string, data: Record<string, unknown>) => handleSseEvent(eventType, data, setState),
   };
 }
 

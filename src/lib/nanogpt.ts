@@ -85,7 +85,14 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch models: ${response.status}`);
+    console.warn(`Could not fetch model list (${response.status}). Falling back to DEFAULT_MODEL.`);
+    return [
+      {
+        id: env.DEFAULT_MODEL,
+        name: env.DEFAULT_MODEL,
+        displayName: env.DEFAULT_MODEL,
+      },
+    ];
   }
 
   const json = (await response.json()) as { data?: ModelApiRow[] };

@@ -333,15 +333,17 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "image_analyze",
-      description: "Analyze an image file using the current vision-capable model. Returns a textual description or answers a question about the image.",
+      description: "Analyze one or more image files using the vision-capable model. Supports batching for efficiency. Returns an array of descriptions, one per image, in the same order as the input paths.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Relative path to the image file in the workspace (e.g. 'upload/photo.jpg')" },
-          prompt: { type: "string", description: "What to ask about the image. Default: 'Describe this image in detail.'", default: "Describe this image in detail." },
+          paths: { type: "array", items: { type: "string" }, description: "Relative paths to the image files in the workspace (e.g. ['upload/photo1.jpg', 'upload/photo2.png']). Max 5 per call." },
+          prompt: { type: "string", description: "What to ask about each image. Default: 'Describe this image concisely.'", default: "Describe this image concisely." },
           detail: { type: "string", enum: ["high", "low"], description: "Vision detail level. Use 'low' for a faster, cheaper overview. Default: 'high'", default: "high" },
+          max_concurrency: { type: "number", description: "Max parallel vision requests (1-3). Default: 2. Higher is faster but may hit rate limits.", default: 2 },
+          max_words: { type: "number", description: "Approximate max words per image description. Default: 80.", default: 80 },
         },
-        required: ["path"],
+        required: ["paths"],
       },
     },
   },
@@ -416,7 +418,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ### Charts & Images
 - chart_create(python_code, output_path) — create matplotlib chart
-- image_analyze(path, prompt?, detail?) — analyze an image with a vision model (high/low detail). Good for OCR, diagrams, or photo descriptions.
+- image_analyze(paths, prompt?, detail?, max_concurrency?, max_words?) — analyze multiple images in parallel (max 5 per call, max_concurrency 1-3, default 2). Good for OCR, diagrams, or photo descriptions. Set max_words to control description length (default 80).
 
 ### Project Management
 - todo_create(items) — create a todo list
@@ -479,7 +481,7 @@ export async function runAgentExecution(input: {
   let finalContent = "";
   let finalReasoning = "";
   let toolCallsCount = 0;
-  const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "20");
+  const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
 
   for (let iteration = 0; iteration < 50 && toolCallsCount < maxToolCalls; iteration++) {
     const accumulatedToolCalls: Array<{
@@ -528,16 +530,6 @@ export async function runAgentExecution(input: {
               arguments: toolCall.function?.arguments ?? "",
             },
           };
-          if (toolCall.function?.name) {
-            sendEvent({
-              type: "tool_start",
-              data: {
-                toolCallId: accumulatedToolCalls[idx].id,
-                toolName: toolCall.function.name,
-                arguments: safeParseArgs(toolCall.function.arguments ?? "{}"),
-              },
-            });
-          }
         } else {
           const funcArgs = toolCall.function?.arguments;
           if (funcArgs) {
@@ -547,7 +539,22 @@ export async function runAgentExecution(input: {
       }
     }
 
-    if (accumulatedToolCalls.length === 0 || accumulatedToolCalls.every((tc) => !tc?.function?.name)) {
+    // Validate and finalize tool calls
+    const validToolCalls = accumulatedToolCalls.filter((tc) => tc?.function?.name);
+
+    // Emit tool_start events once arguments are fully assembled
+    for (const tc of validToolCalls) {
+      sendEvent({
+        type: "tool_start",
+        data: {
+          toolCallId: tc.id,
+          toolName: tc.function.name,
+          arguments: safeParseArgs(tc.function.arguments),
+        },
+      });
+    }
+
+    if (validToolCalls.length === 0) {
       // No tool calls — we're done
       await updateSessionStatus(sessionId, "completed");
       sendEvent({ type: "status", data: { status: "completed" } });
@@ -555,12 +562,12 @@ export async function runAgentExecution(input: {
     }
 
     // Execute tool calls
-    messages.push({ role: "assistant", content: contentBuffer, tool_calls: accumulatedToolCalls as any });
+    messages.push({ role: "assistant", content: contentBuffer, tool_calls: validToolCalls as any });
 
     await updateSessionStatus(sessionId, "executing");
-    sendEvent({ type: "status", data: { status: "executing", step: `Executing ${accumulatedToolCalls.length} tool(s)` } });
+    sendEvent({ type: "status", data: { status: "executing", step: `Executing ${validToolCalls.length} tool(s)` } });
 
-    for (const tc of accumulatedToolCalls) {
+    for (const tc of validToolCalls) {
       if (!tc?.function?.name) continue;
       toolCallsCount++;
       if (toolCallsCount > maxToolCalls) break;
@@ -632,14 +639,14 @@ async function executeSandboxTool(
       const path = String(args.path ?? "");
       const encoding = (args.encoding as "utf8" | "base64") ?? "utf8";
       const res = await sandboxFileRead(sessionId, path, encoding);
-      return { ok: true, result: res, stdout: `Read ${res.size} bytes from ${path}` };
+      return { ok: true, result: res, stdout: `` };
     }
     case "file_write": {
       const path = String(args.path ?? "");
       const content = String(args.content ?? "");
       const encoding = (args.encoding as "utf8" | "base64") ?? "utf8";
       const res = await sandboxFileWrite(sessionId, path, content, encoding);
-      return { ok: true, result: res, stdout: `Wrote ${res.size} bytes to ${path}` };
+      return { ok: true, result: res, stdout: `` };
     }
     case "file_list": {
       const dirPath = String(args.path ?? "/");
@@ -861,31 +868,58 @@ except Exception as e:
       };
     }
     case "image_analyze": {
-      const imagePath = String(args.path ?? "");
-      const prompt = String(args.prompt ?? "Describe this image in detail.");
+      const paths = Array.isArray(args.paths) ? args.paths.filter((p): p is string => typeof p === "string") : [];
+      if (paths.length === 0) return { ok: false, error: "No image paths provided." };
+      const promptBase = String(args.prompt ?? "Describe this image concisely.");
       const detail = (args.detail as "high" | "low") ?? "high";
-      const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
-      const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
-      const mimeMap: Record<string, string> = {
-        jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
-      };
-      const mime = mimeMap[ext] ?? "image/png";
-      const dataUrl = `data:${mime};base64,${fileRes.content}`;
-      const response = await nanoClient.chat.completions.create({
-        model,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: dataUrl, detail } },
+      const maxConcurrency = Math.min(Math.max(Number(args.max_concurrency ?? 2), 1), 3);
+      const maxWords = Math.max(Number(args.max_words ?? 80), 20);
+      const fullPrompt = `${promptBase} Be concise. Limit the description to approximately ${maxWords} words.`;
+
+      const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
+
+      async function analyzeSingle(imagePath: string): Promise<void> {
+        try {
+          const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
+          const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
+          const mimeMap: Record<string, string> = {
+            jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+          };
+          const mime = mimeMap[ext] ?? "image/png";
+          const dataUrl = `data:${mime};base64,${fileRes.content}`;
+          const response = await nanoClient.chat.completions.create({
+            model,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: fullPrompt },
+                  { type: "image_url", image_url: { url: dataUrl, detail } },
+                ],
+              },
             ],
-          },
-        ],
-        max_tokens: 2048,
-      });
-      const content = response.choices[0]?.message?.content ?? "";
-      return { ok: true, result: { content }, stdout: content };
+            max_tokens: Math.min(512 + maxWords * 3, 2048),
+          });
+          const content = response.choices[0]?.message?.content ?? "";
+          results.push({ path: imagePath, content, ok: true });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          results.push({ path: imagePath, content: "", ok: false, error: msg });
+        }
+      }
+
+      // Process in batches with limited concurrency
+      for (let i = 0; i < paths.length; i += maxConcurrency) {
+        const batch = paths.slice(i, i + maxConcurrency);
+        await Promise.all(batch.map((p) => analyzeSingle(p)));
+      }
+
+      // Sort results to match input order
+      results.sort((a, b) => paths.indexOf(a.path) - paths.indexOf(b.path));
+
+      const combined = results.map((r) => `--- ${r.path} ---\n${r.ok ? r.content : `Error: ${r.error}`}`).join("\n\n");
+      const allOk = results.every((r) => r.ok);
+      return { ok: allOk, result: { descriptions: results, combined }, stdout: combined };
     }
     // ── Todo Tools ──────────────────────────────────────────────────────────
     case "todo_create": {
