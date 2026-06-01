@@ -18,6 +18,8 @@ RUN if [ -f package-lock.json ]; then npm ci; \
     && npm install \
         lightningcss-linux-x64-gnu@1.32.0 \
         @tailwindcss/oxide-linux-x64-gnu \
+        @node-rs/argon2-linux-x64-gnu \
+        @napi-rs/canvas-linux-x64-gnu \
         --no-save
 
 # ── Build ─────────────────────────────────────────────────────────────────────
