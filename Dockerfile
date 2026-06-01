@@ -70,7 +70,8 @@ COPY --from=builder --chown=chatapp:chatapp /app/next.config.ts ./next.config.ts
 COPY --from=builder --chown=chatapp:chatapp /app/tsconfig.json ./tsconfig.json
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
-RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
+RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data && \
+    touch /app/data/chatinterface.db && chown chatapp:chatapp /app/data/chatinterface.db
 VOLUME ["/app/data"]
 
 USER chatapp
