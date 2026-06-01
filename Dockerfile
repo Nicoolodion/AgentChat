@@ -15,7 +15,10 @@ COPY package.json package-lock.json* bun.lock* ./
 RUN if [ -f package-lock.json ]; then npm ci; \
     elif [ -f bun.lock ]; then npm install -g bun && bun install --frozen-lockfile; \
     else npm install; fi \
-    && npm install lightningcss-linux-x64-gnu@1.32.0 --no-save
+    && npm install \
+        lightningcss-linux-x64-gnu@1.32.0 \
+        @tailwindcss/oxide-linux-x64-gnu \
+        --no-save
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 FROM node:20-bookworm-slim AS builder
