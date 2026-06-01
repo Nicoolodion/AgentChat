@@ -31,7 +31,9 @@ const envSchema = z.object({
   // Agent configuration
   AGENT_ENABLED: boolLike.default(true),
   AGENT_SANDBOX_URL: z.string().default("http://127.0.0.1:18080"),
-  AGENT_MAX_TOOL_CALLS: z.coerce.number().int().positive().default(20),
+  AGENT_MAX_TOOL_CALLS: z.coerce.number().int().positive().default(50),
+  AGENT_IMAGE_ANALYZE_MAX_BATCH: z.coerce.number().int().positive().default(15),
+  AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: z.coerce.number().int().positive().default(2),
   AGENT_WORKSPACE_DIR: z.string().default("data/agent-workspaces"),
 });
 
@@ -54,5 +56,7 @@ export const env = envSchema.parse({
   AGENT_ENABLED: process.env.AGENT_ENABLED,
   AGENT_SANDBOX_URL: process.env.AGENT_SANDBOX_URL,
   AGENT_MAX_TOOL_CALLS: process.env.AGENT_MAX_TOOL_CALLS,
+  AGENT_IMAGE_ANALYZE_MAX_BATCH: process.env.AGENT_IMAGE_ANALYZE_MAX_BATCH,
+  AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: process.env.AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY,
   AGENT_WORKSPACE_DIR: process.env.AGENT_WORKSPACE_DIR,
 });

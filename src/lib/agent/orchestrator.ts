@@ -333,15 +333,13 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "image_analyze",
-      description: "Analyze one or more image files using the vision-capable model. Supports batching for efficiency. Returns an array of descriptions, one per image, in the same order as the input paths.",
+      description: "Analyze one or more image files using the vision-capable model. Returns an array of descriptions, one per image, in the same order as the input paths. The tool is batched automatically, so you can pass many paths at once.",
       parameters: {
         type: "object",
         properties: {
-          paths: { type: "array", items: { type: "string" }, description: "Relative paths to the image files in the workspace (e.g. ['upload/photo1.jpg', 'upload/photo2.png']). Max 5 per call." },
+          paths: { type: "array", items: { type: "string" }, description: "Relative paths to the image files in the workspace (e.g. ['upload/photo1.jpg', 'upload/photo2.png'])." },
           prompt: { type: "string", description: "What to ask about each image. Default: 'Describe this image concisely.'", default: "Describe this image concisely." },
           detail: { type: "string", enum: ["high", "low"], description: "Vision detail level. Use 'low' for a faster, cheaper overview. Default: 'high'", default: "high" },
-          max_concurrency: { type: "number", description: "Max parallel vision requests (1-3). Default: 2. Higher is faster but may hit rate limits.", default: 2 },
-          max_words: { type: "number", description: "Approximate max words per image description. Default: 80.", default: 80 },
         },
         required: ["paths"],
       },
@@ -418,7 +416,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ### Charts & Images
 - chart_create(python_code, output_path) — create matplotlib chart
-- image_analyze(paths, prompt?, detail?, max_concurrency?, max_words?) — analyze multiple images in parallel (max 5 per call, max_concurrency 1-3, default 2). Good for OCR, diagrams, or photo descriptions. Set max_words to control description length (default 80).
+- image_analyze(paths, prompt?, detail?) — analyze multiple images in one call. Pass all relevant image paths together; the tool batches them automatically.
 
 ### Project Management
 - todo_create(items) — create a todo list
@@ -465,8 +463,9 @@ export async function runAgentExecution(input: {
   priorConversation: Array<{ role: "system" | "user" | "assistant"; content: string }>;
   model: string;
   sendEvent: (event: AgentSseEvent) => void;
+  signal?: AbortSignal;
 }): Promise<{ content: string; reasoning?: string; toolCallsCount: number }> {
-  const { sessionId, userMessage, priorConversation, model, sendEvent } = input;
+  const { sessionId, userMessage, priorConversation, model, sendEvent, signal } = input;
 
   // Update session status
   await updateSessionStatus(sessionId, "thinking");
@@ -484,6 +483,7 @@ export async function runAgentExecution(input: {
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
 
   for (let iteration = 0; iteration < 50 && toolCallsCount < maxToolCalls; iteration++) {
+    if (signal?.aborted) break;
     const accumulatedToolCalls: Array<{
       id: string;
       type: string;
@@ -492,14 +492,14 @@ export async function runAgentExecution(input: {
     let currentToolCallIndex = -1;
     let contentBuffer = "";
 
-        const response = await nanoClient.chat.completions.create({
+    const response = await nanoClient.chat.completions.create({
       model,
       messages,
       tools: AGENT_TOOL_SCHEMAS,
       tool_choice: "auto",
       parallel_tool_calls: false,
       stream: true,
-    });
+    }, { signal });
 
     for await (const chunk of response) {
       const delta = chunk.choices?.[0]?.delta;
@@ -568,6 +568,7 @@ export async function runAgentExecution(input: {
     sendEvent({ type: "status", data: { status: "executing", step: `Executing ${validToolCalls.length} tool(s)` } });
 
     for (const tc of validToolCalls) {
+      if (signal?.aborted) break;
       if (!tc?.function?.name) continue;
       toolCallsCount++;
       if (toolCallsCount > maxToolCalls) break;
@@ -620,8 +621,14 @@ export async function runAgentExecution(input: {
     }
   }
 
-  await updateSessionStatus(sessionId, "completed");
-  sendEvent({ type: "status", data: { status: "completed" } });
+  if (signal?.aborted) {
+    await updateSessionStatus(sessionId, "idle");
+    sendEvent({ type: "status", data: { status: "idle", step: "Stopped by user" } });
+    finalContent += "\n\n[Session stopped by user.]";
+  } else {
+    await updateSessionStatus(sessionId, "completed");
+    sendEvent({ type: "status", data: { status: "completed" } });
+  }
   return { content: finalContent, reasoning: finalReasoning || undefined, toolCallsCount };
 }
 
@@ -870,11 +877,17 @@ except Exception as e:
     case "image_analyze": {
       const paths = Array.isArray(args.paths) ? args.paths.filter((p): p is string => typeof p === "string") : [];
       if (paths.length === 0) return { ok: false, error: "No image paths provided." };
+
+      const maxBatch = Math.max(1, Number(env.AGENT_IMAGE_ANALYZE_MAX_BATCH ?? 15));
+      const maxConcurrency = Math.max(1, Number(env.AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY ?? 2));
+
+      if (paths.length > maxBatch) {
+        return { ok: false, error: `Too many images. Max ${maxBatch} per call, received ${paths.length}. Call the tool multiple times.` };
+      }
+
       const promptBase = String(args.prompt ?? "Describe this image concisely.");
       const detail = (args.detail as "high" | "low") ?? "high";
-      const maxConcurrency = Math.min(Math.max(Number(args.max_concurrency ?? 2), 1), 3);
-      const maxWords = Math.max(Number(args.max_words ?? 80), 20);
-      const fullPrompt = `${promptBase} Be concise. Limit the description to approximately ${maxWords} words.`;
+      const fullPrompt = `${promptBase} Keep the description concise and focused — under 300 words.`;
 
       const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
 
@@ -898,25 +911,24 @@ except Exception as e:
                 ],
               },
             ],
-            max_tokens: Math.min(512 + maxWords * 3, 2048),
+            max_tokens: 1024,
           });
           const content = response.choices[0]?.message?.content ?? "";
           results.push({ path: imagePath, content, ok: true });
         } catch (err) {
+          if ((err as Error).name === "AbortError") throw err;
           const msg = err instanceof Error ? err.message : String(err);
           results.push({ path: imagePath, content: "", ok: false, error: msg });
         }
       }
 
-      // Process in batches with limited concurrency
+      // Process ALL images in batches with limited concurrency
       for (let i = 0; i < paths.length; i += maxConcurrency) {
         const batch = paths.slice(i, i + maxConcurrency);
         await Promise.all(batch.map((p) => analyzeSingle(p)));
       }
 
-      // Sort results to match input order
       results.sort((a, b) => paths.indexOf(a.path) - paths.indexOf(b.path));
-
       const combined = results.map((r) => `--- ${r.path} ---\n${r.ok ? r.content : `Error: ${r.error}`}`).join("\n\n");
       const allOk = results.every((r) => r.ok);
       return { ok: allOk, result: { descriptions: results, combined }, stdout: combined };

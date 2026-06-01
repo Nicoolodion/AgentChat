@@ -24,6 +24,7 @@ import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
 import { sandboxCreateWorkspace, sandboxFileWrite } from "@/lib/agent/sandbox";
 import { getAttachmentForUser } from "@/lib/attachments";
+import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
 
 const schema = z.object({
   content: z.string().min(1).max(20_000),
@@ -356,6 +357,10 @@ async function handleAgentMessage(input: {
 
   const stream = new ReadableStream({
     async start(controller) {
+      const ac = new AbortController();
+      activeAgents.set(sessionId, ac);
+      agentSignals.set(sessionId, ac);
+
       const toolCallMap = new Map<string, ChatToolCall>();
       let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
 
@@ -401,8 +406,26 @@ async function handleAgentMessage(input: {
           priorConversation,
           model: chat.model,
           sendEvent: wrappedSendEvent,
+          signal: ac.signal,
         });
       } catch (error) {
+        if ((error as Error).name === "AbortError") {
+          await prisma.agentSession.update({
+            where: { id: sessionId },
+            data: { status: "idle", errorMessage: "Stopped by user", completedAt: new Date() },
+          });
+          sendSseEvent(controller, "error", { message: "Stopped by user" });
+          sendSseEvent(controller, "done", {
+            session: { ...agentSession!, status: "idle" },
+            artifacts: [],
+            meta: { totalToolCalls: 0, totalDurationMs: 0 },
+          });
+          controller.close();
+          activeAgents.delete(sessionId);
+          agentSignals.delete(sessionId);
+          return;
+        }
+
         console.error("[Agent Execution Error]", error);
         const errMsg = error instanceof Error ? error.message : "Agent execution failed";
         sendSseEvent(controller, "error", { message: errMsg });
@@ -460,6 +483,8 @@ async function handleAgentMessage(input: {
         assistantMessage: assistantMessage ?? undefined,
       });
 
+      activeAgents.delete(sessionId);
+      agentSignals.delete(sessionId);
       controller.close();
     },
   });

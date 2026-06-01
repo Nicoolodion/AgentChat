@@ -27,6 +27,7 @@ import {
   Zap,
   Activity,
   Menu,
+  Square,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
@@ -408,6 +409,7 @@ export function ChatApp() {
     mimeType: string;
   } | null>(null);
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
+  const sendAbortRef = useRef<AbortController | null>(null);
 
   const agent = useAgent(activeChat?.id);
 
@@ -694,6 +696,9 @@ export function ChatApp() {
     setMessageInput("");
     setPendingAttachments([]);
 
+    if (sendAbortRef.current) sendAbortRef.current.abort();
+    sendAbortRef.current = new AbortController();
+
     const tempId = `temp-${Date.now()}`;
 
     const userMsg: ChatMessage = {
@@ -732,6 +737,7 @@ export function ChatApp() {
       const response = await fetch(`/api/chats/${activeChat.id}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: sendAbortRef.current.signal,
         body: JSON.stringify({
           content,
           attachments: attachmentsForSend.map((item) => item.id),
@@ -1460,6 +1466,16 @@ export function ChatApp() {
                   onReroll={message.role === "assistant" && !message._isStreaming ? () => handleReroll(index) : undefined}
                 />
               ))}
+              {/* Reconnect placeholder when agent is running but no streaming message exists yet */}
+              {agent.isAgentMode &&
+                agent.isExecuting &&
+                activeChat &&
+                activeChat.messages[activeChat.messages.length - 1]?.role !== "assistant" && (
+                  <div className="flex items-center gap-2 py-2 text-slate-400">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span className="text-sm text-slate-300">Agent is working…</span>
+                  </div>
+                )}
               <div ref={bottomRef} />
             </div>
 
@@ -1554,12 +1570,36 @@ export function ChatApp() {
                   </span>
                 </div>
                 <button
-                  onClick={() => void sendMessage()}
-                  disabled={sending || (!messageInput.trim() && pendingAttachments.length === 0)}
+                  onClick={() => {
+                    if (agent.isAgentMode && (sending || agent.isExecuting)) {
+                      sendAbortRef.current?.abort();
+                      void agent.stopAgent();
+                    } else {
+                      void sendMessage();
+                    }
+                  }}
+                  disabled={
+                    !(sending || agent.isExecuting) &&
+                    !messageInput.trim() &&
+                    pendingAttachments.length === 0
+                  }
                   className="inline-flex items-center gap-2 rounded-xl bg-teal-400 px-3 py-2 text-sm font-semibold text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : agent.isAgentMode ? <Bot className="h-4 w-4" /> : <CornerDownLeft className="h-4 w-4" />}
-                  {agent.isAgentMode ? "Run Agent" : "Send"}
+                  {sending || agent.isExecuting ? (
+                    agent.isAgentMode ? (
+                      <>
+                        <Square className="h-3.5 w-3.5 fill-current" />
+                        Stop Agent
+                      </>
+                    ) : (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    )
+                  ) : agent.isAgentMode ? (
+                    <Bot className="h-4 w-4" />
+                  ) : (
+                    <CornerDownLeft className="h-4 w-4" />
+                  )}
+                  {!(sending || agent.isExecuting) && (agent.isAgentMode ? "Run Agent" : "Send")}
                 </button>
               </div>
             </div>

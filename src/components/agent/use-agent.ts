@@ -106,6 +106,70 @@ export function useAgent(chatId: string | undefined) {
     setState((s) => ({ ...s, artifacts: [...s.artifacts, artifact] }));
   }, []);
 
+  // ── Polling for running sessions (live sync after refresh) ──
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  }, []);
+
+  const startPolling = useCallback(
+    (sessionId: string) => {
+      stopPolling();
+      pollIntervalRef.current = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/agent/sessions/${sessionId}`);
+          if (!res.ok) return;
+          const data = (await res.json()) as {
+            session?: AgentSession;
+            toolCalls?: AgentToolCall[];
+            artifacts?: AgentArtifact[];
+          };
+          if (!data.session) return;
+
+          if (data.session.status !== "thinking" && data.session.status !== "executing") {
+            stopPolling();
+          }
+
+          if (data.artifacts) {
+            setArtifacts(
+              data.artifacts.map((a) => ({
+                ...a,
+                createdAt:
+                  typeof a.createdAt === "string"
+                    ? a.createdAt
+                    : (a.createdAt as unknown as Date).toISOString?.() ?? String(a.createdAt),
+              }))
+            );
+          }
+
+          setState((s) => ({
+            ...s,
+            isExecuting: ["thinking", "executing"].includes(data.session!.status),
+            currentStep: ["thinking", "executing"].includes(data.session!.status) ? s.currentStep : null,
+          }));
+        } catch {
+          // ignore poll errors
+        }
+      }, 2500);
+    },
+    [stopPolling, setArtifacts]
+  );
+
+  const stopAgent = useCallback(async () => {
+    if (!state.agentSession) return;
+    try {
+      const res = await fetch(`/api/agent/sessions/${state.agentSession.id}/stop`, {
+        method: "POST",
+      });
+      if (!res.ok) console.warn("[Agent Stop] failed", res.status);
+    } catch {}
+    setState((s) => ({ ...s, isExecuting: false, currentStep: null }));
+  }, [state.agentSession]);
+
   const loadSession = useCallback(async (sessionId: string) => {
     try {
       const res = await fetch(`/api/agent/sessions/${sessionId}`);
@@ -162,16 +226,24 @@ export function useAgent(chatId: string | undefined) {
         }
       }
 
+      const isRunning = data.session && (data.session.status === "thinking" || data.session.status === "executing");
       setState((s) => ({
         ...s,
         agentSession: data.session,
         artifacts: data.artifacts,
         terminalEntries: entries,
+        isExecuting: isRunning ? true : s.isExecuting,
+        currentStep: isRunning ? { number: 1, total: 1, description: "Restored session" } : s.currentStep,
       }));
+
+      // If the loaded session is still running, start live polling
+      if (isRunning) {
+        startPolling(data.session.id);
+      }
     } catch {
       // ignore
     }
-  }, []);
+  }, [startPolling]);
 
   const syncChatMode = useCallback(
     async (chat: {
@@ -191,11 +263,15 @@ export function useAgent(chatId: string | undefined) {
         if (lockedToAgent) {
           // Agent mode locked in — restore session
           if (chat.agentSession) {
+            const isRunning = chat.agentSession.status === "thinking" || chat.agentSession.status === "executing";
             setState((s) => ({
               ...s,
               isAgentMode: true,
               modeLocked: true,
+              sidebarOpen: true,
               agentSession: chat.agentSession as AgentSession,
+              isExecuting: isRunning,
+              currentStep: isRunning ? { number: 1, total: 1, description: "Restored session" } : null,
             }));
             void loadSession(chat.agentSession!.id);
           } else {
@@ -236,14 +312,17 @@ export function useAgent(chatId: string | undefined) {
         // Has messages but mode is NOT locked (backward compat / unexpected)
         // Determine from whether there is an agentSession
         if (chat.agentSession) {
+          const isRunning = chat.agentSession.status === "thinking" || chat.agentSession.status === "executing";
           setState((s) => ({
             ...s,
             isAgentMode: true,
             modeLocked: true,
             sidebarOpen: true,
             agentSession: chat.agentSession as AgentSession,
+            isExecuting: isRunning,
+            currentStep: isRunning ? { number: 1, total: 1, description: "Restored session" } : null,
           }));
-          void loadSession(chat.agentSession!.id);
+          void loadSession(chat.agentSession.id);
         } else {
           setState((s) => ({
             ...s,
@@ -280,6 +359,8 @@ export function useAgent(chatId: string | undefined) {
         abortRef.current.abort();
       }
       abortRef.current = new AbortController();
+
+      stopPolling(); // stop background polling while we stream live
 
       setState((s) => ({
         ...s,
@@ -347,8 +428,18 @@ export function useAgent(chatId: string | undefined) {
         setState((s) => ({ ...s, isExecuting: false, currentStep: null }));
       }
     },
-    [state.agentSession]
+    [state.agentSession, stopPolling]
   );
+
+  // Auto-poll running sessions (e.g. after page refresh)
+  useEffect(() => {
+    if (state.agentSession && (state.agentSession.status === "thinking" || state.agentSession.status === "executing")) {
+      startPolling(state.agentSession.id);
+    } else {
+      stopPolling();
+    }
+    return () => stopPolling();
+  }, [state.agentSession?.id, state.agentSession?.status, startPolling, stopPolling]);
 
   // Auto-restore agent mode on mount / chatId change
   useEffect(() => {
@@ -464,6 +555,7 @@ export function useAgent(chatId: string | undefined) {
     loadSession,
     syncChatMode,
     executeAgent,
+    stopAgent,
     processSseEvent: (eventType: string, data: Record<string, unknown>) => handleSseEvent(eventType, data, setState),
   };
 }
