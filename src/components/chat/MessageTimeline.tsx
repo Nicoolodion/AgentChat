@@ -146,7 +146,7 @@ function StepBody({ step, isStreaming }: { step: TimelineStep; isStreaming: bool
     return <ReasoningStep text={step.text} />;
   }
   if (step.kind === "tool") {
-    return <ToolStep call={step.call} arguments={step.arguments} outputs={step.outputs} isStreaming={isStreaming} />;
+    return <ToolStep call={step.call} args={step.arguments} outputs={step.outputs} isStreaming={isStreaming} />;
   }
   return <TextStep text={step.text} isStreaming={isStreaming} />;
 }
