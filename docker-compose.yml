@@ -17,6 +17,7 @@ services:
     image: chatinterface-app:latest
     container_name: chatinterface-app
     restart: unless-stopped
+    pull_policy: never
     env_file: .env
     environment:
       NODE_ENV: production
@@ -44,6 +45,7 @@ services:
     image: chatinterface-agent:latest
     container_name: chatinterface-agent-sandbox
     restart: unless-stopped
+    pull_policy: never
     profiles: ["full"]   # start with: docker compose --profile full up -d
     ports:
       - "127.0.0.1:18080:8080"

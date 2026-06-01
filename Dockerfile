@@ -14,12 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json package-lock.json* bun.lock* ./
 RUN if [ -f package-lock.json ]; then npm ci; \
     elif [ -f bun.lock ]; then npm install -g bun && bun install --frozen-lockfile; \
-    else npm install; fi
+    else npm install; fi \
+    && npm install lightningcss-linux-x64-gnu@1.32.0 --no-save
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 FROM node:20-bookworm-slim AS builder
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npx prisma generate && npm run build

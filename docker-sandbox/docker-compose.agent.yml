@@ -12,6 +12,7 @@ services:
       dockerfile: Dockerfile
     image: chatinterface-agent:latest
     container_name: chatinterface-agent-sandbox
+    pull_policy: never
     ports:
       - "127.0.0.1:18080:8080"
     volumes:
