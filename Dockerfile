@@ -51,6 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates openssl python3 \
     && rm -rf /var/lib/apt/lists/*
 
+# Provide safe defaults so `prisma db push` can read DATABASE_URL at startup
+# when no .env has been baked into the image. Real values come from
+# docker-compose env_file at runtime and override these.
+ENV DATABASE_URL=file:./data/chatinterface.db
+
 # Non-root user
 RUN groupadd -r chatapp -g 1001 \
  && useradd -r -g chatapp -u 1001 -m chatapp
