@@ -74,4 +74,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || exit 1
 
-CMD ["sh", "-c", "npx prisma db push --skip-generate && node node_modules/next/dist/bin/next start -H 0.0.0.0 -p ${PORT}"]
+CMD ["sh", "-c", "npx prisma db push && node node_modules/next/dist/bin/next start -H 0.0.0.0 -p ${PORT}"]
