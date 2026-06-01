@@ -68,7 +68,6 @@ COPY --from=builder --chown=chatapp:chatapp /app/package.json ./package.json
 COPY --from=builder --chown=chatapp:chatapp /app/prisma ./prisma
 COPY --from=builder --chown=chatapp:chatapp /app/next.config.ts ./next.config.ts
 COPY --from=builder --chown=chatapp:chatapp /app/tsconfig.json ./tsconfig.json
-COPY --from=builder --chown=chatapp:chatapp /app/.env.example ./.env.example
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
 RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
@@ -80,4 +79,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || exit 1
 
-CMD ["sh", "-c", "set -a && . /app/.env 2>/dev/null || true; . /app/.env.local 2>/dev/null || true; set +a; export DATABASE_URL=\"${DATABASE_URL:-file:/app/data/chatinterface.db}\"; exec node node_modules/next/dist/bin/next start -H 0.0.0.0 -p ${PORT}"]
+CMD ["node", "node_modules/next/dist/bin/next", "start", "-H", "0.0.0.0", "-p", "3000"]
