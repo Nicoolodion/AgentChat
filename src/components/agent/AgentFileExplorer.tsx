@@ -70,6 +70,7 @@ export function AgentFileExplorer({
     if (sessionId) {
       void loadFiles(currentPath);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps, react-hooks/set-state-in-effect
   }, [sessionId, currentPath, loadFiles]);
 
   function toggleExpand(path: string) {

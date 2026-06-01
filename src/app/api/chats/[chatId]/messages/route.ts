@@ -364,7 +364,10 @@ async function handleAgentMessage(input: {
       const toolCallMap = new Map<string, ChatToolCall>();
       let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
 
-      // wrap sendEvent to intercept tool_start / tool_done and build ChatToolCalls
+      // wrap sendEvent to intercept tool_start / tool_done and build ChatToolCalls.
+      // We rely on the database AgentToolCall table for the canonical list of
+      // tool calls (so they survive a page refresh). The in-memory map is only
+      // used to attach timing/status to the final assistant message we persist.
       const wrappedSendEvent = (event: AgentSseEvent) => {
         if (event.type === "tool_start") {
           const d = event.data as { toolCallId?: string; toolName?: string };
@@ -387,10 +390,10 @@ async function handleAgentMessage(input: {
           if (existing) {
             existing.status = d.ok ? "success" : "error";
             existing.durationMs = d.durationMs;
-          } else {
+          } else if (d.toolName) {
             toolCallMap.set(toolCallId, {
               toolCallId,
-              toolName: d.toolName ?? "unknown",
+              toolName: d.toolName,
               status: d.ok ? "success" : "error",
               durationMs: d.durationMs,
             });

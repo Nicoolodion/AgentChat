@@ -1,0 +1,68 @@
+# docker-compose.yml — Production
+#
+# A small two-service deployment of Chatinterface for Unraid (or any host
+# running Docker Compose v2+). Expose only port 3000 to your reverse proxy.
+#
+# Usage:
+#   cp .env.example .env   # then edit secrets
+#   docker compose up -d
+#
+# The companion agent sandbox is defined in docker-sandbox/docker-compose.agent.yml.
+# To run everything together:
+#   docker compose -f docker-compose.yml -f docker-sandbox/docker-compose.agent.yml up -d
+
+services:
+  app:
+    build: .
+    image: chatinterface-app:latest
+    container_name: chatinterface-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      # Persist DB + encrypted user files + agent workspaces on the host
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Better-sqlite3 + the agent's heavy I/O benefits from extra shared mem
+    shm_size: 512mb
+
+  # Optional: only enable if you want the full agent sandbox on the same host.
+  # The app will still start without it; agent features will report "sandbox offline".
+  agent-sandbox:
+    build:
+      context: docker-sandbox
+    image: chatinterface-agent:latest
+    container_name: chatinterface-agent-sandbox
+    restart: unless-stopped
+    profiles: ["full"]   # start with: docker compose --profile full up -d
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - ./skills:/app/skills:ro
+      - ./data/agent-workspaces:/workspace
+    environment:
+      - SANDBOX_LOG_LEVEL=info
+      - SANDBOX_MAX_EXECUTION_TIME=300
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID

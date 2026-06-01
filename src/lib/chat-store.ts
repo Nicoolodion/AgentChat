@@ -178,7 +178,21 @@ export async function updateChatSettingsForUser(input: {
     agentModeLocked: updated.agentModeLocked,
     createdAt: updated.createdAt.toISOString(),
     updatedAt: updated.updatedAt.toISOString(),
-    messages: updated.messages.map((msg) => decryptMessage(msg, input.userKey)),
+    // Some legacy rows may not decrypt (e.g. a key migration in progress or a
+    // pre-production row). Rather than failing the whole PATCH, return those
+    // messages as empty placeholders so the chat remains usable.
+    messages: updated.messages.map((msg) => {
+      try {
+        return decryptMessage(msg, input.userKey);
+      } catch {
+        return {
+          id: msg.id,
+          role: msg.role as ChatMessage["role"],
+          content: "",
+          createdAt: msg.createdAt.toISOString(),
+        } as ChatMessage;
+      }
+    }),
     agentSession: updated.agentSession
       ? { id: updated.agentSession.id, status: updated.agentSession.status }
       : null,

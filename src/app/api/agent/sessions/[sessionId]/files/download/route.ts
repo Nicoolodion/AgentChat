@@ -1,10 +1,11 @@
+/**
+ * GET /api/agent/sessions/:sessionId/files/download?path=...
+ * Download a file or a zipped folder from the workspace.
+ */
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import {
-  resolveHostWorkspaceFile,
-  getHostWorkspacePath,
-} from "@/lib/agent/workspace";
-import { readFile, stat, readdir } from "node:fs/promises";
+import { resolveHostWorkspaceFile } from "@/lib/agent/workspace";
+import { readFile, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
 function jsonError(message: string, status: number) {
@@ -14,13 +15,6 @@ function jsonError(message: string, status: number) {
   });
 }
 
-/**
- * GET /api/agent/sessions/:sessionId/files/download?path=...
- * Download a file or a zipped folder from the workspace.
- *
- * Reads directly from the host filesystem (data/agent-workspaces/)
- * so it works even when the sandbox container is offline.
- */
 export async function GET(
   request: Request,
   context: { params: Promise<{ sessionId: string }> }
@@ -50,27 +44,15 @@ export async function GET(
       return jsonError("File not found", 404);
     }
 
-    // Directory → zip it
+    // Directory → zip it (cross-platform)
     if (pathStat.isDirectory()) {
       const folderName = filePath.replace(/\/$/, "").split("/").pop() ?? "download";
-      const { spawn } = await import("node:child_process");
       const { tmpdir } = await import("node:os");
       const tmpZip = path.join(tmpdir(), `agent-${sessionId}-${Date.now()}.zip`);
 
-      await new Promise<void>((resolve, reject) => {
-        const zip = spawn("powershell", [
-          "-Command",
-          `Compress-Archive -Path '${resolvedPath.replace(/'/g, "''")}\*' -DestinationPath '${tmpZip.replace(/'/g, "''")}' -Force`,
-        ]);
-        zip.on("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`zip exited ${code}`));
-        });
-        zip.on("error", reject);
-      });
-
+      await zipDirectory(resolvedPath, tmpZip);
       const binary = await readFile(tmpZip);
-      await import("node:fs/promises").then((fs) => fs.rm(tmpZip, { force: true }));
+      await rm(tmpZip, { force: true }).catch(() => undefined);
 
       return new Response(binary, {
         headers: {
@@ -81,11 +63,9 @@ export async function GET(
       });
     }
 
-    // Single file
     const binary = await readFile(resolvedPath);
     const fileName = filePath.split("/").pop() ?? "download";
-    const mimeType =
-      searchParams.get("mimeType") ?? getMimeType(fileName);
+    const mimeType = searchParams.get("mimeType") ?? getMimeType(fileName);
 
     return new Response(binary, {
       headers: {
@@ -97,6 +77,62 @@ export async function GET(
   } catch (error) {
     console.error("[Agent Files Download Error]", error);
     return jsonError("Internal server error", 500);
+  }
+}
+
+async function zipDirectory(srcDir: string, outZip: string): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const isWindows = process.platform === "win32";
+
+  if (isWindows) {
+    await new Promise<void>((resolve, reject) => {
+      const ps = spawn("powershell", [
+        "-NoProfile",
+        "-Command",
+        `Compress-Archive -Path '${srcDir.replace(/'/g, "''")}\*' -DestinationPath '${outZip.replace(/'/g, "''")}' -Force`,
+      ]);
+      ps.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`zip exited ${code}`))));
+      ps.on("error", reject);
+    });
+    return;
+  }
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const z = spawn("zip", ["-r", "-q", outZip, "."], { cwd: srcDir });
+      z.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`zip exited ${code}`))));
+      z.on("error", reject);
+    });
+    return;
+  } catch {
+    // fall through to JSZip
+  }
+
+  const JSZip = (await import("jszip")).default;
+  const zip = new JSZip();
+  await addDirToZip(zip, srcDir, "");
+  const buf = await zip.generateAsync({ type: "nodebuffer" });
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(outZip, buf);
+}
+
+type JSZipInstance = {
+  file: (name: string, data: Buffer | string) => void;
+  generateAsync: (opts: { type: "nodebuffer" }) => Promise<Buffer>;
+};
+
+async function addDirToZip(zip: JSZipInstance, dir: string, prefix: string): Promise<void> {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      await addDirToZip(zip, full, rel);
+    } else {
+      const data = await readFile(full);
+      zip.file(rel, data);
+    }
   }
 }
 
