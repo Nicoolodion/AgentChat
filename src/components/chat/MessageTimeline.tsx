@@ -352,23 +352,41 @@ function buildSteps(
   toolOutputs: ToolOutputEntry[],
   toolArguments?: Record<string, Record<string, unknown>>,
 ): TimelineStep[] {
-  // We construct an ordered stream of steps based on the order reasoning,
-  // tool calls, and text were emitted. Tool calls preserve their `toolCallId`
-  // so we can attach outputs that come in asynchronously.
-  //
-  // Order heuristic: reasoning → text (assistant content so far) → tools.
-  // For now, we present: reasoning (if any) → each tool call (with its
-  // collected outputs) → final text content. This matches the agent's actual
-  // order: reason → call tools → summarize.
-
   const steps: TimelineStep[] = [];
 
-  if (message.reasoning && message.reasoning.trim().length > 0) {
-    steps.push({ kind: "reasoning", id: `r-${message.id}`, text: message.reasoning });
-  }
+  const toolCalls = message.toolCalls ?? [];
+  const hasReasoningSegments = message.reasoningSegments && message.reasoningSegments.length > 0;
 
-  if (message.toolCalls) {
-    for (const call of message.toolCalls) {
+  if (hasReasoningSegments) {
+    const segments = message.reasoningSegments!;
+    const numSegments = segments.length;
+    const numToolCalls = toolCalls.length;
+
+    for (let i = 0; i < Math.max(numSegments, numToolCalls); i++) {
+      if (i < numSegments && segments[i]!.trim().length > 0) {
+        steps.push({ kind: "reasoning", id: `r-${message.id}-${i}`, text: segments[i]! });
+      }
+      if (i < numToolCalls) {
+        const call = toolCalls[i]!;
+        const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
+        const args = toolArguments?.[call.toolCallId];
+        steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
+      }
+    }
+
+    // If there are more tool calls than segments, add remaining tool calls
+    for (let i = numSegments; i < numToolCalls; i++) {
+      const call = toolCalls[i]!;
+      const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
+      const args = toolArguments?.[call.toolCallId];
+      steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
+    }
+  } else {
+    if (message.reasoning && message.reasoning.trim().length > 0) {
+      steps.push({ kind: "reasoning", id: `r-${message.id}`, text: message.reasoning });
+    }
+
+    for (const call of toolCalls) {
       const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
       const args = toolArguments?.[call.toolCallId];
       steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
@@ -403,6 +421,8 @@ function toolCallLabel(toolName: string, args?: Record<string, unknown>): string
     chart_create: "output_path",
     image_analyze: "paths",
     docx_to_pdf: "input_path",
+    docx_read: "path",
+    docx_template_fill: "template_path",
     pdf_from_html: "html_path",
     docx_create: "output_path",
     docx_build: "output_path",

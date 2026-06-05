@@ -639,6 +639,442 @@ def file_info() -> Response:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DOCX Read (extract structured content from .docx files)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/docx/read", methods=["POST"])
+def docx_read() -> Response:
+    """Parse a .docx file and return structured content (paragraphs, tables, images, styles)."""
+    data = request.get_json(force=True) or {}
+    file_path = data.get("path", "")
+    session_id = data.get("session_id", "default")
+    include_images = data.get("include_images", True)
+    max_image_width = int(data.get("max_image_width", 800))
+
+    if not file_path:
+        return make_error("Missing 'path' field", 400)
+
+    try:
+        target = resolve_workspace_path(session_id, file_path)
+    except ValueError:
+        return make_error("Invalid path", 400)
+
+    if not target.exists():
+        return make_error(f"File not found: {file_path}", 404)
+
+    if not str(target).lower().endswith((".docx", ".doc")):
+        return make_error("File must be a .docx or .doc file", 400)
+
+    try:
+        from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        doc = Document(str(target))
+
+        paragraphs = []
+        tables = []
+        images = []
+        image_idx = 0
+
+        # Extract paragraphs with style info
+        for i, p in enumerate(doc.paragraphs):
+            style_name = p.style.name if p.style else ""
+            alignment = ""
+            if p.alignment is not None:
+                alignment_map = {
+                    WD_ALIGN_PARAGRAPH.LEFT: "left",
+                    WD_ALIGN_PARAGRAPH.CENTER: "center",
+                    WD_ALIGN_PARAGRAPH.RIGHT: "right",
+                    WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
+                }
+                alignment = alignment_map.get(p.alignment, "")
+            
+            is_heading = style_name.startswith("Heading")
+            heading_level = int(style_name.replace("Heading ", "").replace("Heading", "1") or "0") if is_heading else 0
+            
+            text = p.text.strip()
+            
+            # Check for inline images in this paragraph
+            has_image = False
+            for run in p.runs:
+                if run._element.xml.find("blip") != -1:
+                    has_image = True
+                    break
+            
+            if text or has_image:
+                entry = {
+                    "index": i,
+                    "text": text,
+                    "style": style_name,
+                    "alignment": alignment,
+                    "is_heading": is_heading,
+                    "heading_level": heading_level,
+                    "has_image": has_image,
+                }
+                paragraphs.append(entry)
+
+        # Extract tables
+        for t_idx, table in enumerate(doc.tables):
+            rows = []
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                rows.append(cells)
+            tables.append({
+                "index": t_idx,
+                "rows": len(rows),
+                "columns": len(rows[0]) if rows else 0,
+                "data": rows,
+            })
+
+        # Extract images
+        if include_images:
+            try:
+                from docx.opc.constants import RELATIONSHIP_TYPE as RT
+                import base64
+                
+                for rel in doc.part.rels.values():
+                    if "image" in rel.reltype:
+                        try:
+                            image_data = rel.target_part.blob
+                            ext = rel.target_part.partname.split(".")[-1] if "." in str(rel.target_part.partname) else "png"
+                            mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp", "tiff": "image/tiff", "emf": "image/x-emf", "wmf": "image/x-wmf"}
+                            mime = mime_map.get(ext.lower(), "image/png")
+                            
+                            # Skip EMF/WMF as they can't be displayed in browser
+                            if ext.lower() in ("emf", "wmf"):
+                                images.append({
+                                    "index": image_idx,
+                                    "mime_type": mime,
+                                    "size": len(image_data),
+                                    "extension": ext,
+                                    "note": "EMF/WMF format - not displayable as base64",
+                                })
+                                image_idx += 1
+                                continue
+                            
+                            b64 = base64.b64encode(image_data).decode("ascii")
+                            images.append({
+                                "index": image_idx,
+                                "mime_type": mime,
+                                "size": len(image_data),
+                                "extension": ext,
+                                "data_url": f"data:{mime};base64,{b64[:100]}...",
+                            })
+                            image_idx += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Build a readable text summary
+        text_parts = []
+        for p in paragraphs:
+            prefix = "#" * p["heading_level"] + " " if p["is_heading"] else ""
+            text_parts.append(f"{prefix}{p['text']}")
+        for t in tables:
+            text_parts.append(f"\n[Table {t['index']}: {t['rows']}x{t['columns']}]")
+            for row in t["data"]:
+                text_parts.append(" | ".join(row))
+        text_summary = "\n".join(text_parts)
+
+        return make_success({
+            "path": file_path,
+            "paragraphs": paragraphs,
+            "tables": tables,
+            "images": images,
+            "paragraph_count": len(paragraphs),
+            "table_count": len(tables),
+            "image_count": len(images),
+            "text_summary": text_summary,
+        })
+
+    except Exception as e:
+        return make_error(f"Failed to parse .docx: {e}", 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DOCX Template Fill (high-level: preserve template layout, replace body content)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/docx/template-fill", methods=["POST"])
+def docx_template_fill() -> Response:
+    """
+    Fill a .docx template with new content while preserving the template's
+    cover page, tables, headers/footers, and styles.
+    
+    The agent provides:
+    - template_path: path to the template .docx
+    - output_path: where to save the result
+    - sections: list of {heading, content, images[]} to replace body content
+    - keep_cover_page: whether to preserve the first page/table(s)
+    - cover_replacements: optional {search: replace} for text in the cover page
+    
+    This eliminates the need for window-by-window WIR editing when the task is
+    "follow this template as an example and create a new document."
+    """
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id", "default")
+    template_path = data.get("template_path", "")
+    output_path = data.get("output_path", "")
+    sections = data.get("sections", [])
+    keep_cover_page = data.get("keep_cover_page", True)
+    cover_replacements = data.get("cover_replacements", {})
+    
+    if not template_path:
+        return make_error("Missing 'template_path' field", 400)
+    if not output_path:
+        return make_error("Missing 'output_path' field", 400)
+    if not sections:
+        return make_error("Missing 'sections' field — provide at least one section", 400)
+    
+    try:
+        template_file = resolve_workspace_path(session_id, template_path)
+    except ValueError:
+        return make_error("Invalid template_path", 400)
+    
+    if not template_file.exists():
+        return make_error(f"Template file not found: {template_path}", 404)
+    
+    try:
+        out_file = resolve_workspace_path(session_id, output_path)
+    except ValueError:
+        return make_error("Invalid output_path", 400)
+    
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    session_workspace = ensure_session_dirs(session_id)
+    
+    try:
+        from docx import Document
+        from docx.shared import Inches, Pt, Cm, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        import copy
+        import re
+        
+        # Read the template to extract style definitions
+        template_doc = Document(str(template_file))
+        
+        # Create a new document based on the template (this preserves styles)
+        # We copy the template then selectively remove body content
+        import shutil
+        shutil.copy2(str(template_file), str(out_file))
+        doc = Document(str(out_file))
+        
+        # Apply cover page text replacements
+        if cover_replacements:
+            for search_text, replace_text in cover_replacements.items():
+                for paragraph in doc.paragraphs:
+                    if search_text in paragraph.text:
+                        for run in paragraph.runs:
+                            if search_text in run.text:
+                                run.text = run.text.replace(search_text, replace_text)
+                # Also check tables on cover page
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                if search_text in paragraph.text:
+                                    for run in paragraph.runs:
+                                        if search_text in run.text:
+                                            run.text = run.text.replace(search_text, replace_text)
+        
+        # Determine where the body content starts.
+        # Strategy: find the first heading after the cover page, or the first
+        # paragraph after all cover-page tables, then remove everything from there.
+        cover_end_index = 0
+        if keep_cover_page:
+            # Find tables in the document body
+            body = doc.element.body
+            table_elements = body.findall(qn('w:tbl'))
+            
+            # Find the index of the last element that's part of the cover page.
+            # Heuristic: the cover page ends after the last table that appears
+            # before any Heading 1 style paragraph.
+            found_heading = False
+            cover_end_elem = None
+            
+            for child in body:
+                tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                
+                # Check if this is a heading paragraph
+                if tag == 'p':
+                    pPr = child.find(qn('w:pPr'))
+                    if pPr is not None:
+                        pStyle = pPr.find(qn('w:pStyle'))
+                        if pStyle is not None:
+                            style_val = pStyle.get(qn('w:val'), '')
+                            if style_val.startswith('Heading') or style_val.startswith('heading'):
+                                found_heading = True
+                                cover_end_elem = child
+                                break
+                    
+                    # Also check for explicit section markers in German protocols
+                    text_elem = child.find(qn('w:r'))
+                    if text_elem is not None:
+                        t_elem = text_elem.find(qn('w:t'))
+                        if t_elem is not None and t_elem.text:
+                            text = t_elem.text.strip()
+                            if text in ('Übungsangabe', 'Aufgabenstellung', 'Stoffwiederholung', 
+                                       'Übungsablauf', 'Exercise', 'Task', 'Procedure'):
+                                found_heading = True
+                                cover_end_elem = child
+                                break
+                
+                # Tables before the first heading are part of the cover page
+                if tag == 'tbl' and not found_heading:
+                    cover_end_elem = child
+            
+            if not found_heading:
+                # No heading found — assume the entire document is cover + body
+                # Keep just the first table (cover table) if any
+                if table_elements:
+                    cover_end_elem = table_elements[0]
+        
+        # Remove body content after cover page
+        if cover_end_elem is not None:
+            body = doc.element.body
+            found_cover_end = False
+            to_remove = []
+            for child in body:
+                if child is cover_end_elem:
+                    found_cover_end = True
+                    to_remove.append(child)
+                    continue
+                if found_cover_end:
+                    to_remove.append(child)
+            
+            for elem in to_remove:
+                body.remove(elem)
+        
+        # Now add new content sections
+        for section in sections:
+            heading = section.get("heading", "")
+            content = section.get("content", "")
+            images = section.get("images", [])
+            
+            # Add heading
+            if heading:
+                heading_level = section.get("heading_level", 1)
+                style_name = f"Heading {heading_level}"
+                try:
+                    h_para = doc.add_heading(heading, level=heading_level)
+                except Exception:
+                    h_para = doc.add_paragraph(heading)
+                    h_para.style = doc.styles[style_name] if style_name in [s.name for s in doc.styles] else None
+            
+            # Add content (parse simple markdown-like formatting)
+            if content:
+                lines = content.split('\n')
+                for line in lines:
+                    line_stripped = line.strip()
+                    if not line_stripped:
+                        doc.add_paragraph('')
+                        continue
+                    
+                    # Bullet list
+                    if line_stripped.startswith('- ') or line_stripped.startswith('* '):
+                        text = line_stripped[2:]
+                        p = doc.add_paragraph(style='List Bullet')
+                        # Handle bold
+                        _add_formatted_runs(p, text)
+                        continue
+                    
+                    # Numbered list
+                    list_match = re.match(r'^(\d+)[.)]\s+(.*)', line_stripped)
+                    if list_match:
+                        text = list_match.group(2)
+                        p = doc.add_paragraph(style='List Number')
+                        _add_formatted_runs(p, text)
+                        continue
+                    
+                    # Sub-heading (### or ##)
+                    heading_match = re.match(r'^(#{1,4})\s+(.*)', line_stripped)
+                    if heading_match:
+                        level = min(len(heading_match.group(1)), 4)
+                        text = heading_match.group(2)
+                        try:
+                            doc.add_heading(text, level=level + 1)  # +1 since Heading 1 is the main section
+                        except Exception:
+                            doc.add_paragraph(text)
+                        continue
+                    
+                    # Regular paragraph
+                    p = doc.add_paragraph()
+                    _add_formatted_runs(p, line_stripped)
+            
+            # Add images
+            for img in images:
+                img_path = img.get("path", "")
+                img_caption = img.get("caption", "")
+                img_width_inches = img.get("width", 5.0)
+                
+                if not img_path:
+                    continue
+                
+                try:
+                    img_file = resolve_workspace_path(session_id, img_path)
+                    if img_file.exists():
+                        p = doc.add_paragraph()
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        run = p.add_run()
+                        run.add_picture(str(img_file), width=Inches(img_width_inches))
+                        
+                        if img_caption:
+                            cap_p = doc.add_paragraph()
+                            cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                            cap_run = cap_p.add_run(img_caption)
+                            cap_run.font.size = Pt(9)
+                            cap_run.font.italic = True
+                except Exception as e:
+                    # Add placeholder if image fails
+                    doc.add_paragraph(f"[Image: {img_path} — failed to insert: {e}]")
+        
+        doc.save(str(out_file))
+        
+        result_size = out_file.stat().st_size
+        
+        # Build a summary of what was done
+        section_names = [s.get("heading", f"Section {i+1}") for i, s in enumerate(sections)]
+        total_images = sum(len(s.get("images", [])) for s in sections)
+        
+        return make_success({
+            "output_path": str(out_file),
+            "size": result_size,
+            "sections_added": len(sections),
+            "section_names": section_names,
+            "images_inserted": total_images,
+            "cover_preserved": keep_cover_page,
+            "cover_replacements_applied": len(cover_replacements),
+            "summary": f"Created {output_path} from template {template_path}: {len(sections)} sections, {total_images} images, cover {'preserved' if keep_cover_page else 'not preserved'}",
+        })
+    
+    except Exception as e:
+        import traceback
+        return make_error(f"Template fill failed: {traceback.format_exc()}", 500)
+
+
+def _add_formatted_runs(paragraph, text: str):
+    """Add runs with **bold** and *italic* formatting to a paragraph."""
+    import re
+    from docx.shared import Pt
+    
+    pattern = r'(\*\*.*?\*\*|\*.*?\*)'
+    parts = re.split(pattern, text)
+    
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith('**') and part.endswith('**'):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        elif part.startswith('*') and part.endswith('*') and not part.startswith('**'):
+            run = paragraph.add_run(part[1:-1])
+            run.italic = True
+        else:
+            paragraph.add_run(part)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DOCX Build (C# + OpenXML SDK creation route)
 # ═══════════════════════════════════════════════════════════════════════════════
 

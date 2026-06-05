@@ -237,6 +237,97 @@ export async function sandboxFileInfo(
 
 // ── Conversions ──────────────────────────────────────────────────────────────
 
+export type SandboxDocxReadResult = {
+  path: string;
+  paragraphs: Array<{
+    index: number;
+    text: string;
+    style: string;
+    alignment: string;
+    is_heading: boolean;
+    heading_level: number;
+    has_image: boolean;
+  }>;
+  tables: Array<{
+    index: number;
+    rows: number;
+    columns: number;
+    data: string[][];
+  }>;
+  images: Array<{
+    index: number;
+    mime_type: string;
+    size: number;
+    extension: string;
+    data_url?: string;
+    note?: string;
+  }>;
+  paragraph_count: number;
+  table_count: number;
+  image_count: number;
+  text_summary: string;
+};
+
+export async function sandboxDocxRead(
+  sessionId: string,
+  filePath: string,
+  includeImages = true,
+  maxImageWidth = 800
+): Promise<SandboxDocxReadResult> {
+  const res = (await sandboxFetch("/docx/read", {
+    method: "POST",
+    body: JSON.stringify({
+      path: filePath,
+      session_id: sessionId,
+      include_images: includeImages,
+      max_image_width: maxImageWidth,
+    }),
+    timeout: 60_000,
+  })) as SandboxDocxReadResult;
+  return res;
+}
+
+export type SandboxDocxTemplateFillResult = {
+  output_path: string;
+  size: number;
+  sections_added: number;
+  section_names: string[];
+  images_inserted: number;
+  cover_preserved: boolean;
+  cover_replacements_applied: number;
+  summary: string;
+};
+
+export async function sandboxDocxTemplateFill(
+  sessionId: string,
+  templatePath: string,
+  outputPath: string,
+  sections: Array<{
+    heading?: string;
+    heading_level?: number;
+    content?: string;
+    images?: Array<{ path: string; caption?: string; width?: number }>;
+  }>,
+  options?: {
+    keepCoverPage?: boolean;
+    coverReplacements?: Record<string, string>;
+  }
+): Promise<SandboxDocxTemplateFillResult> {
+  const res = (await sandboxFetch("/docx/template-fill", {
+    method: "POST",
+    body: JSON.stringify({
+      template_path: templatePath,
+      output_path: outputPath,
+      sections,
+      session_id: sessionId,
+      keep_cover_page: options?.keepCoverPage ?? true,
+      cover_replacements: options?.coverReplacements ?? {},
+    }),
+    timeout: 120_000,
+  })) as SandboxDocxTemplateFillResult;
+  return res;
+}
+
 export async function sandboxConvertHtmlToPdf(
   sessionId: string,
   inputPath: string,

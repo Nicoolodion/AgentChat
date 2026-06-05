@@ -27,6 +27,8 @@ import {
   sandboxConvertDocxToPdf,
   sandboxConvertHtmlToPdf,
   sandboxDocxBuild,
+  sandboxDocxRead,
+  sandboxDocxTemplateFill,
   sandboxExecPython,
   sandboxExecShell,
   sandboxFileDelete,
@@ -209,6 +211,68 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
+      name: "docx_read",
+      description: "Read and parse a .docx file, returning structured content (paragraphs with styles, tables, images). Use this instead of ipython or file_read for .docx files. Returns a text_summary plus structured data.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Path to the .docx file (e.g. 'upload/template.docx')" },
+          include_images: { type: "boolean", default: true, description: "Whether to include image metadata" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "docx_template_fill",
+      description: "Fill a .docx template with new content while preserving the template's cover page, tables, headers/footers, and styles. Use this when the user provides a template/example document and wants a new document following its format. Supports content sections with headings + text, image insertion, and cover page text replacement. PREFERRED over WIR editing when most of the document content needs replacing.",
+      parameters: {
+        type: "object",
+        properties: {
+          template_path: { type: "string", description: "Path to the template .docx file (e.g. 'upload/Musterprotokoll.docx')" },
+          output_path: { type: "string", description: "Output path for the new document (e.g. 'output/Protokoll.docx')" },
+          sections: {
+            type: "array",
+            description: "Content sections to add after the cover page",
+            items: {
+              type: "object",
+              properties: {
+                heading: { type: "string", description: "Section heading text" },
+                heading_level: { type: "number", description: "Heading level (1-4, default 1)", default: 1 },
+                content: { type: "string", description: "Section body content (supports **bold**, *italic*, - bullets, 1. numbered lists, ### sub-headings)" },
+                images: {
+                  type: "array",
+                  description: "Images to insert in this section",
+                  items: {
+                    type: "object",
+                    properties: {
+                      path: { type: "string", description: "Relative path to image file" },
+                      caption: { type: "string", description: "Optional caption below the image" },
+                      width: { type: "number", description: "Width in inches (default 5.0)", default: 5.0 },
+                    },
+                    required: ["path"],
+                  },
+                },
+              },
+              required: ["heading"],
+            },
+          },
+          keep_cover_page: { type: "boolean", default: true, description: "Preserve the template's cover page (first tables before any heading)" },
+          cover_replacements: {
+            type: "object",
+            description: "Text replacements on the cover page: {search_text: replacement_text}",
+            additionalProperties: { type: "string" },
+          },
+        },
+        required: ["template_path", "output_path", "sections"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "docx_create",
       description: "Create a Word document using python-docx. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.docx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
       parameters: {
@@ -375,7 +439,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
 
 // ── System prompt ────────────────────────────────────────────────────────────
 
-const AGENT_SYSTEM_PROMPT = `You are the Chatinterface Agent — an autonomous reasoning engine that helps users create documents, analyze files, write code, search the web, and perform multi-step tasks.
+const AGENT_SYSTEM_PROMPT_BASE = `You are the Chatinterface Agent — an autonomous reasoning engine that helps users create documents, analyze files, write code, search the web, and perform multi-step tasks.
 
 ## Workspace
 You have a persistent workspace. The current working directory is already set to your session workspace directory which contains:
@@ -405,7 +469,10 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 ### Document Generation
 - pdf_from_html(html_path, output_path) — convert HTML to PDF via Playwright
 - docx_to_pdf(input_path, output_path) — convert DOCX to PDF via LibreOffice
+- docx_read(path) — read and parse a .docx file (returns structured content: paragraphs, tables, images). Use this instead of file_read for .docx files.
+- docx_template_fill(template_path, output_path, sections, keep_cover_page?, cover_replacements?) — fill a .docx template with new content while preserving cover page, tables, styles. Each section has heading + content + images. PREFERRED over WIR when creating a new document from a template/example.
 - docx_create(output_path, python_code) — create Word doc using python-docx
+- docx_build(output_path, program_cs) — build high-quality Word doc using C# + OpenXML SDK
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
 - pptx_create(output_path, python_code) — create PowerPoint using python-pptx
 - libreoffice_convert(input_path, output_format, output_path?) — convert office formats
@@ -423,32 +490,38 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - todo_read() — read current todo list
 
 ## Skills
-Skills are mounted at /app/skills/ and provide domain expertise:
-- /app/skills/docx/ — Word document creation via C# + OpenXML SDK
-- /app/skills/pdf/ — PDF generation from HTML (read SKILL.md for routing rules)
-- /app/skills/xlsx/ — Spreadsheet creation
-- /app/skills/pptx/ — Presentation creation
+Skills are mounted at /app/skills/ and provide domain expertise for document generation tasks. The relevant SKILL.md content for your task is automatically injected below when applicable.
+- /app/skills/docx/ — Word documents (C# + OpenXML SDK creation, WIR editing)
+- /app/skills/pdf/ — PDF generation from HTML
 
-To read a skill file, use file_read with the path /app/skills/<skill>/SKILL.md.
-
-### DOCX Skill (Important)
-For Word document tasks, ALWAYS read /app/skills/docx/SKILL.md FIRST before writing any code. It contains routing rules:
-- **WIR route** — If an existing .docx template/format matters, use the WIR engine (read references/wir-reference.md).
-- **Create route** — If building from scratch, use the \`docx_build\` tool. Write C# code using DocumentFormat.OpenXml, then call docx_build with program_cs and output_path.
-- **md2docx route** — If you have upstream .md files from sub-agents, use the md2docx pipeline (references/md2docx-reference.md).
-
-Quality standards from the DOCX skill:
-- Low-saturation color palette; never pure red/blue.
-- Headers, footers, and page numbers must be present.
-- No placeholder text remains.
-- Cover/backcover backgrounds must contrast with text.
+If you need a skill not included below, use file_read with the path /app/skills/<skill>/SKILL.md.
 
 ## Quality Standards
 - Place all final deliverables in the output/ directory.
 - Use clear, descriptive filenames.
 - Summarize what you produced in your final message.
 - If a step fails, retry with a different approach or ask the user.
-- For document generation, read the relevant SKILL.md first to follow best practices.`;
+- For document generation, the relevant SKILL.md has been included — follow its routing rules and quality standards.`;
+
+const SKILL_EXTENSIONS: Record<string, string> = {
+  ".docx": "docx",
+  ".doc": "docx",
+  ".pdf": "pdf",
+};
+
+function buildSystemPrompt(skillContent?: Map<string, string>): string {
+  let prompt = AGENT_SYSTEM_PROMPT_BASE;
+
+  if (skillContent && skillContent.size > 0) {
+    const sections: string[] = [];
+    for (const [skillName, content] of skillContent) {
+      sections.push(`## Skill: ${skillName}\n\n${content}`);
+    }
+    prompt += `\n\n---\n\n# Auto-Loaded Skill Instructions\n\nThe following skill instructions were automatically loaded based on the files in the upload/ directory. Follow these rules without needing to read them again:\n\n${sections.join("\n\n")}`;
+  }
+
+  return prompt;
+}
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
@@ -471,8 +544,36 @@ export async function runAgentExecution(input: {
   await updateSessionStatus(sessionId, "thinking");
   sendEvent({ type: "status", data: { status: "thinking", step: "Analyzing request and planning steps" } });
 
+  // Auto-detect relevant skills from uploaded files
+  const skillContent = new Map<string, string>();
+  try {
+    const files = await sandboxFileList(sessionId, "upload/");
+    const neededSkills = new Set<string>();
+    for (const file of files) {
+      const ext = file.name.includes(".") ? "." + file.name.split(".").pop()!.toLowerCase() : "";
+      const skill = SKILL_EXTENSIONS[ext];
+      if (skill) neededSkills.add(skill);
+    }
+    // Also check the user message for skill-relevant keywords
+    const msgLower = userMessage.toLowerCase();
+    if (msgLower.includes("docx") || msgLower.includes(".doc") || msgLower.includes("word") || msgLower.includes("protokoll") || msgLower.includes("protocol")) {
+      neededSkills.add("docx");
+    }
+    if (msgLower.includes("pdf") || msgLower.includes("report")) {
+      neededSkills.add("pdf");
+    }
+    for (const skill of neededSkills) {
+      try {
+        const res = await sandboxFileRead(sessionId, `/app/skills/${skill}/SKILL.md`, "utf8");
+        if (res.content) skillContent.set(skill, res.content);
+      } catch { /* skill file may not exist */ }
+    }
+  } catch { /* workspace may not have files yet */ }
+
+  const systemPrompt = buildSystemPrompt(skillContent);
+
   const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: AGENT_SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     ...priorConversation.map((m) => ({ role: m.role, content: m.content }) as ChatCompletionMessageParam),
     { role: "user", content: userMessage },
   ];
@@ -725,6 +826,47 @@ async function executeSandboxTool(
       const outputPath = String(args.output_path ?? "");
       const res = await sandboxConvertDocxToPdf(sessionId, inputPath, outputPath);
       return { ok: true, result: res, stdout: `PDF created: ${outputPath} (${res.size} bytes)` };
+    }
+    case "docx_read": {
+      const docxPath = String(args.path ?? "");
+      const includeImages = args.include_images !== false;
+      try {
+        const res = await sandboxDocxRead(sessionId, docxPath, includeImages);
+        const summary = [
+          `Parsed ${docxPath}: ${res.paragraph_count} paragraphs, ${res.table_count} tables, ${res.image_count} images`,
+          "",
+          res.text_summary,
+        ].join("\n");
+        return { ok: true, result: res, stdout: summary };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `docx_read failed: ${msg}` };
+      }
+    }
+    case "docx_template_fill": {
+      const templatePath = String(args.template_path ?? "");
+      const outputPath = String(args.output_path ?? "");
+      const sections = Array.isArray(args.sections) ? args.sections : [];
+      const keepCoverPage = args.keep_cover_page !== false;
+      const coverReplacements = (args.cover_replacements as Record<string, string>) ?? {};
+      try {
+        const res = await sandboxDocxTemplateFill(
+          sessionId,
+          templatePath,
+          outputPath,
+          sections as Array<{
+            heading?: string;
+            heading_level?: number;
+            content?: string;
+            images?: Array<{ path: string; caption?: string; width?: number }>;
+          }>,
+          { keepCoverPage, coverReplacements }
+        );
+        return { ok: true, result: res, stdout: res.summary };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `docx_template_fill failed: ${msg}` };
+      }
     }
     case "docx_create": {
       const outputPath = String(args.output_path ?? "");
@@ -1008,7 +1150,7 @@ async function scanForArtifacts(
   sendEvent: (event: AgentSseEvent) => void
 ): Promise<void> {
   // After file write or conversion tools, scan the output directory for new artifacts
-  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "xlsx_create", "pptx_create", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
+  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_create", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
 
   try {
     const files = await sandboxFileList(sessionId, "output/");

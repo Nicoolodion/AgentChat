@@ -858,10 +858,8 @@ export function ChatApp() {
             activeTab={agent.activeTab}
             onSetTab={agent.setActiveTab}
             sessionId={agent.agentSession.id}
-            terminalEntries={agent.terminalEntries}
             isExecuting={agent.isExecuting}
             artifacts={agent.artifacts}
-            onClearTerminal={agent.clearTerminal}
             onPreviewFile={(f) => setAgentFilePreview(f)}
           />
         )}

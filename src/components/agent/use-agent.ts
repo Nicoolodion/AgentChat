@@ -17,7 +17,7 @@ export type AgentUIState = {
   modeLocked: boolean;
   isInitializing: boolean;
   sidebarOpen: boolean;
-  activeTab: "terminal" | "files" | "artifacts";
+  activeTab: "files" | "artifacts";
   terminalEntries: TerminalEntry[];
   artifacts: AgentArtifact[];
   isExecuting: boolean;
@@ -32,7 +32,7 @@ export function useAgent(chatId: string | undefined) {
     modeLocked: false,
     isInitializing: false,
     sidebarOpen: false, // default minimized
-    activeTab: "terminal",
+    activeTab: "files",
     terminalEntries: [],
     artifacts: [],
     isExecuting: false,

@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useCallback } from "react";
-import { Terminal, FolderTree, Package, ChevronRight, ChevronLeft } from "lucide-react";
-import { AgentTerminal } from "./AgentTerminal";
+import { FolderTree, Package, ChevronRight, ChevronLeft } from "lucide-react";
 import { AgentFileExplorer } from "./AgentFileExplorer";
 import { AgentArtifactsPanel } from "./AgentArtifactsPanel";
-import type { TerminalEntry, AgentUIState } from "./use-agent";
+import type { AgentUIState } from "./use-agent";
 import type { AgentArtifact } from "@/lib/agent/types";
 
 export function AgentSidebar({
@@ -14,10 +13,8 @@ export function AgentSidebar({
   activeTab,
   onSetTab,
   sessionId,
-  terminalEntries,
   isExecuting,
   artifacts,
-  onClearTerminal,
   onPreviewFile,
 }: {
   open: boolean;
@@ -25,10 +22,8 @@ export function AgentSidebar({
   activeTab: AgentUIState["activeTab"];
   onSetTab: (tab: AgentUIState["activeTab"]) => void;
   sessionId: string;
-  terminalEntries: TerminalEntry[];
   isExecuting: boolean;
   artifacts: AgentArtifact[];
-  onClearTerminal: () => void;
   onPreviewFile?: (file: { path: string; name: string; mimeType: string }) => void;
 }) {
   // Keyboard: Escape only closes on mobile; desktop uses toggle button
@@ -60,7 +55,6 @@ export function AgentSidebar({
   }, [open, onToggle]);
 
   const tabs = [
-    { id: "terminal" as const, label: "Terminal", icon: Terminal },
     { id: "files" as const, label: "Files", icon: FolderTree },
     { id: "artifacts" as const, label: "Artifacts", icon: Package },
   ];
@@ -144,13 +138,6 @@ export function AgentSidebar({
         {/* Content */}
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-            {activeTab === "terminal" && (
-              <AgentTerminal
-                entries={terminalEntries}
-                isExecuting={isExecuting}
-                onClear={onClearTerminal}
-              />
-            )}
             {activeTab === "files" && (
               <AgentFileExplorer sessionId={sessionId} onPreview={onPreviewFile} />
             )}

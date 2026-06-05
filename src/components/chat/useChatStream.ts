@@ -157,6 +157,22 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
       let totalTokens = 0;
       let streamStart = Date.now();
       let liveTps: number | undefined;
+      let currentReasoningSegment = "";
+
+      const pushReasoningSegment = () => {
+        if (currentReasoningSegment.length > 0) {
+          setMessages((current) => {
+            const copy = current.slice();
+            const idx = copy.length - 1;
+            if (idx < 0) return current;
+            const last = copy[idx]!;
+            const segs = last.reasoningSegments ?? [];
+            copy[idx] = { ...last, reasoningSegments: [...segs, currentReasoningSegment] };
+            return copy;
+          });
+          currentReasoningSegment = "";
+        }
+      };
 
       const applyContent = (updater: (msg: ChatMessage) => ChatMessage) => {
         setMessages((current) => {
@@ -214,6 +230,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             return;
           }
           if (event === "reasoning" && typeof data.text === "string") {
+            currentReasoningSegment += data.text;
             applyContent((m) => ({
               ...m,
               reasoning: (m.reasoning ?? "") + data.text,
@@ -222,6 +239,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             return;
           }
           if (event === "tool_start") {
+            pushReasoningSegment();
             const tcId = (data.toolCallId as string) ?? `tc-${Date.now()}`;
             const args = (data.arguments as Record<string, unknown> | undefined) ?? undefined;
             if (args) {
@@ -268,6 +286,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             return;
           }
           if (event === "done") {
+            pushReasoningSegment();
             const asst = data.assistantMessage as ChatMessage | undefined;
             if (asst) {
               applyContent((m) => ({
