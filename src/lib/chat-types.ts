@@ -21,7 +21,7 @@ export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   reasoning?: string;
-  reasoningSegments?: string[];
+  reasoningSegments?: Array<{ text: string; beforeToolIndex: number }>;
   toolPayload?: string;
   toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;

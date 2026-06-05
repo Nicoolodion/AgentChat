@@ -668,6 +668,7 @@ def docx_read() -> Response:
     try:
         from docx import Document
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
 
         doc = Document(str(target))
 
@@ -680,14 +681,28 @@ def docx_read() -> Response:
         for i, p in enumerate(doc.paragraphs):
             style_name = p.style.name if p.style else ""
             alignment = ""
-            if p.alignment is not None:
-                alignment_map = {
-                    WD_ALIGN_PARAGRAPH.LEFT: "left",
-                    WD_ALIGN_PARAGRAPH.CENTER: "center",
-                    WD_ALIGN_PARAGRAPH.RIGHT: "right",
-                    WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
-                }
-                alignment = alignment_map.get(p.alignment, "")
+            try:
+                if p.alignment is not None:
+                    alignment_map = {
+                        WD_ALIGN_PARAGRAPH.LEFT: "left",
+                        WD_ALIGN_PARAGRAPH.CENTER: "center",
+                        WD_ALIGN_PARAGRAPH.RIGHT: "right",
+                        WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
+                    }
+                    alignment = alignment_map.get(p.alignment, "")
+            except Exception:
+                jc_map = {"left": "left", "start": "left", "center": "center",
+                          "right": "right", "end": "right", "justify": "justify",
+                          "both": "justify", "distribute": "justify"}
+                try:
+                    pPr = p._element.find(qn('w:pPr'))
+                    if pPr is not None:
+                        jc = pPr.find(qn('w:jc'))
+                        if jc is not None:
+                            val = jc.get(qn('w:val'), '')
+                            alignment = jc_map.get(val, val)
+                except Exception:
+                    alignment = ""
             
             is_heading = style_name.startswith("Heading")
             heading_level = int(style_name.replace("Heading ", "").replace("Heading", "1") or "0") if is_heading else 0
@@ -974,16 +989,23 @@ def docx_template_fill() -> Response:
                     # Bullet list
                     if line_stripped.startswith('- ') or line_stripped.startswith('* '):
                         text = line_stripped[2:]
-                        p = doc.add_paragraph(style='List Bullet')
-                        # Handle bold
+                        try:
+                            p = doc.add_paragraph(style='List Bullet')
+                        except KeyError:
+                            p = doc.add_paragraph()
+                            run = p.add_run('\u2022 ')
+                            run.font.name = 'Symbol'
                         _add_formatted_runs(p, text)
                         continue
                     
-                    # Numbered list
                     list_match = re.match(r'^(\d+)[.)]\s+(.*)', line_stripped)
                     if list_match:
                         text = list_match.group(2)
-                        p = doc.add_paragraph(style='List Number')
+                        try:
+                            p = doc.add_paragraph(style='List Number')
+                        except KeyError:
+                            p = doc.add_paragraph()
+                            num_run = p.add_run(f'{list_match.group(1)}. ')
                         _add_formatted_runs(p, text)
                         continue
                     

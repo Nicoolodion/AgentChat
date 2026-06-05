@@ -359,27 +359,23 @@ function buildSteps(
 
   if (hasReasoningSegments) {
     const segments = message.reasoningSegments!;
-    const numSegments = segments.length;
-    const numToolCalls = toolCalls.length;
 
-    for (let i = 0; i < Math.max(numSegments, numToolCalls); i++) {
-      if (i < numSegments && segments[i]!.trim().length > 0) {
-        steps.push({ kind: "reasoning", id: `r-${message.id}-${i}`, text: segments[i]! });
+    for (let i = 0; i < toolCalls.length; i++) {
+      for (const seg of segments) {
+        if (seg.beforeToolIndex === i && seg.text.trim().length > 0) {
+          steps.push({ kind: "reasoning", id: `r-${message.id}-s${i}`, text: seg.text });
+        }
       }
-      if (i < numToolCalls) {
-        const call = toolCalls[i]!;
-        const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
-        const args = toolArguments?.[call.toolCallId];
-        steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
-      }
-    }
-
-    // If there are more tool calls than segments, add remaining tool calls
-    for (let i = numSegments; i < numToolCalls; i++) {
       const call = toolCalls[i]!;
       const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
       const args = toolArguments?.[call.toolCallId];
       steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
+    }
+
+    for (const seg of segments) {
+      if (seg.beforeToolIndex >= toolCalls.length && seg.text.trim().length > 0) {
+        steps.push({ kind: "reasoning", id: `r-${message.id}-tail-${seg.beforeToolIndex}`, text: seg.text });
+      }
     }
   } else {
     if (message.reasoning && message.reasoning.trim().length > 0) {

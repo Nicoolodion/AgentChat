@@ -158,16 +158,19 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
       let streamStart = Date.now();
       let liveTps: number | undefined;
       let currentReasoningSegment = "";
+      let currentToolCallIdx = 0;
 
       const pushReasoningSegment = () => {
         if (currentReasoningSegment.length > 0) {
+          const segText = currentReasoningSegment;
+          const segIdx = currentToolCallIdx;
           setMessages((current) => {
             const copy = current.slice();
             const idx = copy.length - 1;
             if (idx < 0) return current;
             const last = copy[idx]!;
             const segs = last.reasoningSegments ?? [];
-            copy[idx] = { ...last, reasoningSegments: [...segs, currentReasoningSegment] };
+            copy[idx] = { ...last, reasoningSegments: [...segs, { text: segText, beforeToolIndex: segIdx }] };
             return copy;
           });
           currentReasoningSegment = "";
@@ -245,6 +248,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             if (args) {
               setToolArguments((prev) => ({ ...prev, [tcId]: args }));
             }
+            currentToolCallIdx++;
             applyContent((m) => {
               const existing = m.toolCalls ?? [];
               return {
@@ -293,8 +297,9 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
                 ...asst,
                 _isStreaming: false,
                 ttftMs: asst.ttftMs ?? m.ttftMs,
-                toolCalls: asst.toolCalls ?? m.toolCalls,
+                toolCalls: m.toolCalls ?? asst.toolCalls,
                 reasoning: asst.reasoning ?? m.reasoning,
+                reasoningSegments: m.reasoningSegments,
                 avgTokensPerSecond: asst.avgTokensPerSecond ?? m.avgTokensPerSecond,
               }));
             } else {

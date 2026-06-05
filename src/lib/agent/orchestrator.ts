@@ -289,14 +289,15 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "docx_build",
-      description: "Build a high-quality Word document using the DOCX skill's C# + OpenXML SDK pipeline. This is the preferred route for creating professional DOCX files from scratch. Reads SKILL.md from /app/skills/docx for routing rules. Provide a complete C# Program.cs source that uses DocumentFormat.OpenXml.",
+      description: "Build a high-quality Word document using the DOCX skill's C# + OpenXML SDK pipeline. IMPORTANT: First write your Program.cs using file_write to a path like 'temp/Program.cs', then provide that path in program_cs_path. This avoids JSON escaping issues with inline code. Only use program_cs for very short snippets.",
       parameters: {
         type: "object",
         properties: {
           output_path: { type: "string", description: "Relative path for output DOCX (e.g. 'output/report.docx')" },
-          program_cs: { type: "string", description: "Complete C# source code for Program.cs using DocumentFormat.OpenXml. The skill will compile, run, validate, and produce the docx." },
+          program_cs_path: { type: "string", description: "Relative path to the C# source file previously written via file_write (e.g. 'temp/Program.cs'). Preferred over program_cs." },
+          program_cs: { type: "string", description: "C# source code string (fallback — prefer program_cs_path to avoid escaping issues)." },
         },
-        required: ["output_path", "program_cs"],
+        required: ["output_path"],
       },
     },
   },
@@ -472,7 +473,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - docx_read(path) — read and parse a .docx file (returns structured content: paragraphs, tables, images). Use this instead of file_read for .docx files.
 - docx_template_fill(template_path, output_path, sections, keep_cover_page?, cover_replacements?) — fill a .docx template with new content while preserving cover page, tables, styles. Each section has heading + content + images. PREFERRED over WIR when creating a new document from a template/example.
 - docx_create(output_path, python_code) — create Word doc using python-docx
-- docx_build(output_path, program_cs) — build high-quality Word doc using C# + OpenXML SDK
+- docx_build(output_path, program_cs_path?, program_cs?) — build high-quality Word doc using C# + OpenXML SDK. IMPORTANT: write Program.cs via file_write first, then pass the path in program_cs_path.
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
 - pptx_create(output_path, python_code) — create PowerPoint using python-pptx
 - libreoffice_convert(input_path, output_format, output_path?) — convert office formats
@@ -882,8 +883,18 @@ async function executeSandboxTool(
     }
     case "docx_build": {
       const outputPath = String(args.output_path ?? "");
-      const programCs = String(args.program_cs ?? "");
+      let programCs = String(args.program_cs ?? "");
+      const programCsPath = String(args.program_cs_path ?? "");
       await sandboxExecShell(sessionId, `mkdir -p "$(dirname '${outputPath.replace(/'/g, "'\'")}')"`, "/", 10);
+      if (programCsPath) {
+        try {
+          const fileRes = await sandboxFileRead(sessionId, programCsPath, "utf8");
+          programCs = fileRes.content;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, error: `Failed to read program_cs_path '${programCsPath}': ${msg}` };
+        }
+      }
       const res = await sandboxDocxBuild(sessionId, outputPath, programCs || undefined);
       return {
         ok: true,
@@ -1033,34 +1044,45 @@ except Exception as e:
 
       const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
 
-      async function analyzeSingle(imagePath: string): Promise<void> {
-        try {
-          const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
-          const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
-          const mimeMap: Record<string, string> = {
-            jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
-          };
-          const mime = mimeMap[ext] ?? "image/png";
-          const dataUrl = `data:${mime};base64,${fileRes.content}`;
-          const response = await nanoClient.chat.completions.create({
-            model,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  { type: "text", text: fullPrompt },
-                  { type: "image_url", image_url: { url: dataUrl, detail } },
-                ],
-              },
-            ],
-            max_tokens: 1024,
-          });
-          const content = response.choices[0]?.message?.content ?? "";
-          results.push({ path: imagePath, content, ok: true });
-        } catch (err) {
-          if ((err as Error).name === "AbortError") throw err;
-          const msg = err instanceof Error ? err.message : String(err);
-          results.push({ path: imagePath, content: "", ok: false, error: msg });
+      async function analyzeSingle(imagePath: string, maxRetries = 2): Promise<void> {
+        let attempts = 0;
+        while (attempts <= maxRetries) {
+          attempts++;
+          try {
+            const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
+            const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
+            const mimeMap: Record<string, string> = {
+              jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+            };
+            const mime = mimeMap[ext] ?? "image/png";
+            const dataUrl = `data:${mime};base64,${fileRes.content}`;
+            const response = await nanoClient.chat.completions.create({
+              model,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "text", text: fullPrompt },
+                    { type: "image_url", image_url: { url: dataUrl, detail } },
+                  ],
+                },
+              ],
+              max_tokens: 1024,
+            });
+            const content = response.choices[0]?.message?.content ?? "";
+            if (content.trim().length > 0) {
+              results.push({ path: imagePath, content, ok: true });
+              return;
+            }
+            if (attempts <= maxRetries) continue;
+            results.push({ path: imagePath, content: "", ok: false, error: "Vision model returned empty response after retries" });
+            return;
+          } catch (err) {
+            if ((err as Error).name === "AbortError") throw err;
+            const msg = err instanceof Error ? err.message : String(err);
+            results.push({ path: imagePath, content: "", ok: false, error: msg });
+            return;
+          }
         }
       }
 
