@@ -37,9 +37,18 @@ async function sandboxFetch<T = unknown>(
     });
     clearTimeout(timer);
 
-    const body = (await res.json().catch(() => ({}))) as T & {
-      error?: string;
-    };
+    let body: Record<string, unknown>;
+    try {
+      body = (await res.json()) as Record<string, unknown>;
+    } catch (parseErr) {
+      if (!res.ok) {
+        throw new SandboxError(`sandbox ${res.status} (non-JSON response)`, res.status);
+      }
+      throw new SandboxError(
+        `Failed to parse sandbox response from ${path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+        502,
+      );
+    }
 
     if (!res.ok) {
       const msg =
@@ -47,7 +56,7 @@ async function sandboxFetch<T = unknown>(
       throw new SandboxError(msg, res.status);
     }
 
-    return body;
+    return body as T;
   } catch (err) {
     clearTimeout(timer);
     throw err;
@@ -165,6 +174,7 @@ export async function sandboxFileRead(
   const res = (await sandboxFetch("/file/read", {
     method: "POST",
     body: JSON.stringify({ path: filePath, encoding, session_id: sessionId }),
+    timeout: encoding === "base64" ? 120_000 : DEFAULT_TIMEOUT,
   })) as {
     content: string;
     size: number;

@@ -227,7 +227,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "docx_template_fill",
-      description: "Fill a .docx template with new content while preserving the template's cover page, tables, headers/footers, and styles. Use this when the user provides a template/example document and wants a new document following its format. Supports content sections with headings + text, image insertion, and cover page text replacement. PREFERRED over WIR editing when most of the document content needs replacing.",
+      description: "Fill a .docx template with new content while preserving the template's cover page, tables, headers/footers, and styles. IMPORTANT for complex sections with many images: first write the JSON sections array to a file (e.g. 'temp/sections.json') using file_write, then pass sections_path. This avoids JSON parsing failures with large arguments.",
       parameters: {
         type: "object",
         properties: {
@@ -235,7 +235,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
           output_path: { type: "string", description: "Output path for the new document (e.g. 'output/Protokoll.docx')" },
           sections: {
             type: "array",
-            description: "Content sections to add after the cover page",
+            description: "Content sections to add after the cover page. For large/complex sections, use sections_path instead.",
             items: {
               type: "object",
               properties: {
@@ -259,6 +259,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
               required: ["heading"],
             },
           },
+          sections_path: { type: "string", description: "Path to a JSON file containing the sections array (written via file_write). Preferred over inline sections for complex documents with many images." },
           keep_cover_page: { type: "boolean", default: true, description: "Preserve the template's cover page (first tables before any heading)" },
           cover_replacements: {
             type: "object",
@@ -266,7 +267,7 @@ const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
             additionalProperties: { type: "string" },
           },
         },
-        required: ["template_path", "output_path", "sections"],
+        required: ["template_path", "output_path"],
       },
     },
   },
@@ -471,7 +472,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - pdf_from_html(html_path, output_path) — convert HTML to PDF via Playwright
 - docx_to_pdf(input_path, output_path) — convert DOCX to PDF via LibreOffice
 - docx_read(path) — read and parse a .docx file (returns structured content: paragraphs, tables, images). Use this instead of file_read for .docx files.
-- docx_template_fill(template_path, output_path, sections, keep_cover_page?, cover_replacements?) — fill a .docx template with new content while preserving cover page, tables, styles. Each section has heading + content + images. PREFERRED over WIR when creating a new document from a template/example.
+- docx_template_fill(template_path, output_path, sections?, sections_path?, keep_cover_page?, cover_replacements?) — fill a .docx template with new content. For complex sections with many images, write the sections JSON to a file first and use sections_path to avoid JSON parsing failures.
 - docx_create(output_path, python_code) — create Word doc using python-docx
 - docx_build(output_path, program_cs_path?, program_cs?) — build high-quality Word doc using C# + OpenXML SDK. IMPORTANT: write Program.cs via file_write first, then pass the path in program_cs_path.
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
@@ -847,9 +848,26 @@ async function executeSandboxTool(
     case "docx_template_fill": {
       const templatePath = String(args.template_path ?? "");
       const outputPath = String(args.output_path ?? "");
-      const sections = Array.isArray(args.sections) ? args.sections : [];
+      const sectionsPath = String(args.sections_path ?? "");
+      let sections = Array.isArray(args.sections) ? args.sections : [];
       const keepCoverPage = args.keep_cover_page !== false;
       const coverReplacements = (args.cover_replacements as Record<string, string>) ?? {};
+      if (!templatePath) {
+        return { ok: false, error: "docx_template_fill requires template_path" };
+      }
+      if (sectionsPath && sections.length === 0) {
+        try {
+          const fileRes = await sandboxFileRead(sessionId, sectionsPath, "utf8");
+          const parsed = JSON.parse(fileRes.content);
+          sections = Array.isArray(parsed) ? parsed : (parsed.sections ?? []);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { ok: false, error: `Failed to read/parse sections_path '${sectionsPath}': ${msg}` };
+        }
+      }
+      if (sections.length === 0) {
+        return { ok: false, error: "docx_template_fill requires sections or sections_path with at least one section" };
+      }
       try {
         const res = await sandboxDocxTemplateFill(
           sessionId,
@@ -1044,18 +1062,39 @@ except Exception as e:
 
       const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
 
+      const NO_IMAGE_PATTERNS = [
+        /no image (was |is )?(attached|provided|uploaded|found|included|visible)/i,
+        /did not (attach|upload|provide|include) (an? |the )?image/i,
+        /please (provide|upload|share|attach) (the |an? )?image/i,
+        /i (cannot|can't|am unable to) (see|describe|view|analyze) (the |an? |any )?image/i,
+        /i don'?t see (any |an? )?image/i,
+        /no image (available|present|shown|displayed)/i,
+        /image (is )?missing|missing image/i,
+        /forgot (to )?(attach|upload|include|provide)/i,
+      ];
+
+      function isNoImageResponse(text: string): boolean {
+        return NO_IMAGE_PATTERNS.some((p) => p.test(text));
+      }
+
       async function analyzeSingle(imagePath: string, maxRetries = 2): Promise<void> {
         let attempts = 0;
         while (attempts <= maxRetries) {
           attempts++;
           try {
             const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
+            if (!fileRes.content || fileRes.content.length < 100) {
+              if (attempts <= maxRetries) continue;
+              results.push({ path: imagePath, content: "", ok: false, error: `Failed to read image data from sandbox (${fileRes.content?.length ?? 0} bytes)` });
+              return;
+            }
             const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
             const mimeMap: Record<string, string> = {
               jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
             };
             const mime = mimeMap[ext] ?? "image/png";
             const dataUrl = `data:${mime};base64,${fileRes.content}`;
+            const useDetail = attempts > 1 ? "low" : detail;
             const response = await nanoClient.chat.completions.create({
               model,
               messages: [
@@ -1063,19 +1102,19 @@ except Exception as e:
                   role: "user",
                   content: [
                     { type: "text", text: fullPrompt },
-                    { type: "image_url", image_url: { url: dataUrl, detail } },
+                    { type: "image_url", image_url: { url: dataUrl, detail: useDetail } },
                   ],
                 },
               ],
               max_tokens: 1024,
             });
             const content = response.choices[0]?.message?.content ?? "";
-            if (content.trim().length > 0) {
-              results.push({ path: imagePath, content, ok: true });
+            if (content.trim().length === 0 || isNoImageResponse(content)) {
+              if (attempts <= maxRetries) continue;
+              results.push({ path: imagePath, content: "", ok: false, error: "Vision model could not see the image after retries" });
               return;
             }
-            if (attempts <= maxRetries) continue;
-            results.push({ path: imagePath, content: "", ok: false, error: "Vision model returned empty response after retries" });
+            results.push({ path: imagePath, content, ok: true });
             return;
           } catch (err) {
             if ((err as Error).name === "AbortError") throw err;
@@ -1123,7 +1162,22 @@ function safeParseArgs(raw: string): Record<string, unknown> {
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
-    return {};
+    // LLMs sometimes generate malformed JSON. Try common fixes:
+    try {
+      // Fix trailing commas before } or ]
+      const fixed = raw.replace(/,\s*([}\]])/g, "$1");
+      return JSON.parse(fixed) as Record<string, unknown>;
+    } catch {
+      // Try extracting the first valid JSON object
+      const objStart = raw.indexOf("{");
+      const objEnd = raw.lastIndexOf("}");
+      if (objStart !== -1 && objEnd > objStart) {
+        try {
+          return JSON.parse(raw.slice(objStart, objEnd + 1)) as Record<string, unknown>;
+        } catch { /* give up */ }
+      }
+      return {};
+    }
   }
 }
 
