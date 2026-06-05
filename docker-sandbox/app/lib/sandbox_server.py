@@ -878,88 +878,59 @@ def docx_template_fill() -> Response:
         # Apply cover page text replacements
         if cover_replacements:
             for search_text, replace_text in cover_replacements.items():
+                seen_paragraphs = set()
                 for paragraph in doc.paragraphs:
                     if search_text in paragraph.text:
-                        for run in paragraph.runs:
-                            if search_text in run.text:
-                                run.text = run.text.replace(search_text, replace_text)
-                # Also check tables on cover page
+                        pid = id(paragraph._element)
+                        if pid not in seen_paragraphs:
+                            seen_paragraphs.add(pid)
+                            for run in paragraph.runs:
+                                if search_text in run.text:
+                                    run.text = run.text.replace(search_text, replace_text)
                 for table in doc.tables:
                     for row in table.rows:
                         for cell in row.cells:
                             for paragraph in cell.paragraphs:
                                 if search_text in paragraph.text:
-                                    for run in paragraph.runs:
-                                        if search_text in run.text:
-                                            run.text = run.text.replace(search_text, replace_text)
+                                    pid = id(paragraph._element)
+                                    if pid not in seen_paragraphs:
+                                        seen_paragraphs.add(pid)
+                                        for run in paragraph.runs:
+                                            if search_text in run.text:
+                                                run.text = run.text.replace(search_text, replace_text)
         
         # Determine where the body content starts.
-        # Strategy: find the first heading after the cover page, or the first
-        # paragraph after all cover-page tables, then remove everything from there.
+        # Strategy: Find the first element that is NOT part of the cover page.
+        # The cover page consists of: the first table (protocol header) and any
+        # paragraphs WITHIN/BEFORE that table. Everything after the last cover-page
+        # table element is body content and should be removed.
         cover_end_index = 0
         if keep_cover_page:
-            # Find tables in the document body
             body = doc.element.body
             table_elements = body.findall(qn('w:tbl'))
             
-            # Find the index of the last element that's part of the cover page.
-            # Heuristic: the cover page ends after the last table that appears
-            # before any Heading 1 style paragraph.
-            found_heading = False
             cover_end_elem = None
             
-            for child in body:
-                tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if table_elements:
+                last_cover_table = table_elements[0]
                 
-                # Check if this is a heading paragraph
-                if tag == 'p':
-                    pPr = child.find(qn('w:pPr'))
-                    if pPr is not None:
-                        pStyle = pPr.find(qn('w:pStyle'))
-                        if pStyle is not None:
-                            style_val = pStyle.get(qn('w:val'), '')
-                            if style_val.startswith('Heading') or style_val.startswith('heading'):
-                                found_heading = True
-                                cover_end_elem = child
-                                break
+                for child in body:
+                    if child is last_cover_table:
+                        cover_end_elem = child
+                        break
+                
+                if cover_end_elem is not None:
+                    found_table = False
+                    to_remove = []
+                    for child in body:
+                        if child is cover_end_elem:
+                            found_table = True
+                            continue
+                        if found_table:
+                            to_remove.append(child)
                     
-                    # Also check for explicit section markers in German protocols
-                    text_elem = child.find(qn('w:r'))
-                    if text_elem is not None:
-                        t_elem = text_elem.find(qn('w:t'))
-                        if t_elem is not None and t_elem.text:
-                            text = t_elem.text.strip()
-                            if text in ('Übungsangabe', 'Aufgabenstellung', 'Stoffwiederholung', 
-                                       'Übungsablauf', 'Exercise', 'Task', 'Procedure'):
-                                found_heading = True
-                                cover_end_elem = child
-                                break
-                
-                # Tables before the first heading are part of the cover page
-                if tag == 'tbl' and not found_heading:
-                    cover_end_elem = child
-            
-            if not found_heading:
-                # No heading found — assume the entire document is cover + body
-                # Keep just the first table (cover table) if any
-                if table_elements:
-                    cover_end_elem = table_elements[0]
-        
-        # Remove body content after cover page
-        if cover_end_elem is not None:
-            body = doc.element.body
-            found_cover_end = False
-            to_remove = []
-            for child in body:
-                if child is cover_end_elem:
-                    found_cover_end = True
-                    to_remove.append(child)
-                    continue
-                if found_cover_end:
-                    to_remove.append(child)
-            
-            for elem in to_remove:
-                body.remove(elem)
+                    for elem in to_remove:
+                        body.remove(elem)
         
         # Now add new content sections
         for section in sections:
@@ -980,13 +951,16 @@ def docx_template_fill() -> Response:
             # Add content (parse simple markdown-like formatting)
             if content:
                 lines = content.split('\n')
+                prev_was_blank = False
                 for line in lines:
                     line_stripped = line.strip()
                     if not line_stripped:
-                        doc.add_paragraph('')
+                        if not prev_was_blank:
+                            pass
+                        prev_was_blank = True
                         continue
+                    prev_was_blank = False
                     
-                    # Bullet list
                     if line_stripped.startswith('- ') or line_stripped.startswith('* '):
                         text = line_stripped[2:]
                         try:
@@ -1005,22 +979,20 @@ def docx_template_fill() -> Response:
                             p = doc.add_paragraph(style='List Number')
                         except KeyError:
                             p = doc.add_paragraph()
-                            num_run = p.add_run(f'{list_match.group(1)}. ')
+                            p.add_run(f'{list_match.group(1)}. ')
                         _add_formatted_runs(p, text)
                         continue
                     
-                    # Sub-heading (### or ##)
                     heading_match = re.match(r'^(#{1,4})\s+(.*)', line_stripped)
                     if heading_match:
                         level = min(len(heading_match.group(1)), 4)
                         text = heading_match.group(2)
                         try:
-                            doc.add_heading(text, level=level + 1)  # +1 since Heading 1 is the main section
+                            doc.add_heading(text, level=level + 1)
                         except Exception:
                             doc.add_paragraph(text)
                         continue
                     
-                    # Regular paragraph
                     p = doc.add_paragraph()
                     _add_formatted_runs(p, line_stripped)
             
