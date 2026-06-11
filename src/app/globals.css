@@ -58,3 +58,47 @@ body {
 .animate-chip-in {
   animation: chip-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
+
+/* Light theme overrides */
+.theme-light {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --surface: #ffffff;
+  --surface-soft: #f1f5f9;
+  --accent: #0d9488;
+  --accent-warm: #ea580c;
+}
+
+.theme-light .bg-\[radial-gradient\(\.\.\.\)\] {
+  background: linear-gradient(135deg, #f8fafc, #f1f5f9, #e2e8f0) !important;
+}
+
+.theme-light .bg-slate-950,
+.theme-light .bg-slate-950\/60 {
+  background-color: #ffffff;
+}
+
+.theme-light .bg-slate-900,
+.theme-light .bg-slate-900\/70 {
+  background-color: #f8fafc;
+}
+
+.theme-light .border-white\/10,
+.theme-light .border-white\/15 {
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+.theme-light .text-slate-100,
+.theme-light .text-slate-200,
+.theme-light .text-slate-300 {
+  color: #334155;
+}
+
+.theme-light .text-slate-400,
+.theme-light .text-slate-500 {
+  color: #64748b;
+}
+
+.theme-light .text-white {
+  color: #0f172a;
+}

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 import { getChatByIdForUser } from "@/lib/chat-store";
 import { prisma } from "@/lib/prisma";
 import { sandboxCreateWorkspace, sandboxHealthCheck } from "@/lib/agent/sandbox";
@@ -23,6 +24,9 @@ const createSchema = z.object({
  */
 export async function POST(request: Request) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

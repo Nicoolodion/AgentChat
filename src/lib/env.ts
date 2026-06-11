@@ -52,6 +52,7 @@ const envSchema = z.object({
   AGENT_IMAGE_ANALYZE_MAX_BATCH: z.coerce.number().int().positive().default(15),
   AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: z.coerce.number().int().positive().default(2),
   AGENT_WORKSPACE_DIR: z.string().default("data/agent-workspaces"),
+  SEARXNG_URL: z.string().optional(),
 });
 
 export const env = envSchema.parse({
@@ -76,4 +77,5 @@ export const env = envSchema.parse({
   AGENT_IMAGE_ANALYZE_MAX_BATCH: process.env.AGENT_IMAGE_ANALYZE_MAX_BATCH,
   AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: process.env.AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY,
   AGENT_WORKSPACE_DIR: process.env.AGENT_WORKSPACE_DIR,
+  SEARXNG_URL: process.env.SEARXNG_URL,
 });

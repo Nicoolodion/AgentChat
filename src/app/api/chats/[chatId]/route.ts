@@ -7,6 +7,7 @@ import {
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 const updateSchema = z.object({
   model: z.string().min(1).max(150).optional(),
@@ -36,6 +37,9 @@ export async function PATCH(
   request: Request,
   context: { params: Promise<{ chatId: string }> },
 ) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   const auth = await resolveAuthContext(request);
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -67,6 +71,9 @@ export async function DELETE(
   request: Request,
   context: { params: Promise<{ chatId: string }> },
 ) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   const auth = await resolveAuthContext(request);
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

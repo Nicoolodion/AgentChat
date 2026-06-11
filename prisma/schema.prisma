@@ -123,3 +123,9 @@ model AgentArtifact {
 
   @@index([sessionId])
 }
+
+model RateLimitBucket {
+  key      String   @id
+  count    Int      @default(0)
+  resetAt  DateTime
+}

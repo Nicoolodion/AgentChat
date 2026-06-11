@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { createChatForUser, listChatsForUser } from "@/lib/chat-store";
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 import { env } from "@/lib/env";
 
 const createSchema = z.object({
@@ -22,6 +23,9 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   const auth = await resolveAuthContext(request);
   if (!auth) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

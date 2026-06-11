@@ -7,6 +7,8 @@ import {
   prepareAttachmentsForModel,
 } from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
+import { log } from "@/lib/logger";
 import {
   type ChatToolCall,
   type MessageAttachmentRef,
@@ -35,7 +37,14 @@ const schema = z.object({
 const encoder = new TextEncoder();
 
 function sendSseEvent(controller: ReadableStreamDefaultController, event: string, data: unknown) {
-  controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const encoded = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+    void Promise.resolve().then(() => {
+      try { controller.enqueue(encoded); } catch { /* stream closed */ }
+    });
+  } else {
+    controller.enqueue(encoded);
+  }
 }
 
 export async function POST(
@@ -43,6 +52,9 @@ export async function POST(
   context: { params: Promise<{ chatId: string }> },
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -145,7 +157,7 @@ export async function POST(
                 {
                   role: "system",
                   content:
-                    "You are a secure assistant in Chatinterface. Use tools when useful and return concise, accurate answers.",
+                    "You are a secure assistant in Chatinterface. Return concise, accurate answers.",
                 },
                 ...priorConversation,
               ],
@@ -156,13 +168,11 @@ export async function POST(
               onTTFT: (ttftMs: number) => sendSseEvent(controller, "ttft", { ttftMs }),
               onContent: (text: string) => sendSseEvent(controller, "content", { text }),
               onReasoning: (text: string) => sendSseEvent(controller, "reasoning", { text }),
-              onToolStart: (name: string) => sendSseEvent(controller, "tool_start", { name }),
-              onToolDone: (name: string, ok: boolean) => sendSseEvent(controller, "tool_done", { name, ok }),
             },
           );
         } catch (error) {
           const err = error as Error & { status?: number; response?: { status?: number }; code?: string; error?: unknown };
-          console.error("[NanoGPT Completion Error]", {
+          log.error("NanoGPT completion error", {
             message: err?.message,
             status: err?.status ?? err?.response?.status,
             code: err?.code,
@@ -207,7 +217,6 @@ export async function POST(
             role: "assistant",
             content: completion.content,
             reasoning: completion.reasoning,
-            toolPayload: completion.toolPayload,
             userKey: auth.userKey,
             usagePromptTokens: completion.usagePromptTokens,
             usageCompletionTokens: completion.usageCompletionTokens,
@@ -216,7 +225,7 @@ export async function POST(
             avgTokensPerSecond,
           });
         } catch (dbError) {
-          console.error("[DB Write Error]", dbError);
+          log.error("DB write error", { error: String(dbError) });
           sendSseEvent(controller, "error", { message: "Failed to save response." });
           controller.close();
           return;
@@ -267,7 +276,7 @@ export async function POST(
       },
     });
   } catch (error) {
-    console.error("[Messages Route Error]", error);
+    log.error("Messages route error", { error: String(error) });
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },

@@ -68,6 +68,7 @@ async function apiFetch<T>(input: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      "X-Requested-With": "ChatInterface",
       ...(init?.headers ?? {}),
     },
   });
@@ -101,10 +102,12 @@ function UserBubble({
   message,
   onAttachmentPreview,
   prettyDate,
+  onEdit,
 }: {
   message: ChatMessage;
   onAttachmentPreview: (a: MessageAttachmentRef) => void;
   prettyDate: (iso: string) => string;
+  onEdit: () => void;
 }) {
   const attachments = decodeUserAttachmentsPayload(message.toolPayload);
   const displayContent =
@@ -118,6 +121,13 @@ function UserBubble({
         <Sparkles className="h-3.5 w-3.5" />
         you
         <span className="text-slate-500">{prettyDate(message.createdAt)}</span>
+        <button
+          type="button"
+          onClick={onEdit}
+          className="ml-auto rounded px-1.5 py-0.5 text-[10px] text-slate-400 transition hover:bg-white/10 hover:text-white"
+        >
+          Edit
+        </button>
       </div>
       {attachments.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2">
@@ -143,7 +153,9 @@ function UserBubble({
         </div>
       )}
       {displayContent && (
-        <div className="whitespace-pre-wrap text-sm text-slate-100">{displayContent}</div>
+        <div className="prose prose-invert prose-sm max-w-none text-slate-100">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+        </div>
       )}
     </div>
   );
@@ -259,9 +271,14 @@ export function ChatApp() {
   } | null>(null);
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
 
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
   const modelSearchRef = useRef<HTMLInputElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
 
   const agent = useAgent(activeChat?.id);
 
@@ -325,6 +342,12 @@ export function ChatApp() {
     }
   }, [stream.messages.length]);
 
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    setShowScrollBtn(el.scrollTop + el.clientHeight < el.scrollHeight - 100);
+  }, []);
+
   const activeModelInfo = useMemo(() => {
     if (!activeChat) return null;
     return models.find((m) => m.id === activeChat.model) ?? null;
@@ -346,6 +369,21 @@ export function ChatApp() {
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
   }, [modelDropdownOpen]);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.ctrlKey && e.key === "n" && !e.shiftKey) {
+        e.preventDefault();
+        void createChat(activeChat?.model ?? models[0]?.id);
+      }
+      if (e.ctrlKey && e.shiftKey && (e.key === "N" || e.key === "n")) {
+        e.preventDefault();
+        document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeChat, models]);
 
   const displayModels = useMemo(() => {
     const q = modelSearch.trim().toLowerCase();
@@ -514,7 +552,36 @@ export function ChatApp() {
     router.replace("/login");
   }
 
+  function exportChat(format: "json" | "markdown") {
+    if (!activeChat) return;
+    let content: string;
+    let filename: string;
+    if (format === "json") {
+      content = JSON.stringify(activeChat, null, 2);
+      filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.json`;
+    } else {
+      const lines = activeChat.messages.map((m) => {
+        const role = m.role === "user" ? "**You**" : m.role === "assistant" ? "**Assistant**" : m.role;
+        return `${role}:\n${m.content}`;
+      });
+      content = `# ${activeChat.title}\n\n${lines.join("\n\n---\n\n")}`;
+      filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.md`;
+    }
+    const blob = new Blob([content], { type: format === "json" ? "application/json" : "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   // Tool outputs (flat list for timeline)
+  function handleEditMessage(msg: ChatMessage) {
+    setMessageInput(msg.content.replace(/\n\nAttached files:[\s\S]*$/, "").trimEnd());
+    setTimeout(() => document.querySelector<HTMLTextAreaElement>("textarea")?.focus(), 0);
+  }
+
   const flatToolOutputs = useMemo(
     () => Object.values(stream.toolOutputs).flat(),
     [stream.toolOutputs],
@@ -532,7 +599,7 @@ export function ChatApp() {
   }
 
   return (
-    <div className="relative flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5">
+    <div className={`relative flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5 ${theme === "light" ? "theme-light" : ""}`}>
       {dropOverlayActive && (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-slate-950/60 backdrop-blur-sm">
           <div className="flex items-center gap-2 rounded-full border border-teal-300/80 bg-teal-300/10 px-5 py-3 text-sm font-medium text-teal-100">
@@ -550,19 +617,33 @@ export function ChatApp() {
         )}
       >
         {/* ── Left: chat list ─────────────────────────────────────────────── */}
-        <aside className="border-b border-white/10 p-4 xl:border-b-0 xl:border-r">
+        {mobileSidebarOpen && (
+          <div className="fixed inset-0 z-40 bg-slate-950/60 backdrop-blur-sm xl:hidden" onClick={() => setMobileSidebarOpen(false)} />
+        )}
+        <aside className={cn(
+          "border-b border-white/10 p-4 xl:border-b-0 xl:border-r",
+          mobileSidebarOpen ? "fixed inset-y-0 left-0 z-50 w-80 bg-slate-950" : "hidden xl:block",
+        )}>
           <div className="mb-4 flex items-center justify-between gap-3">
             <div>
               <div className="text-xs uppercase tracking-[0.2em] text-teal-300">Chatinterface</div>
               <div className="text-lg font-semibold text-white">NanoGPT Agent Desk</div>
             </div>
-            <button
-              onClick={() => createChat(activeChat?.model ?? models[0]?.id)}
-              className="inline-flex items-center gap-2 rounded-full bg-teal-400 px-3 py-2 text-xs font-semibold text-slate-900 transition hover:bg-teal-300"
-            >
-              <MessageSquarePlus className="h-4 w-4" />
-              New
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => createChat(activeChat?.model ?? models[0]?.id)}
+                className="inline-flex items-center gap-2 rounded-full bg-teal-400 px-3 py-2 text-xs font-semibold text-slate-900 transition hover:bg-teal-300"
+              >
+                <MessageSquarePlus className="h-4 w-4" />
+                New
+              </button>
+              <button
+                onClick={() => setMobileSidebarOpen(false)}
+                className="xl:hidden rounded-lg border border-white/10 p-1.5 text-slate-300 hover:bg-white/10"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
           <div className="mb-4 rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-slate-300">
@@ -590,21 +671,44 @@ export function ChatApp() {
                   activeChat?.id === c.id ? "border-teal-300/60 bg-teal-400/20" : "border-white/10 bg-white/5 hover:bg-white/10",
                 )}
               >
-                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start justify-between gap-2">
                   <div className="line-clamp-1 text-sm font-medium text-white">{c.title}</div>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void deleteChat(c.id);
-                    }}
-                    className="opacity-0 transition group-hover:opacity-100"
-                    aria-label="Delete chat"
-                  >
-                    <Trash2 className="h-4 w-4 text-rose-300" />
-                  </button>
+                  {confirmDeleteId === c.id ? (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void deleteChat(c.id);
+                        setConfirmDeleteId(null);
+                      }}
+                      className="shrink-0 rounded bg-rose-500/80 px-1.5 py-0.5 text-[10px] font-semibold text-white"
+                    >
+                      Confirm?
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDeleteId(c.id);
+                        setTimeout(() => setConfirmDeleteId((prev) => prev === c.id ? null : prev), 3000);
+                      }}
+                      className="opacity-0 transition group-hover:opacity-100"
+                      aria-label="Delete chat"
+                    >
+                      <Trash2 className="h-4 w-4 text-rose-300" />
+                    </button>
+                  )}
                 </div>
-                <div className="mt-1 line-clamp-2 text-xs text-slate-300">{c.lastMessagePreview}</div>
+                <div className="mt-1 flex items-center gap-2">
+                  <div className="line-clamp-2 text-xs text-slate-300">{c.lastMessagePreview}</div>
+                  {(stream.sending || agent.isExecuting) && activeChat?.id === c.id && (
+                    <span className="relative flex h-2 w-2 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-teal-400 opacity-75" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-teal-400" />
+                    </span>
+                  )}
+                </div>
                 <div className="mt-1 text-[11px] text-slate-400">{prettyDate(c.updatedAt)}</div>
               </div>
             ))}
@@ -615,6 +719,12 @@ export function ChatApp() {
         <main className="relative flex min-h-0 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 p-4">
             <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => setMobileSidebarOpen(true)}
+                className="inline-flex items-center justify-center rounded-xl border border-white/15 bg-slate-900 p-2 text-slate-200 hover:bg-slate-800 xl:hidden"
+              >
+                <Menu className="h-4 w-4" />
+              </button>
               <div className="relative" ref={modelDropdownRef}>
                 <button
                   onClick={() => setModelDropdownOpen((p) => !p)}
@@ -650,7 +760,12 @@ export function ChatApp() {
                           )}
                         >
                           <div className="min-w-0 flex-1">
-                            <div className="truncate font-mono text-xs text-white">{m.name || m.id}</div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate font-mono text-xs text-white">{m.name || m.id}</span>
+                              {m.supportsVision && <span className="text-[10px]" title="Vision">👁</span>}
+                              {m.supportsTools && <span className="text-[10px]" title="Tool support">🔧</span>}
+                              {m.contextLength && <span className="text-[10px] text-slate-500">{Math.round(m.contextLength / 1000)}k</span>}
+                            </div>
                             <div className="truncate text-[11px] text-slate-400">{m.displayName}</div>
                           </div>
                           {activeChat?.model === m.id && (
@@ -692,11 +807,25 @@ export function ChatApp() {
                 Context: {activeModelInfo?.contextLength?.toLocaleString() ?? "unknown"}
               </div>
               <button
+                onClick={() => exportChat("json")}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
+                title="Export chat as JSON"
+              >
+                <Download className="h-4 w-4" />
+              </button>
+              <button
                 onClick={() => void logout()}
                 className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
               >
                 <LogOut className="h-4 w-4" />
                 Logout
+              </button>
+              <button
+                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
+                title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+              >
+                {theme === "dark" ? "☀" : "🌙"}
               </button>
             </div>
           </div>
@@ -704,7 +833,7 @@ export function ChatApp() {
           <AgentProgressBar visible={agent.isAgentMode && agent.isExecuting} />
 
           <div className="flex min-h-0 flex-1 flex-col px-4 py-3">
-            <div className="flex-1 space-y-3 overflow-y-auto">
+            <div ref={scrollContainerRef} className="relative flex-1 space-y-3 overflow-y-auto" onScroll={handleScroll}>
               {stream.messages.map((m, i) =>
                 m.role === "user" ? (
                   <UserBubble
@@ -712,6 +841,7 @@ export function ChatApp() {
                     message={m}
                     onAttachmentPreview={setPreviewAttachment}
                     prettyDate={prettyDate}
+                    onEdit={() => handleEditMessage(m)}
                   />
                 ) : m.role === "assistant" ? (
                   <AssistantBubble
@@ -728,6 +858,16 @@ export function ChatApp() {
               )}
               <div ref={bottomRef} />
             </div>
+            {showScrollBtn && (
+              <button
+                type="button"
+                onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}
+                className="absolute bottom-20 right-8 z-10 rounded-full border border-white/20 bg-slate-900/90 p-2 text-slate-300 shadow-lg transition hover:bg-slate-800 hover:text-white"
+                aria-label="Scroll to bottom"
+              >
+                <ChevronRight className="h-4 w-4 rotate-90" />
+              </button>
+            )}
 
             {/* Composer */}
             <div className="relative mt-3 rounded-2xl border border-white/15 bg-slate-900/70 p-2">

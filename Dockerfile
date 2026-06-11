@@ -12,15 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json* bun.lock* ./
-RUN if [ -f package-lock.json ]; then npm ci; \
-    elif [ -f bun.lock ]; then npm install -g bun && bun install --frozen-lockfile; \
-    else npm install; fi \
-    && npm install \
-        lightningcss-linux-x64-gnu@1.32.0 \
-        @tailwindcss/oxide-linux-x64-gnu \
-        @node-rs/argon2-linux-x64-gnu \
-        @napi-rs/canvas-linux-x64-gnu \
-        --no-save
+RUN if [ -f bun.lock ]; then \
+      npm install -g bun && bun install --frozen-lockfile && \
+      bun add --dev lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+    elif [ -f package-lock.json ]; then \
+      npm ci && \
+      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+    else \
+      npm install && \
+      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+    fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 FROM node:20-bookworm-slim AS builder
@@ -80,4 +81,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || exit 1
 
-CMD ["node", "node_modules/next/dist/bin/next", "start", "-H", "0.0.0.0", "-p", "3000"]
+CMD ["sh", "-c", "npx prisma db push --skip-generate && node node_modules/next/dist/bin/next start -H 0.0.0.0 -p 3000"]

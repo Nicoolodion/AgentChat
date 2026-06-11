@@ -6,6 +6,7 @@ import { env } from "@/lib/env";
 import { jsonError, requestIp } from "@/lib/http";
 import { validatePasswordStrength } from "@/lib/password";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 const schema = z.object({
   username: z.string().min(3).max(32),
@@ -13,12 +14,15 @@ const schema = z.object({
 });
 
 export async function POST(request: Request) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   if (!env.REGISTRATION_ENABLED) {
     return jsonError("Registration is disabled by configuration.", 403);
   }
 
   const ip = requestIp(request);
-  const rateLimit = enforceRateLimit(
+  const rateLimit = await enforceRateLimit(
     `register:${ip}`,
     env.RATE_LIMIT_MAX_REQUESTS,
     env.RATE_LIMIT_WINDOW_SECONDS,

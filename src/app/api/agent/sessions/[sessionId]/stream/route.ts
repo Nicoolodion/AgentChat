@@ -21,7 +21,14 @@ const querySchema = z.object({
 const encoder = new TextEncoder();
 
 function sse(controller: ReadableStreamDefaultController, event: string, data: unknown) {
-  controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const encoded = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+    void Promise.resolve().then(() => {
+      try { controller.enqueue(encoded); } catch { /* stream closed */ }
+    });
+  } else {
+    controller.enqueue(encoded);
+  }
 }
 
 export async function GET(

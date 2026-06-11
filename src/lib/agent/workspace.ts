@@ -162,3 +162,23 @@ function guessMimeType(fileName: string): string | null {
   };
   return map[ext] ?? null;
 }
+
+export async function cleanupOldWorkspaces(maxAgeDays = 7): Promise<number> {
+  const { prisma } = await import("@/lib/prisma");
+  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
+  const oldSessions = await prisma.agentSession.findMany({
+    where: {
+      status: { in: ["completed", "error"] },
+      completedAt: { lte: cutoff },
+    },
+    select: { id: true },
+  });
+  let cleaned = 0;
+  for (const session of oldSessions) {
+    try {
+      await deleteHostWorkspace(session.id);
+      cleaned++;
+    } catch { /* best-effort */ }
+  }
+  return cleaned;
+}

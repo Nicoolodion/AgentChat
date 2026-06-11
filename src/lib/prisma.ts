@@ -18,8 +18,38 @@ declare global {
   var prismaGlobal: PrismaClient | undefined;
 }
 
-export const prisma = global.prismaGlobal ?? createPrismaClient();
+let _prisma: PrismaClient | undefined;
 
-if (process.env.NODE_ENV !== "production") {
-  global.prismaGlobal = prisma;
+function getPrismaInternal(): PrismaClient {
+  if (!_prisma) {
+    _prisma = global.prismaGlobal ?? createPrismaClient();
+    if (process.env.NODE_ENV !== "production") {
+      global.prismaGlobal = _prisma;
+    }
+  }
+  return _prisma;
 }
+
+export function getPrismaClient(): PrismaClient {
+  try {
+    const client = getPrismaInternal();
+    void client.$queryRaw`SELECT 1`;
+    return client;
+  } catch {
+    _prisma = undefined;
+    if (global.prismaGlobal) global.prismaGlobal = undefined;
+    const fresh = createPrismaClient();
+    _prisma = fresh;
+    if (process.env.NODE_ENV !== "production") {
+      global.prismaGlobal = fresh;
+    }
+    return fresh;
+  }
+}
+
+export const prisma = new Proxy({} as PrismaClient, {
+  get(_target, prop, receiver) {
+    const client = getPrismaInternal();
+    return Reflect.get(client, prop, receiver);
+  },
+});

@@ -4,6 +4,7 @@ import { ZodError, z } from "zod";
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 /**
  * POST /api/agent/sessions/:sessionId/stop
@@ -14,6 +15,9 @@ export async function POST(
   context: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

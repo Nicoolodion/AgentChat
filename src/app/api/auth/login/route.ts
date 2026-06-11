@@ -5,6 +5,7 @@ import { loginUser, writeSessionCookie } from "@/lib/auth";
 import { env } from "@/lib/env";
 import { jsonError, requestIp } from "@/lib/http";
 import { enforceRateLimit } from "@/lib/rate-limit";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 const schema = z.object({
   username: z.string().min(3).max(32),
@@ -12,12 +13,15 @@ const schema = z.object({
 });
 
 export async function POST(request: Request) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   if (!env.AUTH_REQUIRED) {
     return NextResponse.json({ ok: true, authRequired: false });
   }
 
   const ip = requestIp(request);
-  const rateLimit = enforceRateLimit(
+  const rateLimit = await enforceRateLimit(
     `login:${ip}`,
     env.RATE_LIMIT_MAX_REQUESTS,
     env.RATE_LIMIT_WINDOW_SECONDS,
