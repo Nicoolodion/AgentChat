@@ -13,7 +13,7 @@ type AuthCardProps = {
 async function requestJson<T>(url: string, payload: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
     body: JSON.stringify(payload),
   });
 

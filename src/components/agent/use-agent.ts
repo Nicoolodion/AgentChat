@@ -56,7 +56,7 @@ export function useAgent(chatId: string | undefined) {
       try {
         const res = await fetch("/api/agent/sessions", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
           body: JSON.stringify({ chatId }),
         });
         const data = (await res.json().catch(() => ({}))) as { session?: AgentSession; error?: string };
@@ -164,6 +164,7 @@ export function useAgent(chatId: string | undefined) {
     try {
       const res = await fetch(`/api/agent/sessions/${state.agentSession.id}/stop`, {
         method: "POST",
+        headers: { "X-Requested-With": "ChatInterface" },
       });
       if (!res.ok) console.warn("[Agent Stop] failed", res.status);
     } catch {}
@@ -280,7 +281,7 @@ export function useAgent(chatId: string | undefined) {
             try {
               const res = await fetch("/api/agent/sessions", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
                 body: JSON.stringify({ chatId }),
               });
               const data = (await res.json().catch(() => ({}))) as { session?: AgentSession; error?: string };
@@ -372,7 +373,7 @@ export function useAgent(chatId: string | undefined) {
       try {
         const response = await fetch(`/api/agent/sessions/${sessionId}/execute`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
           body: JSON.stringify({ message, attachments }),
           signal: abortRef.current.signal,
         });
@@ -474,7 +475,7 @@ export function useAgent(chatId: string | undefined) {
               setState((s) => ({ ...s, isAgentMode: true, modeLocked: true, sidebarOpen: true, isInitializing: true }));
               fetch("/api/agent/sessions", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
                 body: JSON.stringify({ chatId }),
               })
                 .then((r) => r.json().catch(() => ({})))

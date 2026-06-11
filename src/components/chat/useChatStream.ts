@@ -197,7 +197,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
       try {
         const res = await fetch(`/api/chats/${chat.id}/messages`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
           body: JSON.stringify({
             content,
             attachments: atts.map((a) => a.id),
