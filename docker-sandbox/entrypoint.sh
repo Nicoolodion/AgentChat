@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Chatinterface Agent Sandbox Entrypoint
-# Starts the Flask HTTP API server on port 8080
+# Starts as root to fix bind-mount permissions, then drops to sandbox user
 
 SANDBOX_PORT="${SANDBOX_PORT:-8080}"
 SANDBOX_HOST="${SANDBOX_HOST:-0.0.0.0}"
@@ -13,6 +13,10 @@ echo "=========================================="
 echo "Chatinterface Agent Sandbox"
 echo "=========================================="
 echo ""
+
+# Fix ownership of bind-mounted /workspace (created by Docker as root:root)
+mkdir -p /workspace
+chown -R sandbox:sandbox /workspace
 
 # Verify dependencies
 echo "Checking dependencies..."
@@ -40,15 +44,10 @@ echo "  Workers: $SANDBOX_WORKERS"
 echo "  Log Level: $SANDBOX_LOG_LEVEL"
 echo ""
 
-# Ensure workspace directory exists
-mkdir -p /workspace
-
-# Start the Flask server using gunicorn for production
-# In development, flask's built-in server is used
 cd /app/lib
 
 if [ "$SANDBOX_WORKERS" -gt 1 ]; then
-    exec gunicorn \
+    exec gosu sandbox gunicorn \
         -w "$SANDBOX_WORKERS" \
         -b "$SANDBOX_HOST:$SANDBOX_PORT" \
         --timeout 300 \
@@ -59,7 +58,7 @@ if [ "$SANDBOX_WORKERS" -gt 1 ]; then
         --log-level "$SANDBOX_LOG_LEVEL" \
         "sandbox_server:app"
 else
-    exec python sandbox_server.py \
+    exec gosu sandbox python sandbox_server.py \
         --port "$SANDBOX_PORT" \
         --host "$SANDBOX_HOST"
 fi

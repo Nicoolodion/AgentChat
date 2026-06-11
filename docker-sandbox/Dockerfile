@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation fonts-noto fonts-noto-cjk \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
     git wget unzip pandoc \
-    supervisor \
+    supervisor gosu \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -69,11 +69,7 @@ COPY --chown=sandbox:sandbox supervisord.conf /app/supervisord.conf
 
 RUN chmod +x /app/entrypoint.sh
 
-# Ensure workspace exists and is owned by sandbox
 RUN mkdir -p /workspace && chown -R sandbox:sandbox /workspace
-
-# Switch to non-root user
-USER sandbox
 
 # ── Health check ──────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
