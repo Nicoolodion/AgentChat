@@ -39,8 +39,8 @@ RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin \
     && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
-RUN groupadd -r sandbox -g 1000 \
-    && useradd -r -g sandbox -u 1000 -m -s /bin/bash sandbox \
+RUN groupadd -r sandbox -g 1001 \
+    && useradd -r -g sandbox -u 1001 -m -s /bin/bash sandbox \
     && mkdir -p /workspace /app/skills /app/scripts /app/lib \
     && chown -R sandbox:sandbox /workspace /app /ms-playwright 2>/dev/null || true
 
