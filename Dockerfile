@@ -47,9 +47,9 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 
-# OS deps for Prisma better-sqlite3 native binding + sharp canvas
+# OS deps for Prisma better-sqlite3 native binding + sharp canvas + gosu
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates openssl python3 \
+    ca-certificates openssl python3 gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Provide safe defaults so `prisma db push` can read DATABASE_URL at startup
@@ -72,11 +72,14 @@ COPY --from=builder --chown=chatapp:chatapp /app/next.config.ts ./next.config.ts
 COPY --from=builder --chown=chatapp:chatapp /app/tsconfig.json ./tsconfig.json
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
-RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data && \
-    touch /app/data/chatinterface.db && chown chatapp:chatapp /app/data/chatinterface.db
+RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
 VOLUME ["/app/data"]
 
-USER chatapp
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
