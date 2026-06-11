@@ -629,7 +629,7 @@ try:
             result = re.sub(r'<a[^>]*href="([^"]+)"[^>]*>([\\s\\S]*?)</a>', r'[\\2](\\1)', result, flags=re.IGNORECASE)
             result = re.sub(r'<(strong|b)[^>]*>([\\s\\S]*?)</(strong|b)>', r'**\\2**', result, flags=re.IGNORECASE)
             result = re.sub(r'<(em|i)[^>]*>([\\s\\S]*?)</(em|i)>', r'*\\2*', result, flags=re.IGNORECASE)
-            result = re.sub(r'<code[^>]*>([\\s\\S]*?)</code>', r'\x60\\1\x60', result, flags=re.IGNORECASE)
+            result = re.sub(r'<code[^>]*>([\\s\\S]*?)</code>', chr(96) + r'\\1' + chr(96), result, flags=re.IGNORECASE)
             result = re.sub(r'<[^>]+>', ' ', result)
             result = re.sub(r'\\n{3,}', '\\n\\n', result)
             result = re.sub(r' {2,}', ' ', result)

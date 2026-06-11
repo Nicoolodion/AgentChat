@@ -311,8 +311,8 @@ export async function streamCompletionWithCallbacks(
     }
   }
 
-  const usagePromptTokens = lastUsage?.prompt_tokens;
-  const usageCompletionTokens = lastUsage?.completion_tokens;
+  usagePromptTokens = lastUsage?.prompt_tokens;
+  usageCompletionTokens = lastUsage?.completion_tokens;
 
   return {
     content: finalContent,
