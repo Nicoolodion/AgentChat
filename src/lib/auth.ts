@@ -228,3 +228,20 @@ export function clearSessionCookie(response: NextResponse): void {
 export function readSessionTokenFromRequest(request: Request): string | null {
   return parseCookie(request.headers.get("cookie"), env.COOKIE_NAME);
 }
+
+export async function cleanupExpiredSessions(): Promise<number> {
+  const result = await prisma.session.deleteMany({
+    where: { expiresAt: { lte: new Date() } },
+  });
+  return result.count;
+}
+
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+export function startSessionCleanup(intervalMs = 60 * 60 * 1000): void {
+  void cleanupExpiredSessions();
+  if (cleanupTimer) return;
+  cleanupTimer = setInterval(() => {
+    void cleanupExpiredSessions().catch(() => {});
+  }, intervalMs);
+}

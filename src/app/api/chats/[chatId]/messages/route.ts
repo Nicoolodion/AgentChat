@@ -71,8 +71,8 @@ export async function POST(
     if (chat.agentModeLocked !== null) {
       // Chat is already locked — respect the stored mode
       agentEnabled = chat.agentModeLocked;
-    } else if (messageCount === 0) {
-      // First message — lock the mode
+    } else {
+      // No mode locked yet — lock it now before proceeding
       await prisma.chat.update({
         where: { id: chat.id },
         data: { agentModeLocked: agentEnabled },
@@ -286,6 +286,12 @@ async function handleAgentMessage(input: {
   attachments: string[];
 }) {
   const { auth, chat, chatId, content, attachments } = input;
+
+  // Prevent concurrent agent execution on the same session
+  const existingSession = await prisma.agentSession.findUnique({ where: { chatId } });
+  if (existingSession && activeAgents.has(existingSession.id)) {
+    return NextResponse.json({ error: "Agent is already running for this chat." }, { status: 409 });
+  }
 
   // Find or create/reset agent session (upsert avoids unique constraint violation on chatId)
   const agentSession = await prisma.agentSession.upsert({

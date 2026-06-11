@@ -23,6 +23,7 @@ import {
   AgentSessionStatus,
   AgentToolCallStatus,
 } from "./types";
+import { safeParseArgs } from "./parse-args";
 import {
   sandboxConvertDocxToPdf,
   sandboxConvertHtmlToPdf,
@@ -513,6 +514,8 @@ const SKILL_EXTENSIONS: Record<string, string> = {
 
 function buildSystemPrompt(skillContent?: Map<string, string>): string {
   let prompt = AGENT_SYSTEM_PROMPT_BASE;
+
+  prompt += `\n\nCurrent date/time: ${new Date().toISOString()}`;
 
   if (skillContent && skillContent.size > 0) {
     const sections: string[] = [];
@@ -1157,29 +1160,6 @@ except Exception as e:
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function safeParseArgs(raw: string): Record<string, unknown> {
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    // LLMs sometimes generate malformed JSON. Try common fixes:
-    try {
-      // Fix trailing commas before } or ]
-      const fixed = raw.replace(/,\s*([}\]])/g, "$1");
-      return JSON.parse(fixed) as Record<string, unknown>;
-    } catch {
-      // Try extracting the first valid JSON object
-      const objStart = raw.indexOf("{");
-      const objEnd = raw.lastIndexOf("}");
-      if (objStart !== -1 && objEnd > objStart) {
-        try {
-          return JSON.parse(raw.slice(objStart, objEnd + 1)) as Record<string, unknown>;
-        } catch { /* give up */ }
-      }
-      return {};
-    }
-  }
-}
 
 async function updateSessionStatus(sessionId: string, status: AgentSessionStatus): Promise<void> {
   await prisma.agentSession.update({

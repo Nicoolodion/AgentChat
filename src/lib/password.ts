@@ -6,14 +6,18 @@ export function validatePasswordStrength(password: string): boolean {
   return PASSWORD_RULE.test(password);
 }
 
-export async function hashPassword(password: string): Promise<string> {
-  return hash(password, {
-    // 2 is Argon2id in @node-rs/argon2.
-    algorithm: 2,
-    memoryCost: 19_456,
-    timeCost: 2,
+function getHashOptions() {
+  const isProduction = process.env.NODE_ENV === "production";
+  return {
+    algorithm: 2 as const,
+    memoryCost: isProduction ? 65_536 : 19_456,
+    timeCost: isProduction ? 3 : 2,
     parallelism: 1,
-  });
+  };
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  return hash(password, getHashOptions());
 }
 
 export async function verifyPasswordHash(password: string, passwordHash: string): Promise<boolean> {

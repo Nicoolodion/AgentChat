@@ -3,6 +3,7 @@ import type { Chat, Message } from "@prisma/client";
 import { decryptString, encryptString } from "@/lib/crypto";
 import type { ChatDetail, ChatListItem, ChatMessage, ChatToolCall } from "@/lib/chat-types";
 import { prisma } from "@/lib/prisma";
+import { deleteHostWorkspace } from "@/lib/agent/workspace";
 
 type ChatWithLatestMessage = Chat & { messages: Message[] };
 
@@ -200,12 +201,28 @@ export async function updateChatSettingsForUser(input: {
 }
 
 export async function deleteChatForUser(userId: string, chatId: string): Promise<boolean> {
+  const chat = await prisma.chat.findFirst({
+    where: { id: chatId, userId },
+    include: { agentSession: { select: { id: true } } },
+  });
+  if (!chat) return false;
+
+  if (chat.agentSession) {
+    try {
+      await deleteHostWorkspace(chat.agentSession.id);
+    } catch {
+      // best-effort; don't block chat deletion
+    }
+  }
+
   const deleted = await prisma.chat.deleteMany({
     where: { id: chatId, userId },
   });
 
   return deleted.count > 0;
 }
+
+const MAX_MESSAGES_PER_CHAT = 500;
 
 export async function appendMessageToChat(input: {
   chatId: string;
@@ -242,6 +259,19 @@ export async function appendMessageToChat(input: {
       avgTokensPerSecond: input.avgTokensPerSecond,
     },
   });
+
+  const chatMessageCount = await prisma.message.count({ where: { chatId: input.chatId } });
+  if (chatMessageCount > MAX_MESSAGES_PER_CHAT) {
+    const oldest = await prisma.message.findMany({
+      where: { chatId: input.chatId },
+      orderBy: { createdAt: "asc" },
+      take: chatMessageCount - MAX_MESSAGES_PER_CHAT,
+      select: { id: true },
+    });
+    await prisma.message.deleteMany({
+      where: { id: { in: oldest.map((m) => m.id) } },
+    });
+  }
 
   return decryptMessage(message, input.userKey);
 }

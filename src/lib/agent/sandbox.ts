@@ -13,6 +13,14 @@ const SANDBOX_BASE_URL =
   process.env.AGENT_SANDBOX_URL ?? "http://127.0.0.1:18080";
 
 const DEFAULT_TIMEOUT = 30_000;
+const SANDBOX_HEALTH_TIMEOUT = 5_000;
+const SANDBOX_UNAVAILABLE_RESULT = {
+  stdout: "",
+  stderr: "Sandbox is unavailable. Please try again later.",
+  images: [],
+  error: "Sandbox container is unreachable. Agent features are unavailable.",
+  execution_time_ms: 0,
+};
 
 // ── Low-level helpers ────────────────────────────────────────────────────────
 

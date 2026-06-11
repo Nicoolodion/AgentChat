@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { safeParseArgs } from "@/lib/agent/parse-args";
 
 const querySchema = z.object({
   fromCreatedAt: z.string().datetime().optional(),
@@ -75,7 +76,7 @@ export async function GET(
           sse(controller, "replay_tool_start", {
             toolCallId: tc.id,
             toolName: tc.toolName,
-            arguments: safeParse(tc.arguments),
+            arguments: safeParseArgs(tc.arguments),
             timestamp: tc.createdAt.getTime(),
           });
           if (tc.result) {
@@ -121,8 +122,19 @@ export async function GET(
         // to the database, so this gives us a real-time tail.
         const seenIds = new Set(toolCalls.map((tc) => tc.id));
         const start = Date.now();
+        let closed = false;
+
+        const safeClose = () => {
+          if (closed) return;
+          closed = true;
+          try { controller.close(); } catch {}
+        };
 
         const interval = setInterval(async () => {
+          if (closed) {
+            clearInterval(interval);
+            return;
+          }
           try {
             const fresh = await prisma.agentToolCall.findMany({
               where: { sessionId, id: { notIn: Array.from(seenIds) } },
@@ -134,7 +146,7 @@ export async function GET(
               sse(controller, "replay_tool_start", {
                 toolCallId: tc.id,
                 toolName: tc.toolName,
-                arguments: safeParse(tc.arguments),
+                arguments: safeParseArgs(tc.arguments),
                 timestamp: tc.createdAt.getTime(),
               });
               if (tc.status === "success") {
@@ -176,7 +188,7 @@ export async function GET(
               });
               sse(controller, "done", { session: cur, artifacts: artifacts.map(toClientArtifact) });
               clearInterval(interval);
-              controller.close();
+              safeClose();
             }
           } catch (err) {
             // ignore — keep polling
@@ -187,17 +199,13 @@ export async function GET(
         // Safety: cap connection at 30 minutes
         setTimeout(() => {
           clearInterval(interval);
-          try {
-            controller.close();
-          } catch {}
+          safeClose();
         }, 30 * 60 * 1000);
 
         // Close on client disconnect
         request.signal.addEventListener("abort", () => {
           clearInterval(interval);
-          try {
-            controller.close();
-          } catch {}
+          safeClose();
         });
 
         // Touch start to satisfy linter
@@ -220,14 +228,6 @@ export async function GET(
       "X-Accel-Buffering": "no",
     },
   });
-}
-
-function safeParse(raw: string): Record<string, unknown> {
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
 }
 
 function toClientArtifact(a: {

@@ -10,6 +10,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import time
@@ -308,21 +309,30 @@ def exec_python() -> Response:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLACKLISTED_SHELL_PATTERNS = [
-    "rm -rf /",
-    "rm -rf /*",
-    "mkfs.",
-    ":(){ :|:& };:",
-    "dd if=/dev/zero",
-    "> /dev/sda",
-    "curl .*|.*sh",
-    "wget .*|.*sh",
+    re.compile(r"rm\s+-rf\s+/", re.IGNORECASE),
+    re.compile(r"rm\s+-rf\s+/\*", re.IGNORECASE),
+    re.compile(r"mkfs\.", re.IGNORECASE),
+    re.compile(r":\(\)\{\s*:\|:&\s*\};:", re.IGNORECASE),
+    re.compile(r"dd\s+if=/dev/zero", re.IGNORECASE),
+    re.compile(r">\s*/dev/sda", re.IGNORECASE),
+    re.compile(r"curl\s+.*\|\s*sh", re.IGNORECASE),
+    re.compile(r"wget\s+.*\|\s*sh", re.IGNORECASE),
+    re.compile(r"base64\s+.*\|\s*sh", re.IGNORECASE),
+    re.compile(r"printf\s+.*\|\s*sh", re.IGNORECASE),
+    re.compile(r"xargs\s+sh", re.IGNORECASE),
+    re.compile(r"eval\s+", re.IGNORECASE),
+    re.compile(r"exec\s+sh", re.IGNORECASE),
+    re.compile(r"\$\(\s*rm\s", re.IGNORECASE),
+    re.compile(r"chmod\s+[0-7]*777", re.IGNORECASE),
+    re.compile(r"chown\s+.*root", re.IGNORECASE),
+    re.compile(r"/etc/passwd", re.IGNORECASE),
+    re.compile(r"/etc/shadow", re.IGNORECASE),
 ]
 
 
 def is_shell_blacklisted(command: str) -> bool:
-    lowered = command.lower()
     for pattern in BLACKLISTED_SHELL_PATTERNS:
-        if pattern.lower() in lowered:
+        if pattern.search(command):
             return True
     return False
 

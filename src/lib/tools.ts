@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import { safeParseArgs } from "@/lib/agent/parse-args";
+
 export const AGENT_TOOLS = [
   {
     type: "function",
@@ -51,15 +53,6 @@ type ToolResult = {
   error?: string;
 };
 
-function safeParseArgs(raw: string | undefined): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
-
 function runMath(args: Record<string, unknown>): ToolResult {
   const left = Number(args.left);
   const right = Number(args.right);
@@ -82,7 +75,7 @@ function runMath(args: Record<string, unknown>): ToolResult {
 }
 
 export async function executeAgentTool(name: string, rawArguments?: string): Promise<ToolResult> {
-  const args = safeParseArgs(rawArguments);
+  const args = rawArguments ? safeParseArgs(rawArguments) : {};
 
   if (name === "get_current_time") {
     return {

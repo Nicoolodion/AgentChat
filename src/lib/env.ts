@@ -8,6 +8,23 @@ const boolLike = z
     return ["1", "true", "yes", "on"].includes(normalized);
   });
 
+const KNOWN_BAD_KEYS = new Set([
+  "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+  "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=",
+]);
+
+const base64KeySchema = z.string().refine((val) => {
+  if (process.env.NODE_ENV === "production" && KNOWN_BAD_KEYS.has(val)) {
+    return false;
+  }
+  try {
+    const decoded = Buffer.from(val, "base64");
+    return decoded.length === 32;
+  } catch {
+    return false;
+  }
+}, "Encryption key must be a valid base64-encoded 32-byte key (not the default)");
+
 const envSchema = z.object({
   DATABASE_URL: z.string().default("file:./prisma/dev.db"),
   NANOGPT_API_KEY: z.string().optional(),
@@ -18,12 +35,12 @@ const envSchema = z.object({
   REGISTRATION_ENABLED: boolLike.default(true),
   COOKIE_NAME: z.string().default("chatinterface_session"),
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24 * 7),
-  APP_ENCRYPTION_KEY: z
-    .string()
-    .default("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
-  SESSION_ENCRYPTION_KEY: z
-    .string()
-    .default("ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA="),
+  APP_ENCRYPTION_KEY: base64KeySchema.default(
+    "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+  ),
+  SESSION_ENCRYPTION_KEY: base64KeySchema.default(
+    "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA="
+  ),
   GUEST_USERNAME: z.string().default("local-user"),
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(25),

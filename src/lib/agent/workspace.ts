@@ -125,8 +125,12 @@ export async function copyFileToWorkspaceUpload(
 export function resolveHostWorkspaceFile(sessionId: string, filePath: string): string {
   const ws = getHostWorkspacePath(sessionId);
   const resolved = path.resolve(ws, filePath);
-  // Security: ensure we stay inside the workspace
-  if (!resolved.startsWith(ws + path.sep) && resolved !== ws) {
+  const normalizedWs = ws.split(path.sep).join("/").replace(/\/$/, "");
+  const normalizedResolved = resolved.split(path.sep).join("/");
+  if (
+    !normalizedResolved.startsWith(normalizedWs + "/") &&
+    normalizedResolved !== normalizedWs
+  ) {
     throw new Error("Path traversal detected");
   }
   return resolved;

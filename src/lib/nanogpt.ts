@@ -448,8 +448,8 @@ export async function generateChatTitle({
       const rawTitle =
         response.choices?.[0]?.message?.content?.trim() ?? "";
 
-      if (countWords(rawTitle) <= 1) {
-        return rawTitle || "New chat";
+      if (countWords(rawTitle) >= 2 && countWords(rawTitle) <= 10) {
+        return rawTitle;
       }
 
       lastResult = rawTitle;
@@ -458,7 +458,7 @@ export async function generateChatTitle({
     }
   }
 
-  if (lastResult && countWords(lastResult) <= 14) {
+  if (lastResult && countWords(lastResult) >= 2 && countWords(lastResult) <= 14) {
     return lastResult;
   }
 
