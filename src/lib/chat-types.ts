@@ -45,14 +45,31 @@ export type ChatDetail = {
   agentSession: { id: string; status: string } | null;
 };
 
+export type ModelSource = "nanogpt" | "neuralwatt";
+
+export type ReasoningEffort = "low" | "medium" | "high" | "max";
+
 export type ModelInfo = {
   id: string;
   displayName: string;
   name?: string;
   provider?: string;
+  source?: ModelSource;
   contextLength?: number;
   supportsVision?: boolean;
   supportsTools?: boolean;
+  supportsJsonMode?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningEffort?: boolean;
+  supportsStreaming?: boolean;
+  maxOutputTokens?: number;
+  maxImages?: number;
+  inputPricePerMillion?: number;
+  outputPricePerMillion?: number;
+  cachedInputPricePerMillion?: number | null;
+  pricingTbd?: boolean;
+  deprecated?: boolean;
+  description?: string | null;
 };
 
 export type AttachmentKind = "image" | "pdf" | "document" | "text" | "binary";

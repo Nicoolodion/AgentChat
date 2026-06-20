@@ -20,7 +20,7 @@ import {
   getConversationForModel,
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
-import { streamCompletionWithCallbacks, generateChatTitle } from "@/lib/nanogpt";
+import { streamCompletionWithCallbacks, generateChatTitle, resolveModelContextLength } from "@/lib/nanogpt";
 import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
@@ -32,6 +32,7 @@ const schema = z.object({
   content: z.string().min(1).max(20_000),
   attachments: z.array(z.string().min(16).max(64)).max(40).optional(),
   agentEnabled: z.boolean().optional(),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]).optional(),
 });
 
 const encoder = new TextEncoder();
@@ -100,6 +101,7 @@ export async function POST(
         chatId,
         content: parsed.data.content,
         attachments: parsed.data.attachments ?? [],
+        reasoningEffort: parsed.data.reasoningEffort,
       });
     }
 
@@ -163,6 +165,7 @@ export async function POST(
               ],
               attachments: preparedAttachments,
               latestUserPrompt: parsed.data.content,
+              reasoningEffort: parsed.data.reasoningEffort,
             },
             {
               onTTFT: (ttftMs: number) => sendSseEvent(controller, "ttft", { ttftMs }),
@@ -293,8 +296,9 @@ async function handleAgentMessage(input: {
   chatId: string;
   content: string;
   attachments: string[];
+  reasoningEffort?: "low" | "medium" | "high" | "max";
 }) {
-  const { auth, chat, chatId, content, attachments } = input;
+  const { auth, chat, chatId, content, attachments, reasoningEffort } = input;
 
   // Prevent concurrent agent execution on the same session
   const existingSession = await prisma.agentSession.findUnique({ where: { chatId } });
@@ -353,7 +357,7 @@ async function handleAgentMessage(input: {
   }
 
   // Persist user message (with attachment refs so the UI can render them)
-  await appendMessageToChat({
+  const userMessage = await appendMessageToChat({
     chatId: chat.id,
     role: "user",
     content,
@@ -418,6 +422,7 @@ async function handleAgentMessage(input: {
       };
 
       try {
+        const modelContextLength = await resolveModelContextLength(chat.model).catch(() => undefined);
         completionResult = await runAgentExecution({
           sessionId,
           userMessage: content,
@@ -425,6 +430,8 @@ async function handleAgentMessage(input: {
           model: chat.model,
           sendEvent: wrappedSendEvent,
           signal: ac.signal,
+          reasoningEffort,
+          modelContextLength,
         });
       } catch (error) {
         if ((error as Error).name === "AbortError") {
@@ -499,6 +506,7 @@ async function handleAgentMessage(input: {
           totalDurationMs: 0,
         },
         assistantMessage: assistantMessage ?? undefined,
+        userMessage,
       });
 
       activeAgents.delete(sessionId);

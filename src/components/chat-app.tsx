@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Bot,
+  Brain,
   CornerDownLeft,
   Download,
   File,
@@ -18,7 +19,6 @@ import {
   Paperclip,
   RefreshCw,
   Search,
-  ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
@@ -34,7 +34,6 @@ import { useRouter } from "next/navigation";
 import {
   AgentModeToggle,
   AgentProgressBar,
-  AgentMessageBadge,
   AgentSidebar,
   useAgent,
 } from "@/components/agent";
@@ -45,9 +44,11 @@ import type {
   ChatMessage,
   MessageAttachmentRef,
   ModelInfo,
+  ModelSource,
+  ReasoningEffort,
   UploadedAttachment,
 } from "@/lib/chat-types";
-import { decodeUserAttachmentsPayload, encodeUserAttachmentsPayload } from "@/lib/chat-types";
+import { decodeUserAttachmentsPayload } from "@/lib/chat-types";
 import { cn } from "@/lib/ui";
 import { useChatStream } from "./chat/useChatStream";
 import { formatTokensPerSecond, formatTTFT, MessageTimeline } from "./chat/MessageTimeline";
@@ -94,6 +95,18 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatPrice(perMillion?: number): string {
+  if (perMillion === undefined || perMillion === null) return "";
+  if (perMillion === 0) return "free";
+  return `$${perMillion}`;
+}
+
+function formatContext(length?: number): string {
+  if (!length) return "";
+  if (length >= 1_000_000) return `${(length / 1_000_000).toFixed(length % 1_000_000 === 0 ? 0 : 1)}M`;
+  return `${Math.round(length / 1000)}k`;
 }
 
 // ── User message bubble (unchanged) ───────────────────────────────────────────
@@ -153,8 +166,41 @@ function UserBubble({
         </div>
       )}
       {displayContent && (
-        <div className="prose prose-invert prose-sm max-w-none text-slate-100">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayContent}</ReactMarkdown>
+        <div className="max-w-none text-slate-100">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              p: ({ children }) => <p className="mb-1.5 text-sm leading-relaxed last:mb-0">{children}</p>,
+              ul: ({ children }) => <ul className="mb-1.5 ml-4 list-disc text-sm last:mb-0">{children}</ul>,
+              ol: ({ children }) => <ol className="mb-1.5 ml-4 list-decimal text-sm last:mb-0">{children}</ol>,
+              li: ({ children }) => <li className="mb-0.5 leading-relaxed">{children}</li>,
+              a: ({ href, children }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer" className="text-teal-200 underline underline-offset-2 hover:text-teal-100">
+                  {children}
+                </a>
+              ),
+              blockquote: ({ children }) => (
+                <blockquote className="mb-1.5 border-l-2 border-teal-300/40 pl-2 italic text-slate-200">{children}</blockquote>
+              ),
+              hr: () => <hr className="my-2 border-white/10" />,
+              pre: ({ children }) => (
+                <pre className="my-1.5 overflow-x-auto rounded-lg border border-white/10 bg-slate-900/80 p-2 text-[12px] leading-relaxed text-slate-100">
+                  {children}
+                </pre>
+              ),
+              code: ({ className, children }) => {
+                const isBlock = className?.includes("language-");
+                if (isBlock) return <>{children}</>;
+                return (
+                  <code className="rounded bg-white/10 px-1 py-0.5 font-mono text-[12px] text-slate-100">
+                    {children}
+                  </code>
+                );
+              },
+            }}
+          >
+            {displayContent}
+          </ReactMarkdown>
         </div>
       )}
     </div>
@@ -274,6 +320,7 @@ export function ChatApp() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [reasoningEffort, setReasoningEffort] = useState<"none" | ReasoningEffort>("none");
 
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
   const modelSearchRef = useRef<HTMLInputElement | null>(null);
@@ -393,6 +440,30 @@ export function ChatApp() {
     );
   }, [modelSearch, models]);
 
+  // Group models into provider sections (NanoGPT / Neuralwatt) preserving order.
+  const groupedModels = useMemo(() => {
+    const order: ModelSource[] = ["neuralwatt", "nanogpt"];
+    const sections = new Map<ModelSource, ModelInfo[]>();
+    for (const m of displayModels) {
+      const key: ModelSource = m.source ?? "nanogpt";
+      const list = sections.get(key) ?? [];
+      list.push(m);
+      sections.set(key, list);
+    }
+    return order
+      .filter((src) => sections.has(src))
+      .map((src) => ({
+        source: src,
+        label: src === "neuralwatt" ? "Neuralwatt" : "NanoGPT",
+        models: sections.get(src)!,
+      }))
+      .concat(
+        [...sections.keys()]
+          .filter((k) => k !== "neuralwatt" && k !== "nanogpt")
+          .map((k) => ({ source: k, label: k, models: sections.get(k)! })),
+      );
+  }, [displayModels]);
+
   // ── Chat CRUD ────────────────────────────────────────────────────────────
   async function reloadChatsAndKeepSelection(chatId?: string) {
     const { chats: rows } = await apiFetch<{ chats: ChatListItem[] }>("/api/chats");
@@ -507,7 +578,8 @@ export function ChatApp() {
     setMessageInput("");
     setPendingAttachments([]);
 
-    await stream.send({ text: messageInput, attachments: atts });
+    const effort = reasoningEffort === "none" ? undefined : reasoningEffort;
+    await stream.send({ text: messageInput, attachments: atts, reasoningEffort: effort });
   }
 
   async function reroll(index: number) {
@@ -535,6 +607,7 @@ export function ChatApp() {
     }
     await stream.send({
       text: userMsg.content.replace(/\n\nAttached files:[\s\S]*$/, "").trimEnd(),
+      reasoningEffort: reasoningEffort === "none" ? undefined : reasoningEffort,
       attachments: userAtts.map((a) => ({
         id: a.id,
         fileName: a.fileName,
@@ -577,8 +650,41 @@ export function ChatApp() {
   }
 
   // Tool outputs (flat list for timeline)
-  function handleEditMessage(msg: ChatMessage) {
+  async function handleEditMessage(msg: ChatMessage) {
+    if (!activeChat || stream.sending) return;
+    const idx = stream.messages.findIndex((m) => m.id === msg.id);
+    if (idx === -1) return;
+
+    // The assistant reply that directly follows the user message (if any)
+    const following = stream.messages.slice(idx + 1);
+    const assistantReply = following.find((m) => m.role === "assistant");
+    const assistantEndIdx = assistantReply
+      ? idx + 1 + following.indexOf(assistantReply)
+      : -1;
+
+    // Everything from the edited user message up to (and including) its assistant
+    // reply is removed so re-sending produces a clean exchange.
+    const removeEnd = assistantEndIdx === -1 ? idx : assistantEndIdx;
+    const toRemove = stream.messages.slice(idx, removeEnd + 1);
+    const removeIds = new Set(toRemove.map((m) => m.id));
+
+    stream.reset(stream.messages.filter((m) => !removeIds.has(m.id)));
+
+    // Populate the composer with the original text so the user can tweak it.
     setMessageInput(msg.content.replace(/\n\nAttached files:[\s\S]*$/, "").trimEnd());
+
+    // Best-effort delete the persisted messages on the server. Optimistic temp
+    // ids (e.g. right after sending) can't be resolved here; the done-event
+    // sync replaces those with real ids so deletion works on later edits.
+    for (const m of toRemove) {
+      if (m.id.startsWith("user-temp-") || m.id.startsWith("temp-")) continue;
+      try {
+        await apiFetch(`/api/chats/${activeChat.id}/messages/${m.id}`, { method: "DELETE" });
+      } catch {
+        // ignore — local state is already correct
+      }
+    }
+
     setTimeout(() => document.querySelector<HTMLTextAreaElement>("textarea")?.focus(), 0);
   }
 
@@ -745,35 +851,78 @@ export function ChatApp() {
                       className="w-full border-b border-white/10 bg-transparent px-3 py-2 text-sm text-white outline-none placeholder:text-slate-500"
                       placeholder="Search models..."
                     />
-                    <div className="max-h-[280px] overflow-y-auto p-1">
-                      {displayModels.map((m) => (
-                        <button
-                          key={m.id}
-                          onClick={() => {
-                            void updateChat({ model: m.id });
-                            setModelDropdownOpen(false);
-                            setModelSearch("");
-                          }}
-                          className={cn(
-                            "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition",
-                            activeChat?.model === m.id ? "bg-teal-400/20 text-teal-100" : "text-slate-300 hover:bg-white/10",
-                          )}
-                        >
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5">
-                              <span className="truncate font-mono text-xs text-white">{m.name || m.id}</span>
-                              {m.supportsVision && <span className="text-[10px]" title="Vision">👁</span>}
-                              {m.supportsTools && <span className="text-[10px]" title="Tool support">🔧</span>}
-                              {m.contextLength && <span className="text-[10px] text-slate-500">{Math.round(m.contextLength / 1000)}k</span>}
-                            </div>
-                            <div className="truncate text-[11px] text-slate-400">{m.displayName}</div>
+                    <div className="max-h-[320px] overflow-y-auto p-1">
+                      {groupedModels.map((section) => (
+                        <div key={section.source} className="mb-1">
+                          <div className="sticky top-0 z-10 flex items-center gap-2 bg-slate-900 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                            <span
+                              className={cn(
+                                "h-1.5 w-1.5 rounded-full",
+                                section.source === "neuralwatt" ? "bg-emerald-400" : "bg-teal-400",
+                              )}
+                            />
+                            {section.label}
+                            <span className="text-slate-600">· {section.models.length}</span>
                           </div>
-                          {activeChat?.model === m.id && (
-                            <span className="text-[10px] font-semibold text-teal-300">ACTIVE</span>
-                          )}
-                        </button>
+                          {section.models.map((m) => {
+                            const inputHint = m.inputPricePerMillion;
+                            const outputHint = m.outputPricePerMillion;
+                            return (
+                              <button
+                                key={m.id}
+                                onClick={() => {
+                                  void updateChat({ model: m.id });
+                                  setModelDropdownOpen(false);
+                                  setModelSearch("");
+                                }}
+                                className={cn(
+                                  "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition",
+                                  activeChat?.model === m.id ? "bg-teal-400/20 text-teal-100" : "text-slate-300 hover:bg-white/10",
+                                )}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="truncate font-mono text-xs text-white">{m.name || m.displayName}</span>
+                                    {m.supportsVision && <span className="text-[10px]" title="Vision">👁</span>}
+                                    {m.supportsTools && <span className="text-[10px]" title="Tool support">🔧</span>}
+                                    {m.supportsReasoning && <span className="text-[10px]" title="Reasoning">🧠</span>}
+                                    {m.supportsJsonMode && <span className="text-[10px]" title="JSON mode">{"{}"}</span>}
+                                    {m.contextLength && (
+                                      <span className="text-[10px] text-slate-500" title="Context window">
+                                        {formatContext(m.contextLength)}
+                                      </span>
+                                    )}
+                                    {m.maxOutputTokens && (
+                                      <span className="text-[10px] text-slate-600" title="Max output tokens">
+                                        →{formatContext(m.maxOutputTokens)}
+                                      </span>
+                                    )}
+                                    {m.deprecated && (
+                                      <span className="rounded bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-300">
+                                        DEPRECATED
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2 truncate text-[11px] text-slate-400">
+                                    <span className="truncate">{m.displayName}</span>
+                                    {m.pricingTbd ? (
+                                      <span className="shrink-0 text-slate-500">pricing TBD</span>
+                                    ) : (inputHint !== undefined || outputHint !== undefined) ? (
+                                      <span className="shrink-0 font-mono text-[10px] text-slate-500" title="Per million tokens (in / out)">
+                                        {formatPrice(inputHint)} / {formatPrice(outputHint)}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </div>
+                                {activeChat?.model === m.id && (
+                                  <span className="text-[10px] font-semibold text-teal-300">ACTIVE</span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
                       ))}
-                      {displayModels.length === 0 && (
+                      {groupedModels.length === 0 && (
                         <div className="px-3 py-4 text-center text-xs text-slate-500">No models found</div>
                       )}
                     </div>
@@ -793,6 +942,24 @@ export function ChatApp() {
                 {activeChat?.webSearchEnabled ? <Globe className="h-4 w-4" /> : <Search className="h-4 w-4" />}
                 Web Search
               </button>
+
+              {activeModelInfo?.supportsReasoningEffort && (
+                <label className="inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-slate-900 px-3 py-1.5 text-sm text-slate-200" title="Reasoning effort (optional — leave on Auto for the provider's default)">
+                  <Brain className="h-3.5 w-3.5 text-violet-300" />
+                  <span className="hidden text-xs text-slate-400 sm:inline">Effort</span>
+                  <select
+                    value={reasoningEffort}
+                    onChange={(e) => setReasoningEffort(e.target.value as "none" | ReasoningEffort)}
+                    className="cursor-pointer bg-transparent text-sm text-slate-100 outline-none"
+                  >
+                    <option className="bg-slate-900" value="none">Auto</option>
+                    <option className="bg-slate-900" value="low">low</option>
+                    <option className="bg-slate-900" value="medium">medium</option>
+                    <option className="bg-slate-900" value="high">high</option>
+                    <option className="bg-slate-900" value="max">max</option>
+                  </select>
+                </label>
+              )}
 
               <AgentModeToggle
                 isOn={agent.isAgentMode}

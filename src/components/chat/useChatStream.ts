@@ -25,6 +25,7 @@ import type {
   ChatMessage,
   ChatToolCall,
   MessageAttachmentRef,
+  ReasoningEffort,
   UploadedAttachment,
 } from "@/lib/chat-types";
 import { encodeUserAttachmentsPayload } from "@/lib/chat-types";
@@ -54,7 +55,7 @@ export type UseChatStream = {
   toolArguments: Record<string, Record<string, unknown>>;
   sending: boolean;
   error: string | null;
-  send: (input: { text: string; attachments: UploadedAttachment[] }) => Promise<void>;
+  send: (input: { text: string; attachments: UploadedAttachment[]; reasoningEffort?: ReasoningEffort }) => Promise<void>;
   cancel: () => void;
   restore: () => void;
   applyAssistantMessage: (msg: ChatMessage) => void;
@@ -116,7 +117,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
 
   // ── Send a new message ────────────────────────────────────────────────────
   const send = useCallback(
-    async ({ text, attachments }: { text: string; attachments: UploadedAttachment[] }) => {
+    async ({ text, attachments, reasoningEffort }: { text: string; attachments: UploadedAttachment[]; reasoningEffort?: ReasoningEffort }) => {
       if (sending) return;
       const content = text.trim() || "Please analyze the attached files.";
       const atts = [...attachments];
@@ -202,6 +203,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             content,
             attachments: atts.map((a) => a.id),
             agentEnabled,
+            reasoningEffort,
           }),
           signal: sendAbortRef.current.signal,
         });
@@ -292,6 +294,23 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
           if (event === "done") {
             pushReasoningSegment();
             const asst = data.assistantMessage as ChatMessage | undefined;
+            const usr = data.userMessage as ChatMessage | undefined;
+            // Replace the optimistic user message id with the persisted one so
+            // later edits/deletes resolve to the real DB row.
+            if (usr) {
+              setMessages((current) => {
+                const copy = current.slice();
+                const userIdx = copy.length - 2;
+                if (
+                  userIdx >= 0 &&
+                  copy[userIdx]?.role === "user" &&
+                  copy[userIdx]!.id.startsWith("user-temp-")
+                ) {
+                  copy[userIdx] = { ...copy[userIdx]!, id: usr.id };
+                }
+                return copy;
+              });
+            }
             if (asst) {
               applyContent((m) => ({
                 ...asst,

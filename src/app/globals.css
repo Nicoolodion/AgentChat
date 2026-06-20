@@ -73,19 +73,31 @@ body {
   background: linear-gradient(135deg, #f8fafc, #f1f5f9, #e2e8f0) !important;
 }
 
-.theme-light .bg-slate-950,
-.theme-light .bg-slate-950\/60 {
+/* Dark slate surfaces (any opacity variant, incl. /80) → light surfaces
+   so the agent sidebar, chat panel and code blocks all flip to white. */
+.theme-light [class*="bg-slate-950"] {
   background-color: #ffffff;
 }
 
-.theme-light .bg-slate-900,
-.theme-light .bg-slate-900\/70 {
-  background-color: #f8fafc;
+.theme-light [class*="bg-slate-900"],
+.theme-light [class*="bg-slate-800"] {
+  background-color: #f1f5f9;
+}
+
+/* Solid white surfaces stay white; translucent white tints become faint slate
+   card surfaces so they remain visible against the light background. */
+.theme-light .bg-white {
+  background-color: #ffffff;
+}
+
+.theme-light [class*="bg-white/"] {
+  background-color: rgba(15, 23, 42, 0.04);
 }
 
 .theme-light .border-white\/10,
-.theme-light .border-white\/15 {
-  border-color: rgba(15, 23, 42, 0.1);
+.theme-light .border-white\/15,
+.theme-light [class*="border-white/"] {
+  border-color: rgba(15, 23, 42, 0.12);
 }
 
 .theme-light .text-slate-100,
@@ -101,4 +113,9 @@ body {
 
 .theme-light .text-white {
   color: #0f172a;
+}
+
+/* Keep scrollbar track legible on light backgrounds */
+.theme-light * {
+  scrollbar-color: rgba(100, 116, 139, 0.4) transparent;
 }

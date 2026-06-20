@@ -9,12 +9,15 @@
  *   5. Persists tool calls & artifacts to the database
  */
 
-import type { PrismaClient } from "@prisma/client";
-import type OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions/completions";
 
+import type { ReasoningEffort } from "@/lib/chat-types";
 import { env } from "@/lib/env";
-import { nanoClient } from "@/lib/nanogpt";
+import {
+  getOpenAIClientForModel,
+  resolveApiModelId,
+  resolveReasoningEffort,
+} from "@/lib/nanogpt";
 import { prisma } from "@/lib/prisma";
 import {
   AgentArtifactKind,
@@ -50,16 +53,54 @@ export type SseController = {
 
 const MAX_CONVERSATION_CHARS = 80000;
 
-function summarizeOldMessages(messages: ChatCompletionMessageParam[]): ChatCompletionMessageParam[] {
-  let totalChars = 0;
-  for (const m of messages) totalChars += typeof m.content === "string" ? m.content.length : 0;
+/** Rough token estimate (~4 chars/token) used for context-budget checks. */
+function estimateTokens(messages: ChatCompletionMessageParam[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") {
+      chars += m.content.length;
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part === "object" && part !== null && "text" in part) {
+          chars += String((part as { text?: string }).text ?? "").length;
+        }
+      }
+    }
+    if ("tool_calls" in m && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls as Array<{ function?: { arguments?: string } }>) {
+        chars += (tc.function?.arguments ?? "").length;
+      }
+    }
+  }
+  return Math.ceil(chars / 4);
+}
 
-  if (totalChars <= MAX_CONVERSATION_CHARS) return messages;
+function summarizeOldMessages(
+  messages: ChatCompletionMessageParam[],
+  modelContextLength?: number,
+): ChatCompletionMessageParam[] {
+  // Only summarize when we actually know the model's context limit and the
+  // conversation is approaching it (leave ~20% headroom for output + tool
+  // overhead). When the limit is unknown we fall back to the legacy 80KB
+  // character guard so very large sessions are still protected.
+  let shouldSummarize: boolean;
+  if (modelContextLength) {
+    const headroom = Math.floor(modelContextLength * 0.8);
+    shouldSummarize = estimateTokens(messages) > headroom;
+  } else {
+    let totalChars = 0;
+    for (const m of messages) totalChars += typeof m.content === "string" ? m.content.length : 0;
+    shouldSummarize = totalChars > MAX_CONVERSATION_CHARS;
+  }
+
+  if (!shouldSummarize) return messages;
 
   const systemMsg = messages.find((m) => m.role === "system");
   const nonSystem = messages.filter((m) => m.role !== "system");
 
-  const recentCount = 10;
+  // Keep a reasonable tail; for small contexts keep fewer messages so the
+  // trimmed context has room to fit.
+  const recentCount = modelContextLength && modelContextLength < 16000 ? 6 : 10;
   const recent = nonSystem.slice(-recentCount);
   const old = nonSystem.slice(0, -recentCount);
 
@@ -88,9 +129,10 @@ export async function runAgentExecution(input: {
   model: string;
   sendEvent: (event: AgentSseEvent) => void;
   signal?: AbortSignal;
-  reasoningEffort?: "low" | "medium" | "high";
+  reasoningEffort?: ReasoningEffort;
+  modelContextLength?: number;
 }): Promise<{ content: string; reasoning?: string; toolCallsCount: number }> {
-  const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort } = input;
+  const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort, modelContextLength } = input;
 
   // Check sandbox availability before starting
   try {
@@ -150,6 +192,10 @@ export async function runAgentExecution(input: {
   let toolCallsCount = 0;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
 
+  // Resolve the reasoning_effort capability once (the route may have already
+  // warmed the catalog cache via resolveModelContextLength).
+  const effectiveReasoningEffort = await resolveReasoningEffort(model, reasoningEffort);
+
   for (let iteration = 0; iteration < 50 && toolCallsCount < maxToolCalls; iteration++) {
     if (signal?.aborted) break;
     const accumulatedToolCalls: Array<{
@@ -160,24 +206,29 @@ export async function runAgentExecution(input: {
     let currentToolCallIndex = -1;
     let contentBuffer = "";
 
-    const trimmedMessages = summarizeOldMessages(messages);
+    const trimmedMessages = summarizeOldMessages(messages, modelContextLength);
+    const apiModel = resolveApiModelId(model);
+    const client = getOpenAIClientForModel(model);
     const createOptions: Record<string, unknown> = {
-      model,
+      model: apiModel,
       messages: trimmedMessages,
       tools: AGENT_TOOL_SCHEMAS,
       tool_choice: "auto",
       parallel_tool_calls: true,
       stream: true,
     };
-    if (reasoningEffort) {
-      createOptions.reasoning_effort = reasoningEffort;
+    if (effectiveReasoningEffort) {
+      createOptions.reasoning_effort = effectiveReasoningEffort;
     }
 
-    const response = await nanoClient.chat.completions.create(
+    const response = await client.chat.completions.create(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       createOptions as any,
       { signal },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ) as any;
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for await (const chunk of response as AsyncIterable<any>) {
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) continue;
@@ -239,6 +290,7 @@ export async function runAgentExecution(input: {
     }
 
     // Execute tool calls
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     messages.push({ role: "assistant", content: contentBuffer, tool_calls: validToolCalls as any });
 
     await updateSessionStatus(sessionId, "executing");
@@ -706,8 +758,8 @@ except Exception as e:
             const mime = mimeMap[ext] ?? "image/png";
             const dataUrl = `data:${mime};base64,${fileRes.content}`;
             const useDetail = attempts > 1 ? "low" : detail;
-            const response = await nanoClient.chat.completions.create({
-              model,
+            const response = await getOpenAIClientForModel(model).chat.completions.create({
+              model: resolveApiModelId(model),
               messages: [
                 {
                   role: "user",
