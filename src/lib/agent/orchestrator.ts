@@ -30,15 +30,18 @@ import { AGENT_TOOL_SCHEMAS, SKILL_EXTENSIONS, buildSystemPrompt } from "./tool-
 import {
   buildBrowserHeaders,
   classifyContentType,
+  classifyImageResponse,
   describeBinaryResponse,
   extractPageMeta,
   htmlToMarkdown,
   htmlToText,
   isHtmlBody,
+  sanitizeVisionError,
   stripNonContent,
   truncateForOutput,
   validateFetchUrl,
   type FetchFormat,
+  type VisionResponseStatus,
 } from "./web-tools";
 import {
   sandboxConvertDocxToPdf,
@@ -1080,44 +1083,7 @@ print(json.dumps(out))
 
       const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
 
-      // "No image attached" style non-responses.
-      const NO_IMAGE_PATTERNS = [
-        /no image (was |is )?(attached|provided|uploaded|found|included|visible)/i,
-        /did not (attach|upload|provide|include) (an? |the )?image/i,
-        /please (provide|upload|share|attach) (the |an? )?image/i,
-        /i (cannot|can't|am unable to) (see|describe|view|analyze) (the |an? |any )?image/i,
-        /i don'?t see (any |an? )?image/i,
-        /no image (available|present|shown|displayed)/i,
-        /image (is )?missing|missing image/i,
-        /forgot (to )?(attach|upload|include|provide)/i,
-      ];
-
-      // Refusal / safety non-answers. These must NOT be returned as if they
-      // were a valid description — instead we retry on the next candidate
-      // model so a single model's safety filter can't block the whole task.
-      const REFUSAL_PATTERNS = [
-        /\bi (can'??not|can'?t|won'?t|am (?:un)?able to|will not)\b[^.]{0,80}?\b(assist|help|provide|describe|analyze|transcribe|fulfill|complete|participate|engage|comply|process|generate|create)\b/i,
-        /\bi (?:am )?(?:not able|unable) to (?:see|describe|analyze|view|process|provide)\b/i,
-        /\b(refuse|decline) (to|to help|to assist|to provide)\b/i,
-        /(?:content|image|material) (?:depicts|appears to depict|involves|contains) (?:sexual(?:ized)?|explicit|minor|underage|csam|child)/i,
-        /\bsafe(?:ty|guard|filter)?\b/i,
-        /report (?:it )?to\b/i,
-        /cybertipline|tips\.fbi\.gov|ncmec/i,
-        /\b(minor|underage|child(?:ren)?)\S{0,30}(?:-like)?\s+character/i,
-        /against (?:my )?(?:guidelines|policies|safety policy)/i,
-        /i'?m not (?:able|allowed|permitted) to/i,
-        /(?:not|cannot) (?:assist|help) (?:with|in) (?:this|that|any)/i,
-      ];
-
-      function isNonAnswer(text: string): { nonAnswer: boolean; kind: "no-image" | "refusal" | null } {
-        const t = text.trim();
-        if (t.length === 0) return { nonAnswer: true, kind: null };
-        if (NO_IMAGE_PATTERNS.some((p) => p.test(text))) return { nonAnswer: true, kind: "no-image" };
-        if (REFUSAL_PATTERNS.some((p) => p.test(text))) return { nonAnswer: true, kind: "refusal" };
-        return { nonAnswer: false, kind: null };
-      }
-
-      async function analyzeWithModel(imagePath: string, dataUrl: string, useDetail: "high" | "low", modelId: string): Promise<{ content: string; ok: boolean; error?: string }> {
+      async function analyzeWithModel(imagePath: string, dataUrl: string, useDetail: "high" | "low", modelId: string): Promise<{ content: string; status: VisionResponseStatus; error?: string }> {
         const client = getOpenAIClientForModel(modelId);
         const response = await client.chat.completions.create({
           model: resolveApiModelId(modelId),
@@ -1134,46 +1100,63 @@ print(json.dumps(out))
           max_tokens: 1024,
         });
         const content = response.choices[0]?.message?.content ?? "";
-        return { content, ok: content.trim().length > 0, error: content.trim().length === 0 ? "Empty response from vision model" : undefined };
+        const status = classifyImageResponse(content);
+        return { content, status, error: status === "empty" ? "Empty response from vision model" : undefined };
       }
 
       async function analyzeSingle(imagePath: string): Promise<void> {
+        let fileRes;
         try {
-          const fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
-          if (!fileRes.content || fileRes.content.length < 100) {
-            results.push({ path: imagePath, content: "", ok: false, error: `Failed to read image data from sandbox (${fileRes.content?.length ?? 0} bytes)` });
-            return;
-          }
-          const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
-          const mimeMap: Record<string, string> = {
-            jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
-          };
-          const mime = mimeMap[ext] ?? "image/png";
-          const dataUrl = `data:${mime};base64,${fileRes.content}`;
-
-          let lastError = "";
-          // One pass over each candidate model, retrying the *same* model once
-          // at low detail before moving on. This way a fallback model is used
-          // whenever the primary refuses or sees nothing.
-          for (const modelId of candidateModels) {
-            for (const useDetail of [detail, "low"] as const) {
-              const r = await analyzeWithModel(imagePath, dataUrl, useDetail, modelId);
-              const check = isNonAnswer(r.content);
-              if (r.ok && !check.nonAnswer) {
-                results.push({ path: imagePath, content: r.content, ok: true });
-                return;
-              }
-              lastError = check.kind === "refusal"
-                ? `Vision model '${modelId}' refused the request`
-                : (r.error ?? `Vision model '${modelId}' returned a non-answer`);
-            }
-          }
-          results.push({ path: imagePath, content: "", ok: false, error: lastError || "All vision models failed to produce a usable response" });
+          fileRes = await sandboxFileRead(sessionId, imagePath, "base64");
         } catch (err) {
           if ((err as Error).name === "AbortError") throw err;
           const msg = err instanceof Error ? err.message : String(err);
-          results.push({ path: imagePath, content: "", ok: false, error: msg });
+          results.push({ path: imagePath, content: "", ok: false, error: sanitizeVisionError(msg) });
+          return;
         }
+        if (!fileRes.content || fileRes.content.length < 100) {
+          results.push({ path: imagePath, content: "", ok: false, error: `Failed to read image data from sandbox (${fileRes.content?.length ?? 0} bytes)` });
+          return;
+        }
+        const ext = imagePath.includes(".") ? imagePath.split(".").pop()!.toLowerCase() : "png";
+        const mimeMap: Record<string, string> = {
+          jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+        };
+        const mime = mimeMap[ext] ?? "image/png";
+        const dataUrl = `data:${mime};base64,${fileRes.content}`;
+
+        const failures: string[] = [];
+        // One pass over each candidate model, retrying the *same* model once
+        // at low detail before moving on. Each attempt is isolated so a thrown
+        // error (404, network, rate limit) falls through to the next model
+        // instead of aborting the whole image.
+        for (const modelId of candidateModels) {
+          for (const useDetail of [detail, "low"] as const) {
+            try {
+              const r = await analyzeWithModel(imagePath, dataUrl, useDetail, modelId);
+              if (r.status === "ok") {
+                results.push({ path: imagePath, content: r.content, ok: true });
+                return;
+              }
+              failures.push(r.status === "refusal"
+                ? `vision model '${modelId}' refused the request`
+                : (r.error ?? `vision model '${modelId}' returned a non-answer (${r.status})`));
+            } catch (err) {
+              if ((err as Error).name === "AbortError") throw err;
+              const msg = err instanceof Error ? err.message : String(err);
+              failures.push(sanitizeVisionError(msg, modelId));
+              // Continue to the next candidate model / detail level.
+            }
+          }
+        }
+        results.push({
+          path: imagePath,
+          content: "",
+          ok: false,
+          error: failures.length > 0
+            ? `All vision models failed: ${failures.join("; ")}`
+            : "All vision models failed to produce a usable response",
+        });
       }
 
       // Process ALL images in batches with limited concurrency

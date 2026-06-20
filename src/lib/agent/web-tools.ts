@@ -362,3 +362,92 @@ export function validateFetchUrl(raw: string): UrlValidation {
   }
   return { ok: true, url: u };
 }
+
+// ── Vision response classification & error sanitization ──────────────────────
+
+export type VisionResponseStatus = "ok" | "no-image" | "refusal" | "empty";
+
+/** Patterns for "I don't see an image" style non-answers. */
+const NO_IMAGE_PATTERNS = [
+  /no image (was |is )?(attached|provided|uploaded|found|included|visible)/i,
+  /did not (attach|upload|provide|include) (an? |the )?image/i,
+  /please (provide|upload|share|attach) (the |an? )?image/i,
+  /i (cannot|can't|am unable to) (see|describe|view|analyze) (the |an? |any )?image/i,
+  /i don'?t see (any |an? )?image/i,
+  /no image (available|present|shown|displayed)/i,
+  /image (is )?missing|missing image/i,
+  /forgot (to )?(attach|upload|include|provide)/i,
+];
+
+/** Refusal / safety non-answers. A single model's safety filter must not be
+ *  trusted as the final result — the orchestrator retries the next candidate.
+ *  Patterns are kept specific to avoid false-positives on real descriptions
+ *  that merely mention "safety", "minor", etc. in a non-rejecting context. */
+const REFUSAL_PATTERNS = [
+  /\bi (can'??not|can'?t|won'?t|am (?:un)?able to|will not)\b[^.]{0,80}?\b(assist|help|provide|describe|analyze|transcribe|fulfill|complete|participate|engage|comply|process|generate|create)\b/i,
+  /\bi (?:am )?(?:not able|unable) to (?:see|describe|analyze|view|process|provide)\b/i,
+  /\b(refuse|decline) (to|to help|to assist|to provide)\b/i,
+  /(?:content|image|material) (?:depicts|appears to depict|involves|contains) (?:sexual(?:ized)?|explicit|minor|underage|csam|child)/i,
+  /report (?:it )?to\b/i,
+  /cybertipline|tips\.fbi\.gov|ncmec/i,
+  /\b(minor|underage|child(?:ren)?)\S{0,30}(?:-like)?\s+character/i,
+  /against (?:my )?(?:guidelines|policies|safety policy)/i,
+  /i'?m not (?:able|allowed|permitted) to/i,
+  /(?:not|cannot) (?:assist|help) (?:with|in) (?:this|that|any)/i,
+];
+
+/** Classify a vision-model response so refusals/no-image/empty answers are
+ *  retried on the next candidate model instead of returned as ground truth. */
+export function classifyImageResponse(text: string): VisionResponseStatus {
+  const t = (text ?? "").trim();
+  if (t.length === 0) return "empty";
+  if (NO_IMAGE_PATTERNS.some((p) => p.test(text))) return "no-image";
+  if (REFUSAL_PATTERNS.some((p) => p.test(text))) return "refusal";
+  return "ok";
+}
+
+/** Turn a raw vision-API error (which may contain a full HTML 404/500 page, a
+ *  JSON error blob, or a huge payload) into a short, agent-context-safe
+ *  message. Extracts the HTTP status and the embedded error message when
+ *  possible. */
+export function sanitizeVisionError(raw: string, modelId?: string): string {
+  const prefix = modelId ? `vision model '${modelId}'` : "vision model";
+  const s = raw ?? "";
+
+  // Leading "404 <!DOCTYPE..." or "429 {...}" style OpenAI-SDK messages.
+  const m = s.match(/^\s*(\d{3})\b\s*([\s\S]*)?/);
+  const status = m?.[1] ?? null;
+  const rest = (m?.[2] ?? s).trim();
+
+  const looksHtml = /<html|<!doctype html|<head|<body/i.test(rest || s);
+  if (looksHtml) {
+    const body = rest || s;
+    const title = body.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim();
+    const hint = title ? ` (HTML page: "${title.slice(0, 80)}")` : " (HTML error page returned, not a JSON API response)";
+    return `${prefix}: HTTP ${status ?? "error"}${hint} — provider base URL or model id is likely wrong`;
+  }
+
+  // JSON error blob, e.g. {"error":{"message":"Too many requests","type":...}}.
+  if (rest.startsWith("{") || rest.startsWith("[")) {
+    let message = "";
+    try {
+      const obj = JSON.parse(rest);
+      message =
+        (obj?.error?.message as string | undefined) ??
+        (obj?.message as string | undefined) ??
+        (obj?.detail as string | undefined) ??
+        (typeof obj?.error === "string" ? obj.error : "") ??
+        "";
+    } catch {
+      /* fall through to plain cleanup */
+    }
+    if (message) {
+      return `${prefix}: ${status ? `HTTP ${status}: ` : ""}${String(message).slice(0, 300)}`;
+    }
+  }
+
+  // Strip HTML tags + collapse whitespace for any other payload, then cap.
+  const cleaned = (rest || s).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const truncated = cleaned.slice(0, 300);
+  return `${prefix}: ${status ? `HTTP ${status}: ` : ""}${truncated}`;
+}

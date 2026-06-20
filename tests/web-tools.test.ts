@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildBrowserHeaders,
   classifyContentType,
+  classifyImageResponse,
   decodeEntities,
   deriveReferer,
   describeBinaryResponse,
@@ -11,6 +12,7 @@ import {
   htmlToText,
   isHtmlBody,
   isPrivateHost,
+  sanitizeVisionError,
   stripNonContent,
   truncateForOutput,
   validateFetchUrl,
@@ -237,5 +239,78 @@ describe("web-tools: validateFetchUrl", () => {
   });
   it("rejects malformed urls", () => {
     expect(validateFetchUrl("not a url").ok).toBe(false);
+  });
+});
+
+describe("web-tools: classifyImageResponse", () => {
+  it("classifies a real answer as ok", () => {
+    const txt = "A fox-girl reclines on a dark surface. Text reads おじさんのスリーパーだけで大丈夫だよ.";
+    expect(classifyImageResponse(txt)).toBe("ok");
+  });
+  it("classifies empty as empty", () => {
+    expect(classifyImageResponse("")).toBe("empty");
+    expect(classifyImageResponse("   \n  ")).toBe("empty");
+  });
+  it("classifies 'no image attached' non-answers", () => {
+    expect(classifyImageResponse("I don't see any image attached.")).toBe("no-image");
+    expect(classifyImageResponse("No image was provided.")).toBe("no-image");
+  });
+  it("classifies the exact refusal from the transcript as refusal", () => {
+    // Verbatim safety non-answer observed in production.
+    const refusal =
+      "I can't provide a detailed description, coordinates, or transcription for this image. " +
+      "It appears to depict sexual content involving a minor-like character, which I won't assist with in any form.\n\n" +
+      "If you have concerns about this type of material, you can report it to:\n- NCMEC CyberTipline";
+    expect(classifyImageResponse(refusal)).toBe("refusal");
+  });
+  it("classifies generic refusals", () => {
+    expect(classifyImageResponse("I'm sorry, but I can't assist with that request.")).toBe("refusal");
+    expect(classifyImageResponse("I am unable to analyze this image.")).toBe("refusal");
+    expect(classifyImageResponse("This content appears to depict explicit material.")).toBe("refusal");
+  });
+  it("does not false-positive on legitimate description text", () => {
+    // Must not flag a real description just because it mentions 'safety' or
+    // 'minor' in a non-refusal context, e.g. describing a safety pin or a
+    // minor character. (Kept conservative: these are ok.)
+    expect(classifyImageResponse("The character wears a helmet for safety.")).toBe("ok");
+  });
+});
+
+describe("web-tools: sanitizeVisionError", () => {
+  it("collapses a giant 404 HTML page into a short, context-safe message", () => {
+    // Verbatim shape of the production failure: OpenAI-SDK error message
+    // = "<status> <body>" where the body is the provider's Next.js 404 page.
+    const html404 =
+      "404 <!DOCTYPE html><html lang=\"en\"><head><meta charSet=\"utf-8\"/>" +
+      "<title>404 | This page could not be found.</title>" +
+      "<link rel=\"stylesheet\" href=\"/_next/static/css/10534ac409e0d126.css\"/></head>" +
+      "<body><div>404</div></body></html>";
+    const out = sanitizeVisionError(html404, "neuralwatt:vision-1");
+    expect(out.length).toBeLessThan(160);
+    expect(out).toContain("HTTP 404");
+    expect(out).toContain("neuralwatt:vision-1");
+    expect(out).not.toContain("<html");
+    expect(out).not.toContain("<!DOCTYPE");
+    expect(out).not.toContain("_next");
+  });
+  it("reports a likely-wrong base URL / model id for HTML error pages", () => {
+    const out = sanitizeVisionError("404 <!DOCTYPE html><html><head></head><body></body></html>");
+    expect(out).toMatch(/base URL or model id is likely wrong/i);
+  });
+  it("handles bare status + JSON error text", () => {
+    const out = sanitizeVisionError("429 {\"error\":{\"message\":\"Too many requests\"}}", "m1");
+    expect(out).toContain("HTTP 429");
+    expect(out).toContain("Too many requests");
+    expect(out).not.toContain("{");
+  });
+  it("passes through short plain errors", () => {
+    const out = sanitizeVisionError("connection reset", "m1");
+    expect(out).toContain("connection reset");
+    expect(out).toContain("m1");
+  });
+  it("truncates very long non-html errors", () => {
+    const long = "x".repeat(5000);
+    const out = sanitizeVisionError(long, "m1");
+    expect(out.length).toBeLessThan(400);
   });
 });
