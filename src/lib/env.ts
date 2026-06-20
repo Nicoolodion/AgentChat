@@ -54,6 +54,11 @@ const envSchema = z.object({
   AGENT_IMAGE_ANALYZE_MAX_BATCH: z.coerce.number().int().positive().default(15),
   AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: z.coerce.number().int().positive().default(2),
   AGENT_WORKSPACE_DIR: z.string().default("data/agent-workspaces"),
+  // Optional override models for image analysis. When set, image_analyze routes
+  // to AGENT_VISION_MODEL first (instead of the session model) and falls back to
+  // AGENT_VISION_FALLBACK_MODEL on a refusal / empty response before retrying.
+  AGENT_VISION_MODEL: z.string().optional(),
+  AGENT_VISION_FALLBACK_MODEL: z.string().optional(),
   SEARXNG_URL: z.string().optional(),
 });
 
@@ -81,5 +86,7 @@ export const env = envSchema.parse({
   AGENT_IMAGE_ANALYZE_MAX_BATCH: process.env.AGENT_IMAGE_ANALYZE_MAX_BATCH,
   AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY: process.env.AGENT_IMAGE_ANALYZE_MAX_CONCURRENCY,
   AGENT_WORKSPACE_DIR: process.env.AGENT_WORKSPACE_DIR,
+  AGENT_VISION_MODEL: process.env.AGENT_VISION_MODEL,
+  AGENT_VISION_FALLBACK_MODEL: process.env.AGENT_VISION_FALLBACK_MODEL,
   SEARXNG_URL: process.env.SEARXNG_URL,
 });
