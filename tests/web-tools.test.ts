@@ -17,9 +17,19 @@ import {
 } from "@/lib/agent/web-tools";
 
 describe("web-tools: deriveReferer", () => {
-  it("returns the origin with a trailing slash", () => {
+  it("returns the origin with a trailing slash for ordinary hosts", () => {
+    expect(deriveReferer("https://example.com/images/34/25/x.jpg"))
+      .toBe("https://example.com/");
+  });
+  it("strips asset/CDN subdomain prefixes so the parent site is the Referer", () => {
+    // img4.gelbooru.com must send a gelbooru.com Referer, not its own origin,
+    // otherwise the CDN returns an HTML stub instead of the image bytes.
     expect(deriveReferer("https://img4.gelbooru.com/images/34/25/x.jpg"))
-      .toBe("https://img4.gelbooru.com/");
+      .toBe("https://gelbooru.com/");
+    expect(deriveReferer("https://cdn.example.org/assets/a.png"))
+      .toBe("https://example.org/");
+    expect(deriveReferer("https://static.foo.test/pic.webp"))
+      .toBe("https://foo.test/");
   });
   it("returns empty string for invalid urls", () => {
     expect(deriveReferer("not a url")).toBe("");

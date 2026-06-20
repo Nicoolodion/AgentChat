@@ -930,7 +930,7 @@ def is_blocked_host(host):
         return True
     if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
         return True
-    v4 = __import__("re").match(r"^(\\\\d{1,3})\\\\.(\\\\d{1,3})\\\\.(\\\\d{1,3})\\\\.(\\\\d{1,3})$", host)
+    v4 = re.match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
     if v4:
         a, b = int(v4.group(1)), int(v4.group(2))
         return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
@@ -963,11 +963,14 @@ try:
                 except Exception:
                     try: raw = zlib.decompress(raw, -zlib.MAX_WBITS)
                     except Exception: pass
-            # Honor Content-Disposition filename when present.
+            # Honor Content-Disposition filename when present. Pattern is kept
+            # free of inner double-quotes so it compiles inside this template.
             cd = resp.headers.get("Content-Disposition", "") or ""
-            m = re.search(r"filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?", cd, re.I)
+            m = re.search(r"filename\\*?=(?:UTF-8'')?([^;]+)", cd, re.I)
             if m:
-                out["filename"] = urllib.parse.unquote(m.group(1))
+                name = m.group(1).strip().strip('"').strip()
+                if name:
+                    out["filename"] = urllib.parse.unquote(name)
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
             with open(output_path, "wb") as f:
                 f.write(raw)

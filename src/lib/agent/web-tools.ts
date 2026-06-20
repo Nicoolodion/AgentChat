@@ -45,10 +45,22 @@ export function buildBrowserHeaders(
   return headers;
 }
 
-/** Derive a sensible Referer from the request URL's origin. */
+/** Derive a sensible Referer from the request URL's origin.
+ *
+ *  For image-CDN subdomains (e.g. `img4.gelbooru.com`, `img2.danbooru.donmai.us`,
+ *  `cdn.*`, `static.*`, `media.*`), the asset host typically rejects or
+ *  down-serves requests that reference its own origin and expects a Referer
+ *  from the parent site. So we strip the well-known asset subdomain prefix and
+ *  use the apex domain's root as the Referer instead. */
 export function deriveReferer(url: string): string {
   try {
     const u = new URL(url);
+    const host = u.hostname;
+    // Asset/CDN subdomain prefixes whose parent site should be the Referer.
+    const m = host.match(/^(?:img\d*|cdn|static|media|assets|images?|pics?)\.(.+)/i);
+    if (m) {
+      return `${u.protocol}//${m[1]}/`;
+    }
     return `${u.protocol}//${u.host}/`;
   } catch {
     return "";
