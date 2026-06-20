@@ -1,22 +1,18 @@
 name: Build, publish and deploy
 
-# Builds the app + agent-sandbox images, pushes them to GHCR, then SSHes into
-# the Unraid host to pull the new images and restart the stack. After this is
-# set up, `git push` (or the "Run workflow" button) fully deploys — no manual
-# SSH/git-pull/web-UI steps required.
+# Builds the app + agent-sandbox + deploy-webhook images, pushes them to GHCR,
+# then POSTs to the deploy-webhook receiver to roll the stack on Unraid. After
+# this is set up, `git push` (or the "Run workflow" button) fully deploys — no
+# manual SSH/git-pull/web-UI steps required.
 #
 # Required GitHub repository secrets (Settings -> Secrets and variables -> Actions):
-#   UNRAID_HOST          e.g. 192.168.1.10  (or your domain)
-#   UNRAID_PORT          SSH port, e.g. 22  (set as plain text secret or var)
-#   UNRAID_USER          SSH user that owns the app directory
-#   UNRAID_SSH_KEY       private key (PEM) matching an authorized key on Unraid
-#   UNRAID_DEPLOY_PATH   absolute path to the repo clone on Unraid
+#   WEBHOOK_URL        e.g. https://deploy.nicoolodion.com/deploy
+#   WEBHOOK_SECRET     random string (same value as WEBHOOK_SECRET on Unraid)
 #
 # The packages are published to:
-#   ghcr.io/nicoolodion/agentchat          (app)
-#   ghcr.io/nicoolodion/agentchat-agent     (sandbox)
-# Visibility defaults to private (inherits repo visibility). The deploy host
-# authenticates via a Personal Access Token with read:packages — see README.
+#   ghcr.io/nicoolodion/agentchat           (app)
+#   ghcr.io/nicoolodion/agentchat-agent      (sandbox)
+#   ghcr.io/nicoolodion/agentchat-webhook    (deploy receiver)
 
 on:
   push:
@@ -50,6 +46,9 @@ jobs:
           - image: sandbox
             context: docker-sandbox
             target: ghcr.io/nicoolodion/agentchat-agent
+          - image: webhook
+            context: deploy
+            target: ghcr.io/nicoolodion/agentchat-webhook
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,32 +86,27 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    name: Deploy to Unraid
+    name: Trigger deploy webhook
     runs-on: ubuntu-latest
     needs: build
     # Don't auto-deploy from dependabot/PR runs; only the real master branch.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
-      - name: SSH into Unraid and roll the stack
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.UNRAID_HOST }}
-          port: ${{ secrets.UNRAID_PORT }}
-          username: ${{ secrets.UNRAID_USER }}
-          key: ${{ secrets.UNRAID_SSH_KEY }}
-          # Abort early on first error.
-          script_stop: true
-          script: |
-            set -euo pipefail
-            cd "${{ secrets.UNRAID_DEPLOY_PATH }}"
-            echo "==> Updating repo"
-            git fetch --all
-            git reset --hard origin/master
-            echo "==> Pulling new images"
-            docker compose --profile full pull
-            echo "==> Recreating containers"
-            docker compose --profile full up -d --remove-orphans
-            echo "==> Pruning dangling images"
-            docker image prune -f
-            echo "==> Done. Running containers:"
-            docker compose --profile full ps
+      - name: POST to deploy-webhook
+        run: |
+          set -euo pipefail
+          echo "Triggering ${{ secrets.WEBHOOK_URL }}"
+          code=$(curl -sS -o /tmp/body -w "%{http_code}" \
+            -X POST \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --max-time 1200 \
+            "${{ secrets.WEBHOOK_URL }}")
+          echo "----- webhook response (HTTP $code) -----"
+          cat /tmp/body
+          echo
+          echo "-----------------------------------------"
+          if [ "$code" != "200" ]; then
+            echo "Deploy failed (HTTP $code)"
+            exit 1
+          fi

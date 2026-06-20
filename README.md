@@ -50,9 +50,11 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ## Production deploy (Docker)
 
 The repo ships with a multi-stage `Dockerfile` (app), a `docker-sandbox/Dockerfile`
-(sandbox), and `docker-compose.yml`. **Images are built by GitHub Actions and
-published to GHCR** — the host only pulls prebuilt images, so updates are fast
-and put no build load on Unraid.
+(sandbox), a `deploy/Dockerfile` (deploy webhook receiver), and
+`docker-compose.yml`. **Images are built by GitHub Actions and published to GHCR**
+— the host only pulls prebuilt images, so updates are fast and put no build load
+on Unraid. Deploys are triggered over HTTPS via the webhook receiver (no inbound
+SSH to your server).
 
 ### One-time setup on Unraid
 
@@ -60,38 +62,40 @@ and put no build load on Unraid.
    touched by deploys, so your secrets survive updates):
 
    ```bash
-   git clone https://github.com/Nicoolodion/AgentChat.git /mnt/user/appdata/agentchat
-   cd /mnt/user/appdata/agentchat
+   git clone https://github.com/Nicoolodion/AgentChat.git /mnt/user/appdata/AgentChat
+   cd /mnt/user/appdata/AgentChat
    cp .env.example .env
-   # Edit .env: set NANOGPT_API_KEY + the two encryption keys + DATABASE_URL.
+   # Edit .env: set NANOGPT_API_KEY + the two encryption keys + DATABASE_URL,
+   #   plus HOST_DEPLOY_PATH (the absolute path above) and WEBHOOK_SECRET.
    ```
 
-2. Authenticate Docker to the (private) GHCR package so the host can pull:
-
-   ```bash
-   # Create a Personal Access Token with read:packages scope at
-   # https://github.com/settings/tokens  (classic), then:
-   docker login ghcr.io -u Nicoolodion
-   ```
-
-3. Start the stack (app + sandbox):
+2. Start the stack (app + sandbox + deploy-webhook):
 
    ```bash
    docker compose --profile full up -d
    ```
 
-Point your reverse proxy at `127.0.0.1:3000`. All state (DB, encrypted uploads,
-agent workspaces) persists in the host-mounted `./data` directory.
+   > If the repo is **public**, GHCR packages are public too and the host can
+   > `docker pull` them with no login. If private, run
+   > `docker login ghcr.io -u Nicoolodion` once with a PAT that has
+   > `read:packages`.
+
+3. Expose the deploy webhook through your reverse proxy. Add a new proxy host
+   (e.g. `deploy.nicoolodion.com`) forwarding to `127.0.0.1:9000` with HTTPS
+   (Let's Encrypt). The app itself is served by pointing a proxy host at
+   `127.0.0.1:3000`.
+
+Point your chat reverse proxy at `127.0.0.1:3000`. All state (DB, encrypted
+uploads, agent workspaces) persists in the host-mounted `./data` directory.
 
 ### Updating
 
-There are two equivalent ways — both only pull prebuilt images and recreate
-containers, so they're fast and identical in effect:
-
 - **Automatic (recommended):** pushing to `master` (or the Actions "Run workflow"
   button) triggers `.github/workflows/build-and-deploy.yml`, which builds & pushes
-  both images to GHCR, then SSHes into Unraid to `pull` + `up -d`. Nothing to do
-  by hand.
+  all three images to GHCR, then POSTs to `deploy.nicoolodion.com/deploy`. The
+  `deploy-webhook` container validates the secret, runs `deploy/deploy.sh`
+  (`git reset --hard origin/master` → `compose pull app agent-sandbox` →
+  recreate), and returns the log to the workflow. Nothing to do by hand.
 - **Manual:** on the host,
 
   ```bash
@@ -99,7 +103,14 @@ containers, so they're fast and identical in effect:
   docker compose --profile full up -d --remove-orphans
   ```
 
-  This is also what the Unraid web UI "Update Stack (Full)" effectively runs.
+Note: the webhook updates **app + sandbox only** — never itself (it would kill
+its own HTTP response mid-deploy). The webhook image rarely changes; when it
+does, pull + recreate it by hand:
+
+```bash
+docker compose --profile full pull deploy-webhook
+docker compose --profile full up -d --no-deps --force-recreate deploy-webhook
+```
 
 ### Required GitHub secrets (for automatic deploy)
 
@@ -107,15 +118,11 @@ In **Settings → Secrets and variables → Actions**, add:
 
 | Secret | Example | Purpose |
 | --- | --- | --- |
-| `UNRAID_HOST` | `192.168.1.10` | SSH host of the Unraid box |
-| `UNRAID_PORT` | `22` | SSH port |
-| `UNRAID_USER` | `root` | SSH user owning the app dir |
-| `UNRAID_SSH_KEY` | *(PEM)* | Private key matching an authorized key on Unraid |
-| `UNRAID_DEPLOY_PATH` | `/mnt/user/appdata/agentchat` | Absolute path to the repo clone |
+| `WEBHOOK_URL` | `https://deploy.nicoolodion.com/deploy` | HTTPS endpoint of the webhook receiver |
+| `WEBHOOK_SECRET` | *(random)* | Shared secret; must match `WEBHOOK_SECRET` in `.env` on Unraid |
 
-The SSH key needs passwordless sudo only if `docker` requires root (Unraid's
-`docker` typically works for `root`). Generate one with no passphrase:
-`ssh-keygen -t ed25519 -f deploy_key`.
+Generate the secret locally with `openssl rand -hex 32` and put the same value
+in both the GitHub secret and Unraid's `.env`.
 
 
 ## Auth and security

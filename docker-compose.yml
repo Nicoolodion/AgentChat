@@ -7,18 +7,22 @@
 # pulls prebuilt images (no local build needed -> fast updates, low host load).
 #
 # First-time setup:
-#   cp .env.example .env   # then edit secrets
-#   docker compose --profile full up -d   # lastpass: creates & starts everything
+#   cp .env.example .env   # then edit secrets (incl. HOST_DEPLOY_PATH + WEBHOOK_SECRET)
+#   docker compose --profile full up -d   # creates & starts everything
 #
-# Update (manual or triggered by CI's SSH step):
+# Update (manual: pull prebuilt images + recreate):
 #   docker compose --profile full pull && docker compose --profile full up -d
+# Update (automatic): push to master -> GitHub Actions builds + pushes images
+#   -> POSTs to deploy-webhook -> deploy.sh pulls + recreates app/sandbox.
 #
 # The companion agent sandbox lives in docker-sandbox/ and is built from its
-# own Dockerfile by the same CI workflow.
+# own Dockerfile by the same CI workflow. The deploy webhook receiver lives in
+# deploy/ and is built from deploy/Dockerfile.
 
 # Lowercase repo owner is required by GHCR.
-# App:  ghcr.io/nicoolodion/agentchat
+# App:     ghcr.io/nicoolodion/agentchat
 # Sandbox: ghcr.io/nicoolodion/agentchat-agent
+# Webhook: ghcr.io/nicoolodion/agentchat-webhook
 
 services:
   app:
@@ -89,7 +93,35 @@ services:
       - CHOWN
       - SETGID
       - SETUID
-      
+
+  # Deploy webhook receiver. Listens on 127.0.0.1:9000; expose it via your
+  # reverse proxy (e.g. deploy.<your-domain> -> 127.0.0.1:9000). GitHub Actions
+  # posts to /deploy with header X-Webhook-Secret; the container validates it,
+  # then runs deploy.sh which pulls new images and recreates app + sandbox.
+  # No profile -> always starts with `docker compose up -d`.
+  deploy-webhook:
+    image: ghcr.io/nicoolodion/agentchat-webhook:latest
+    container_name: chatinterface-deploy-webhook
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - "127.0.0.1:9000:9000"
+    # Same-path bind so docker compose (run inside, against host daemon)
+    # resolves relative volume binds correctly. Must be the absolute host
+    # path that contains this docker-compose.yml.
+    volumes:
+      - ${HOST_DEPLOY_PATH}:${HOST_DEPLOY_PATH}
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - HOST_DEPLOY_PATH=${HOST_DEPLOY_PATH}
+      - PORT=9000
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 networks:
   app-net:
     driver: bridge
