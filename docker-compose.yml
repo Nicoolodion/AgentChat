@@ -105,7 +105,9 @@ services:
     restart: unless-stopped
     pull_policy: always
     ports:
-      - "127.0.0.1:9000:9000"
+      - "9000:9000"
+    networks:
+      - app-net
     # Same-path bind so docker compose (run inside, against host daemon)
     # resolves relative volume binds correctly. Must be the absolute host
     # path that contains this docker-compose.yml.
