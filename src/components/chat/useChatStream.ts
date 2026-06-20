@@ -23,7 +23,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ChatDetail,
   ChatMessage,
-  ChatToolCall,
   MessageAttachmentRef,
   ReasoningEffort,
   UploadedAttachment,
@@ -73,6 +72,10 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
   const sendAbortRef = useRef<AbortController | null>(null);
   const restoreAbortRef = useRef<AbortController | null>(null);
   const lastSyncedChatIdRef = useRef<string | null>(null);
+  // True while re-attaching to a session that is still running on the server.
+  // On `done` we then pull the freshly-persisted chat detail so the timeline
+  // reflects the canonical assistant message (tool calls + segments).
+  const liveRestoreRef = useRef(false);
 
   // Re-sync state when the parent switches to a different chat. We only
   // depend on chat.id — chat.messages gets a fresh array reference on every
@@ -159,6 +162,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
       let streamStart = Date.now();
       let liveTps: number | undefined;
       let currentReasoningSegment = "";
+      let currentContentSegment = "";
       let currentToolCallIdx = 0;
 
       const pushReasoningSegment = () => {
@@ -176,6 +180,23 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
           });
           currentReasoningSegment = "";
         }
+      };
+
+      const pushContentSegment = () => {
+        if (currentContentSegment.trim().length > 0) {
+          const segText = currentContentSegment;
+          const segIdx = currentToolCallIdx;
+          setMessages((current) => {
+            const copy = current.slice();
+            const idx = copy.length - 1;
+            if (idx < 0) return current;
+            const last = copy[idx]!;
+            const segs = last.contentSegments ?? [];
+            copy[idx] = { ...last, contentSegments: [...segs, { text: segText, beforeToolIndex: segIdx }] };
+            return copy;
+          });
+        }
+        currentContentSegment = "";
       };
 
       const applyContent = (updater: (msg: ChatMessage) => ChatMessage) => {
@@ -226,6 +247,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             totalTokens += data.text.length;
             const elapsed = Math.max((Date.now() - streamStart) / 1000, 0.1);
             liveTps = totalTokens / elapsed;
+            currentContentSegment += data.text;
             applyContent((m) => ({
               ...m,
               content: m.content + data.text,
@@ -245,30 +267,20 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
           }
           if (event === "tool_start") {
             pushReasoningSegment();
+            pushContentSegment();
             const tcId = (data.toolCallId as string) ?? `tc-${Date.now()}`;
             const args = (data.arguments as Record<string, unknown> | undefined) ?? undefined;
             if (args) {
               setToolArguments((prev) => ({ ...prev, [tcId]: args }));
             }
             currentToolCallIdx++;
-            applyContent((m) => {
-              const existing = m.toolCalls ?? [];
-              return {
-                ...m,
-                toolCalls: [
-                  ...existing,
-                  {
-                    toolCallId: tcId,
-                    toolName: (data.toolName as string) ?? "unknown",
-                    status: "running",
-                  },
-                ],
-                _isStreaming: true,
-              };
-            });
+            applyContent((m) => applyToolEventToMessage(m, "tool_start", data) ?? m);
             return;
           }
           if (event === "tool_output") {
+            // Streamed output lives in toolOutputs (live display) + the
+            // persisted toolCall.output (server-side). No per-chunk message
+            // mutation here — avoids N×M re-renders for chunked output.
             appendOutput({
               toolCallId: (data.toolCallId as string) ?? "",
               output: (data.output as string) ?? "",
@@ -276,15 +288,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             return;
           }
           if (event === "tool_done") {
-            const id = (data.toolCallId as string) ?? "";
-            applyContent((m) => {
-              const tcs = (m.toolCalls ?? []).map((tc) =>
-                tc.toolCallId === id || tc.toolName === data.toolName
-                  ? { ...tc, status: data.ok ? ("success" as const) : ("error" as const), durationMs: data.durationMs as number }
-                  : tc,
-              );
-              return { ...m, toolCalls: tcs, _isStreaming: true };
-            });
+            applyContent((m) => applyToolEventToMessage(m, "tool_done", data) ?? m);
             return;
           }
           if (event === "error") {
@@ -293,6 +297,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
           }
           if (event === "done") {
             pushReasoningSegment();
+            pushContentSegment();
             const asst = data.assistantMessage as ChatMessage | undefined;
             const usr = data.userMessage as ChatMessage | undefined;
             // Replace the optimistic user message id with the persisted one so
@@ -316,9 +321,13 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
                 ...asst,
                 _isStreaming: false,
                 ttftMs: asst.ttftMs ?? m.ttftMs,
-                toolCalls: m.toolCalls ?? asst.toolCalls,
+                // Prefer the server-persisted tool calls/segments (they carry
+                // arguments + output and survive refresh); fall back to the
+                // live in-memory copies when the server omitted them.
+                toolCalls: asst.toolCalls ?? m.toolCalls,
                 reasoning: asst.reasoning ?? m.reasoning,
-                reasoningSegments: m.reasoningSegments,
+                reasoningSegments: asst.reasoningSegments ?? m.reasoningSegments,
+                contentSegments: asst.contentSegments ?? m.contentSegments,
                 avgTokensPerSecond: asst.avgTokensPerSecond ?? m.avgTokensPerSecond,
               }));
             } else {
@@ -347,6 +356,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
     if (restoreAbortRef.current) restoreAbortRef.current.abort();
     const ac = new AbortController();
     restoreAbortRef.current = ac;
+    liveRestoreRef.current = false;
 
     const agentSessionId = chat.agentSession?.id;
     if (!agentSessionId) return;
@@ -383,39 +393,53 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             const sess = data.session as { status?: string };
             if (sess?.status === "thinking" || sess?.status === "executing") {
               setSending(true);
-              // Mark the last assistant message (if any) as streaming so the
-              // live cursor stays on while we replay tool calls.
-              applyContent((m) =>
-                m.role === "assistant" ? { ...m, _isStreaming: true } : m,
-              );
+              liveRestoreRef.current = true;
+              // If the in-flight assistant message isn't persisted yet (the last
+              // row is the user message), create a streaming placeholder so the
+              // replayed tool calls have somewhere to attach on the timeline.
+              setMessages((current) => {
+                const copy = current.slice();
+                const idx = copy.length - 1;
+                if (idx < 0) return current;
+                const last = copy[idx]!;
+                if (last.role === "assistant") {
+                  copy[idx] = { ...last, _isStreaming: true };
+                  return copy;
+                }
+                copy.push({
+                  id: `temp-restore-${agentSessionId}`,
+                  role: "assistant",
+                  content: "",
+                  createdAt: new Date().toISOString(),
+                  _isStreaming: true,
+                });
+                return copy;
+              });
             }
             return;
           }
           if (event === "replay_tool_start") {
-            const id = data.toolCallId as string;
-            const call: ChatToolCall = {
-              toolCallId: id,
-              toolName: data.toolName as string,
-              status: "running",
-            };
+            const id = (data.toolCallId as string) ?? "";
             const args = (data.arguments as Record<string, unknown> | undefined) ?? undefined;
-            if (args) {
+            if (args && id) {
               setToolArguments((prev) => ({ ...prev, [id]: args }));
             }
-            // If the message we care about is the last assistant one, push the call
             setMessages((current) => {
               const copy = current.slice();
               const idx = copy.length - 1;
               if (idx < 0) return current;
               const last = copy[idx]!;
               if (last.role !== "assistant") return current;
-              const tcs = last.toolCalls ?? [];
-              copy[idx] = { ...last, toolCalls: [...tcs, call] };
+              const updated = applyToolEventToMessage(last, "replay_tool_start", data);
+              if (!updated) return current;
+              copy[idx] = updated;
               return copy;
             });
             return;
           }
           if (event === "replay_tool_output") {
+            // Live output is displayed via toolOutputs; persisted call.output is
+            // loaded from chat detail after the session finishes (see `done`).
             appendOutput({
               toolCallId: data.toolCallId as string,
               output: data.output as string,
@@ -423,19 +447,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
             return;
           }
           if (event === "replay_tool_done") {
-            const id = data.toolCallId as string;
-            applyContent((m) => {
-              const tcs = (m.toolCalls ?? []).map((tc) =>
-                tc.toolCallId === id
-                  ? {
-                      ...tc,
-                      status: data.ok ? ("success" as const) : ("error" as const),
-                      durationMs: data.durationMs as number,
-                    }
-                  : tc,
-              );
-              return { ...m, toolCalls: tcs };
-            });
+            applyContent((m) => applyToolEventToMessage(m, "replay_tool_done", data) ?? m);
             return;
           }
           if (event === "status") {
@@ -447,6 +459,46 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
           if (event === "done") {
             setSending(false);
             applyContent((m) => (m._isStreaming ? { ...m, _isStreaming: false } : m));
+            // If we re-attached to a live session that has now finished, pull
+            // the freshly-persisted chat detail so the timeline shows the
+            // canonical assistant message (tool calls w/ arguments + output and
+            // ordered content/reasoning segments) instead of the placeholder.
+            if (liveRestoreRef.current) {
+              liveRestoreRef.current = false;
+              void (async () => {
+                // The orchestrator flips session status to "completed" before
+                // the messages route persists the assistant row, so the stream's
+                // `done` can arrive a moment too early. Retry until the last
+                // message is a real persisted assistant row (not our
+                // `temp-restore-*` placeholder).
+                const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+                for (let attempt = 0; attempt < 8; attempt++) {
+                  if (ac.signal.aborted) return;
+                  try {
+                    const res = await fetch(`/api/chats/${chat.id}`, {
+                      headers: { "X-Requested-With": "ChatInterface" },
+                      signal: ac.signal,
+                    });
+                    if (res.ok) {
+                      const detail = (await res.json().catch(() => null)) as { chat?: ChatDetail } | null;
+                      const msgs = detail?.chat?.messages;
+                      if (msgs && msgs.length) {
+                        const last = msgs[msgs.length - 1]!;
+                        if (last.role === "assistant" && !last.id.startsWith("temp-restore-")) {
+                          setMessages(msgs);
+                          setToolOutputs({});
+                          setToolArguments({});
+                          return;
+                        }
+                      }
+                    }
+                  } catch {
+                    // keep retrying
+                  }
+                  await sleep(450);
+                }
+              })();
+            }
             if (onChatsRefresh) void onChatsRefresh();
           }
           if (event === "error") {
@@ -458,7 +510,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
         // ignore network errors during restore
       }
     })();
-  }, [chat.agentSession?.id, onChatsRefresh]);
+  }, [chat.id, chat.agentSession?.id, onChatsRefresh, onSseEvent]);
 
   // Trigger restore on chat change
   useEffect(() => {
@@ -517,4 +569,55 @@ export async function consumeSse(
       }
     }
   }
+}
+
+// ── Shared tool-event reducer ────────────────────────────────────────────────
+// Both the fresh `send` stream and the `restore` replay stream mutate the
+// assistant message's `toolCalls` array the same way. Centralizing it prevents
+// drift between the two code paths. `tool_output` events are intentionally NOT
+// handled here — streamed output lives in the `toolOutputs` state during a live
+// session and on the persisted tool call after refresh; stashing it per-chunk
+// onto the message would double state updates for every output chunk.
+export function applyToolEventToMessage(
+  msg: ChatMessage,
+  event:
+    | "tool_start"
+    | "replay_tool_start"
+    | "tool_done"
+    | "replay_tool_done",
+  data: Record<string, unknown>,
+): ChatMessage | null {
+  if (event === "tool_start" || event === "replay_tool_start") {
+    const tcId = (data.toolCallId as string) ?? `tc-${Date.now()}`;
+    const existing = msg.toolCalls ?? [];
+    // Avoid duplicates when the server replays the same call twice.
+    if (existing.some((tc) => tc.toolCallId === tcId)) return null;
+    return {
+      ...msg,
+      toolCalls: [
+        ...existing,
+        {
+          toolCallId: tcId,
+          toolName: (data.toolName as string) ?? "unknown",
+          status: "running",
+          arguments: (data.arguments as Record<string, unknown> | undefined) ?? undefined,
+        },
+      ],
+      _isStreaming: true,
+    };
+  }
+  // tool_done / replay_tool_done — match by id only (avoids matching the
+  // wrong call when two calls share a tool name).
+  const id = (data.toolCallId as string) ?? "";
+  const tcs = (msg.toolCalls ?? []).map((tc) =>
+    tc.toolCallId === id
+      ? {
+          ...tc,
+          status: data.ok ? ("success" as const) : ("error" as const),
+          durationMs: data.durationMs as number,
+          error: (data.error as string) ?? tc.error,
+        }
+      : tc,
+  );
+  return { ...msg, toolCalls: tcs };
 }

@@ -347,7 +347,7 @@ function TextStep({ text, isStreaming }: { text: string; isStreaming: boolean })
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function buildSteps(
+export function buildSteps(
   message: ChatMessage,
   toolOutputs: ToolOutputEntry[],
   toolArguments?: Record<string, Record<string, unknown>>,
@@ -356,41 +356,75 @@ function buildSteps(
 
   const toolCalls = message.toolCalls ?? [];
   const hasReasoningSegments = message.reasoningSegments && message.reasoningSegments.length > 0;
+  const hasContentSegments = message.contentSegments && message.contentSegments.length > 0;
 
-  if (hasReasoningSegments) {
-    const segments = message.reasoningSegments!;
+  // Resolve the args/output for a tool call. Prefer the values persisted on the
+  // message (survive refresh / export); fall back to the live in-memory maps
+  // passed in from useChatStream during streaming.
+  const resolveCall = (call: ChatToolCall) => {
+    const args = call.arguments ?? toolArguments?.[call.toolCallId];
+    const liveOutputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
+    const outputs =
+      liveOutputs.length > 0
+        ? liveOutputs
+        : call.output
+          ? [{ toolCallId: call.toolCallId, output: call.output }]
+          : [];
+    return { arguments: args, outputs };
+  };
 
-    for (let i = 0; i < toolCalls.length; i++) {
-      for (const seg of segments) {
+  // Helper: push any reasoning + content segments positioned *before* tool index
+  // `i`, in emission order (reasoning first, then content).
+  const pushSegmentsBefore = (i: number) => {
+    if (hasReasoningSegments) {
+      for (const seg of message.reasoningSegments!) {
         if (seg.beforeToolIndex === i && seg.text.trim().length > 0) {
-          steps.push({ kind: "reasoning", id: `r-${message.id}-s${i}`, text: seg.text });
+          steps.push({ kind: "reasoning", id: `r-${message.id}-s${i}-${steps.length}`, text: seg.text });
         }
       }
-      const call = toolCalls[i]!;
-      const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
-      const args = toolArguments?.[call.toolCallId];
-      steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
     }
+    if (hasContentSegments) {
+      for (const seg of message.contentSegments!) {
+        if (seg.beforeToolIndex === i && seg.text.trim().length > 0) {
+          steps.push({ kind: "text", id: `x-${message.id}-s${i}-${steps.length}`, text: seg.text });
+        }
+      }
+    }
+  };
 
-    for (const seg of segments) {
-      if (seg.beforeToolIndex >= toolCalls.length && seg.text.trim().length > 0) {
-        steps.push({ kind: "reasoning", id: `r-${message.id}-tail-${seg.beforeToolIndex}`, text: seg.text });
+  if (hasReasoningSegments || hasContentSegments) {
+    const reasoningSegmentsArr = message.reasoningSegments ?? [];
+    const contentSegmentsArr = message.contentSegments ?? [];
+    const maxIndex = Math.max(
+      toolCalls.length,
+      ...reasoningSegmentsArr.map((s) => s.beforeToolIndex + 1),
+      ...contentSegmentsArr.map((s) => s.beforeToolIndex + 1),
+      0,
+    );
+
+    for (let i = 0; i < maxIndex; i++) {
+      pushSegmentsBefore(i);
+      const call = toolCalls[i];
+      if (call) {
+        const { arguments: args, outputs } = resolveCall(call);
+        steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
       }
     }
   } else {
+    // Legacy fallback: no segment info (e.g. non-agent assistant turn). Show one
+    // reasoning block at top + tools + a single trailing text block.
     if (message.reasoning && message.reasoning.trim().length > 0) {
       steps.push({ kind: "reasoning", id: `r-${message.id}`, text: message.reasoning });
     }
 
     for (const call of toolCalls) {
-      const outputs = toolOutputs.filter((o) => o.toolCallId === call.toolCallId);
-      const args = toolArguments?.[call.toolCallId];
+      const { arguments: args, outputs } = resolveCall(call);
       steps.push({ kind: "tool", id: `t-${message.id}-${call.toolCallId}`, call, arguments: args, outputs });
     }
-  }
 
-  if (message.content && message.content.trim().length > 0) {
-    steps.push({ kind: "text", id: `x-${message.id}`, text: message.content });
+    if (message.content && message.content.trim().length > 0) {
+      steps.push({ kind: "text", id: `x-${message.id}`, text: message.content });
+    }
   }
 
   return steps;

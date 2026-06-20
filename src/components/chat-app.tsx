@@ -630,12 +630,28 @@ export function ChatApp() {
     let content: string;
     let filename: string;
     if (format === "json") {
+      // activeChat.messages[].toolCalls now carry arguments + output, so the
+      // exported JSON is a faithful record of the whole conversation.
       content = JSON.stringify(activeChat, null, 2);
       filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.json`;
     } else {
       const lines = activeChat.messages.map((m) => {
         const role = m.role === "user" ? "**You**" : m.role === "assistant" ? "**Assistant**" : m.role;
-        return `${role}:\n${m.content}`;
+        let body = m.content;
+        const toolCalls = m.toolCalls ?? [];
+        if (toolCalls.length > 0) {
+          const toolBlock = toolCalls
+            .map((tc) => {
+              const args = tc.arguments ? JSON.stringify(tc.arguments) : "—";
+              const status = tc.status === "error" ? " (failed)" : "";
+              const header = "- tool `" + tc.toolName + "`" + status + "  args: " + args;
+              const out = tc.output ? "\n```\n" + tc.output.slice(0, 2000) + "\n```" : "";
+              return header + out;
+            })
+            .join("\n");
+          body = `${m.content}\n\n#### Tool calls\n${toolBlock}`.trim();
+        }
+        return `${role}:\n${body}`;
       });
       content = `# ${activeChat.title}\n\n${lines.join("\n\n---\n\n")}`;
       filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.md`;

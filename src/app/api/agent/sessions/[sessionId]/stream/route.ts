@@ -76,40 +76,47 @@ export async function GET(
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        // 1. Hand the client back the current session state + everything we have so far.
+        // 1. Hand the client back the current session state.
         sse(controller, "session", { session });
 
-        for (const tc of toolCalls) {
-          sse(controller, "replay_tool_start", {
-            toolCallId: tc.id,
-            toolName: tc.toolName,
-            arguments: safeParseArgs(tc.arguments),
-            timestamp: tc.createdAt.getTime(),
-          });
-          if (tc.result) {
-            sse(controller, "replay_tool_output", {
-              toolCallId: tc.id,
-              output: tc.result.slice(0, 4000),
-              timestamp: tc.createdAt.getTime() + 1,
-            });
-          }
-          if (tc.status === "success") {
-            sse(controller, "replay_tool_done", {
+        // Only replay persisted tool calls when the session is still running.
+        // For completed/error/idle sessions the assistant message already
+        // carries its tool calls (incl. arguments + output) — they are loaded
+        // from the chat detail endpoint, so replaying here would only
+        // duplicate them on the wrong message.
+        if (isLive) {
+          for (const tc of toolCalls) {
+            sse(controller, "replay_tool_start", {
               toolCallId: tc.id,
               toolName: tc.toolName,
-              ok: true,
-              durationMs: tc.durationMs ?? 0,
-              timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
+              arguments: safeParseArgs(tc.arguments),
+              timestamp: tc.createdAt.getTime(),
             });
-          } else if (tc.status === "error") {
-            sse(controller, "replay_tool_done", {
-              toolCallId: tc.id,
-              toolName: tc.toolName,
-              ok: false,
-              durationMs: tc.durationMs ?? 0,
-              error: tc.error ?? undefined,
-              timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
-            });
+            if (tc.result) {
+              sse(controller, "replay_tool_output", {
+                toolCallId: tc.id,
+                output: tc.result.slice(0, 4000),
+                timestamp: tc.createdAt.getTime() + 1,
+              });
+            }
+            if (tc.status === "success") {
+              sse(controller, "replay_tool_done", {
+                toolCallId: tc.id,
+                toolName: tc.toolName,
+                ok: true,
+                durationMs: tc.durationMs ?? 0,
+                timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
+              });
+            } else if (tc.status === "error") {
+              sse(controller, "replay_tool_done", {
+                toolCallId: tc.id,
+                toolName: tc.toolName,
+                ok: false,
+                durationMs: tc.durationMs ?? 0,
+                error: tc.error ?? undefined,
+                timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
+              });
+            }
           }
         }
 

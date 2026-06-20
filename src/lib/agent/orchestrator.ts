@@ -11,7 +11,7 @@
 
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions/completions";
 
-import type { ReasoningEffort } from "@/lib/chat-types";
+import type { MessageSegment, ReasoningEffort } from "@/lib/chat-types";
 import { env } from "@/lib/env";
 import {
   getOpenAIClientForModel,
@@ -27,6 +27,19 @@ import {
 } from "./types";
 import { safeParseArgs } from "./parse-args";
 import { AGENT_TOOL_SCHEMAS, SKILL_EXTENSIONS, buildSystemPrompt } from "./tool-schemas";
+import {
+  buildBrowserHeaders,
+  classifyContentType,
+  describeBinaryResponse,
+  extractPageMeta,
+  htmlToMarkdown,
+  htmlToText,
+  isHtmlBody,
+  stripNonContent,
+  truncateForOutput,
+  validateFetchUrl,
+  type FetchFormat,
+} from "./web-tools";
 import {
   sandboxConvertDocxToPdf,
   sandboxConvertHtmlToPdf,
@@ -131,7 +144,13 @@ export async function runAgentExecution(input: {
   signal?: AbortSignal;
   reasoningEffort?: ReasoningEffort;
   modelContextLength?: number;
-}): Promise<{ content: string; reasoning?: string; toolCallsCount: number }> {
+}): Promise<{
+  content: string;
+  reasoning?: string;
+  reasoningSegments?: MessageSegment[];
+  contentSegments?: MessageSegment[];
+  toolCallsCount: number;
+}> {
   const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort, modelContextLength } = input;
 
   // Check sandbox availability before starting
@@ -192,6 +211,27 @@ export async function runAgentExecution(input: {
   let toolCallsCount = 0;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
 
+  // Ordered content/reasoning segments, indexed by the number of tool calls
+  // that had already started when the segment was emitted. This is what lets
+  // the UI render text/reasoning *between* tool calls in true emission order
+  // (and survive a page refresh, since we persist these on the message).
+  const contentSegments: MessageSegment[] = [];
+  const reasoningSegments: MessageSegment[] = [];
+  let currentContentSeg = "";
+  let currentReasoningSeg = "";
+  let startedToolCount = 0;
+
+  const flushSegments = () => {
+    if (currentReasoningSeg.trim().length > 0) {
+      reasoningSegments.push({ text: currentReasoningSeg, beforeToolIndex: startedToolCount });
+    }
+    if (currentContentSeg.trim().length > 0) {
+      contentSegments.push({ text: currentContentSeg, beforeToolIndex: startedToolCount });
+    }
+    currentReasoningSeg = "";
+    currentContentSeg = "";
+  };
+
   // Resolve the reasoning_effort capability once (the route may have already
   // warmed the catalog cache via resolveModelContextLength).
   const effectiveReasoningEffort = await resolveReasoningEffort(model, reasoningEffort);
@@ -236,12 +276,14 @@ export async function runAgentExecution(input: {
       const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
       if (reasoningDelta) {
         finalReasoning += reasoningDelta;
+        currentReasoningSeg += reasoningDelta;
         sendEvent({ type: "reasoning", data: { text: reasoningDelta } });
       }
 
       if (delta.content) {
         contentBuffer += delta.content;
         finalContent += delta.content;
+        currentContentSeg += delta.content;
         sendEvent({ type: "content", data: { text: delta.content } });
       }
 
@@ -270,6 +312,12 @@ export async function runAgentExecution(input: {
     // Validate and finalize tool calls
     const validToolCalls = accumulatedToolCalls.filter((tc) => tc?.function?.name);
 
+    // Anything the model emitted as reasoning/content *before* these tool calls
+    // belongs to a segment positioned just before them.
+    if (validToolCalls.length > 0) {
+      flushSegments();
+    }
+
     // Emit tool_start events once arguments are fully assembled
     for (const tc of validToolCalls) {
       sendEvent({
@@ -280,13 +328,22 @@ export async function runAgentExecution(input: {
           arguments: safeParseArgs(tc.function.arguments),
         },
       });
+      startedToolCount++;
     }
 
     if (validToolCalls.length === 0) {
-      // No tool calls — we're done
+      // No tool calls — we're done. Flush any trailing reasoning/content as the
+      // final tail segment (positioned after the last tool, if any).
+      flushSegments();
       await updateSessionStatus(sessionId, "completed");
       sendEvent({ type: "status", data: { status: "completed" } });
-      return { content: contentBuffer || finalContent, reasoning: finalReasoning || undefined, toolCallsCount };
+      return {
+        content: finalContent,
+        reasoning: finalReasoning || undefined,
+        reasoningSegments: reasoningSegments.length ? reasoningSegments : undefined,
+        contentSegments: contentSegments.length ? contentSegments : undefined,
+        toolCallsCount,
+      };
     }
 
     // Execute tool calls
@@ -345,7 +402,9 @@ export async function runAgentExecution(input: {
     }
 
     if (toolCallsCount > maxToolCalls) {
-      finalContent += "\n\n[Reached maximum number of tool calls for this session.]";
+      const notice = "\n\n[Reached maximum number of tool calls for this session.]";
+      finalContent += notice;
+      currentContentSeg += notice;
       break;
     }
   }
@@ -353,12 +412,21 @@ export async function runAgentExecution(input: {
   if (signal?.aborted) {
     await updateSessionStatus(sessionId, "idle");
     sendEvent({ type: "status", data: { status: "idle", step: "Stopped by user" } });
-    finalContent += "\n\n[Session stopped by user.]";
+    const notice = "\n\n[Session stopped by user.]";
+    finalContent += notice;
+    currentContentSeg += notice;
   } else {
     await updateSessionStatus(sessionId, "completed");
     sendEvent({ type: "status", data: { status: "completed" } });
   }
-  return { content: finalContent, reasoning: finalReasoning || undefined, toolCallsCount };
+  flushSegments();
+  return {
+    content: finalContent,
+    reasoning: finalReasoning || undefined,
+    reasoningSegments: reasoningSegments.length ? reasoningSegments : undefined,
+    contentSegments: contentSegments.length ? contentSegments : undefined,
+    toolCallsCount,
+  };
 }
 
 // ── Tool execution dispatcher ────────────────────────────────────────────────
@@ -600,99 +668,245 @@ async function executeSandboxTool(
       const maxResults = Math.min(Math.max(Number(args.max_results ?? 5), 1), 10);
       const searxngUrl = process.env.SEARXNG_URL ?? "";
       const searchCode = `
-import json, urllib.request, urllib.parse, os, re
+import json, urllib.request, urllib.parse, re, html as html_mod
+
 query = ${JSON.stringify(query)}
 max_results = ${maxResults}
 searxng_url = ${JSON.stringify(searxngUrl)}
+ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+def fetch(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
 results = []
+error = None
 try:
     if searxng_url:
-        req = urllib.request.Request(
-            f"{searxng_url.rstrip('/')}/search?q={urllib.parse.quote(query)}&format=json",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        url = f"{searxng_url.rstrip('/')}/search?q={urllib.parse.quote(query)}&format=json"
+        data = json.loads(fetch(url, {"User-Agent": ua, "Accept": "application/json"}))
         for item in data.get("results", [])[:max_results]:
             results.append({"title": item.get("title", ""), "url": item.get("url", ""), "snippet": item.get("content", "")})
     else:
-        req = urllib.request.Request(
-            f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        for topic in data.get("RelatedTopics", [])[:max_results]:
-            if isinstance(topic, dict) and "Text" in topic:
-                results.append({"title": topic.get("Text", "")[:80], "url": topic.get("FirstURL", ""), "snippet": topic.get("Text", "")})
+        # DuckDuckGo HTML endpoint — tolerant parsing (no reliance on exact class names).
+        ddg = fetch(f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}")
+        # Result blocks are anchored by result__url links.
+        blocks = re.split(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*', ddg)
+        for b in blocks[1:max_results + 1]:
+            href_m = re.match(r'href="([^"]+)"', b)
+            if not href_m:
+                continue
+            href = href_m.group(1)
+            # DDG wraps links in /l/?uddg=<encoded>; unwrap.
+            m = re.search(r'uddg=([^&]+)', href)
+            if m:
+                href = urllib.parse.unquote(m.group(1))
+            text_m = re.search(r'>([^<]*)<', b)
+            title = html_mod.unescape(text_m.group(1).strip()) if text_m else ""
+            snippet_m = re.search(r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\\s\\S]*?)</a>', b)
+            snippet = ""
+            if snippet_m:
+                snippet = html_mod.unescape(re.sub(r"<[^>]+>", "", snippet_m.group(1))).strip()
+            if href:
+                results.append({"title": title, "url": href, "snippet": snippet})
         if not results:
-            req = urllib.request.Request(
-                f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-            for m in re.finditer(r'<a rel="nofollow" class="result__a" href="([^"]+)">([^<]+)</a>', html):
-                if len(results) >= max_results:
-                    break
-                results.append({"title": m.group(2).strip(), "url": m.group(1), "snippet": ""})
-            snippets = re.findall(r'<a class="result__snippet"[^>]*>([^<]+)</a>', html)
-            for i, s in enumerate(snippets):
-                if i < len(results):
-                    results[i]["snippet"] = s.strip()
-    print(json.dumps(results))
+            # Last-ditch: DDG JSON api (instant answers).
+            data = json.loads(fetch(f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1"))
+            for topic in data.get("RelatedTopics", [])[:max_results]:
+                if isinstance(topic, dict) and "Text" in topic:
+                    results.append({"title": topic.get("Text", "")[:80], "url": topic.get("FirstURL", ""), "snippet": topic.get("Text", "")})
+        if not results:
+            error = "No search results returned for query"
 except Exception as e:
-    print(json.dumps({"error": str(e)}))
+    error = str(e)
+
+print(json.dumps({"results": results[:max_results], "error": error}))
 `;
       const res = await sandboxExecPython(sessionId, searchCode, 30);
-      let parsed: unknown = [];
+      let parsed: { results?: unknown[]; error?: string } = { results: [], error: undefined };
       try {
-        parsed = JSON.parse(res.stdout.trim().split("\n").pop() ?? "[]");
-      } catch { /* ignore */ }
-      return { ok: !res.error, result: parsed, stdout: res.stdout };
+        const lastLine = (res.stdout || "").trim().split("\n").filter(Boolean).pop() ?? "";
+        parsed = JSON.parse(lastLine);
+      } catch { /* ignore parse error */ }
+      const results = Array.isArray(parsed.results) ? parsed.results : [];
+      const stdout = JSON.stringify(results, null, 2);
+      return {
+        ok: !res.error && !parsed.error,
+        result: { results, error: parsed.error },
+        error: parsed.error ?? (res.error || undefined),
+        stdout,
+      };
     }
     case "web_fetch": {
       const url = String(args.url ?? "");
-      const format = (args.format as "html" | "text" | "markdown") ?? "text";
+      const format = (args.format as FetchFormat) ?? "text";
+      // SSRF guard: reject non-http(s) and private/loopback/internal hosts
+      // before issuing the request.
+      const urlValidation = validateFetchUrl(url);
+      if (!urlValidation.ok) {
+        return { ok: false, error: urlValidation.error, result: { url }, stdout: urlValidation.error };
+      }
+      const headers = buildBrowserHeaders(url);
       const fetchCode = `
-import urllib.request, re
+import json, urllib.request, urllib.parse, gzip, zlib
+
+def is_blocked_host(host):
+    host = (host or "").lower().strip("[]")
+    blocked = {"localhost", "metadata.google.internal", "metadata", "169.254.169.254", "metadata.aws.internal"}
+    if host in blocked:
+        return True
+    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
+        return True
+    v4 = __import__("re").match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
+    if v4:
+        a, b = int(v4.group(1)), int(v4.group(2))
+        return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
+    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
+        return True
+    return False
+
 url = ${JSON.stringify(url)}
+headers = ${JSON.stringify(headers)}
+out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "body": None, "error": None}
 try:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
-    fmt = ${JSON.stringify(format)}
-    if fmt == "text":
-        text = re.sub(r'<[^>]+>', ' ', html)
-        text = re.sub(r'\\s+', ' ', text).strip()
-        print(text[:12000])
-    elif fmt == "markdown":
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        raw = resp.read()
+        out["status"] = resp.status
+        out["content_type"] = resp.headers.get("Content-Type", "") or ""
+        out["final_url"] = resp.geturl()
+        out["size"] = len(raw)
+        # Re-validate the final (post-redirect) host to block SSRF via redirect.
         try:
-            from markdownify import markdownify as md
-            print(md(html)[:12000])
-        except ImportError:
-            result = html
-            result = re.sub(r'<script[^>]*>[\\s\\S]*?</script>', '', result, flags=re.IGNORECASE)
-            result = re.sub(r'<style[^>]*>[\\s\\S]*?</style>', '', result, flags=re.IGNORECASE)
-            for i in range(1, 7):
-                result = re.sub(rf'<h{i}[^>]*>([\\s\\S]*?)</h{i}>', '#' * i + r' \\1\\n', result, flags=re.IGNORECASE)
-            result = re.sub(r'<p[^>]*>([\\s\\S]*?)</p>', r'\\1\\n\\n', result, flags=re.IGNORECASE)
-            result = re.sub(r'<li[^>]*>([\\s\\S]*?)</li>', r'- \\1\\n', result, flags=re.IGNORECASE)
-            result = re.sub(r'<a[^>]*href="([^"]+)"[^>]*>([\\s\\S]*?)</a>', r'[\\2](\\1)', result, flags=re.IGNORECASE)
-            result = re.sub(r'<(strong|b)[^>]*>([\\s\\S]*?)</(strong|b)>', r'**\\2**', result, flags=re.IGNORECASE)
-            result = re.sub(r'<(em|i)[^>]*>([\\s\\S]*?)</(em|i)>', r'*\\2*', result, flags=re.IGNORECASE)
-            result = re.sub(r'<code[^>]*>([\\s\\S]*?)</code>', chr(96) + r'\\1' + chr(96), result, flags=re.IGNORECASE)
-            result = re.sub(r'<[^>]+>', ' ', result)
-            result = re.sub(r'\\n{3,}', '\\n\\n', result)
-            result = re.sub(r' {2,}', ' ', result)
-            print(result.strip()[:12000])
-    else:
-        print(html[:15000])
+            final_host = urllib.parse.urlparse(out["final_url"]).hostname or ""
+        except Exception:
+            final_host = ""
+        if is_blocked_host(final_host):
+            out["error"] = f"Blocked redirect to private/internal host: {final_host}"
+        else:
+            if resp.headers.get("Content-Encoding") == "gzip":
+                try: raw = gzip.decompress(raw)
+                except Exception: pass
+            elif resp.headers.get("Content-Encoding") == "deflate":
+                try: raw = zlib.decompress(raw)
+                except Exception:
+                    try: raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    except Exception: pass
+            ct = out["content_type"].lower()
+            looks_text = ct == "" or ct.startswith("text/") or "json" in ct or "xml" in ct or "javascript" in ct or "xhtml" in ct
+            # Don't treat a missing content-type as text if the body looks binary.
+            if ct == "" and b"\\x00" in raw[:4096]:
+                looks_text = False
+            if looks_text:
+                charset = "utf-8"
+                if "charset=" in ct:
+                    charset = ct.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+                try:
+                    body = raw.decode(charset, errors="replace")
+                except LookupError:
+                    body = raw.decode("utf-8", errors="replace")
+                out["body"] = body[:250000]
+            else:
+                out["body"] = None
+    out["ok"] = True if not out["error"] else False
+except urllib.error.HTTPError as e:
+    out["status"] = e.code
+    out["error"] = f"HTTP Error {e.code}: {e.reason}"
+    try:
+        raw = e.read()
+        ct = e.headers.get("Content-Type", "") or ""
+        out["content_type"] = ct
+        out["size"] = len(raw)
+        cl = ct.lower()
+        if cl.startswith("text/") or "json" in cl or "xml" in cl:
+            out["body"] = raw.decode("utf-8", errors="replace")[:250000]
+    except Exception:
+        pass
 except Exception as e:
-    print(f"Fetch error: {e}")
+    out["error"] = f"Fetch error: {e}"
+print(json.dumps(out))
 `;
-      const res = await sandboxExecPython(sessionId, fetchCode, 30);
-      return { ok: !res.error, result: { content: res.stdout }, stdout: res.stdout };
+      const res = await sandboxExecPython(sessionId, fetchCode, 35);
+
+      let parsed: {
+        ok?: boolean;
+        status?: number;
+        content_type?: string;
+        final_url?: string;
+        size?: number;
+        body?: string | null;
+        error?: string | null;
+      } = {};
+      try {
+        const lastLine = (res.stdout || "").trim().split("\n").filter(Boolean).pop() ?? "";
+        parsed = JSON.parse(lastLine);
+      } catch {
+        return {
+          ok: false,
+          error: "web_fetch: sandbox returned no parseable response",
+          result: { raw: res.stdout.slice(0, 4000) },
+          stdout: res.stdout.slice(0, 4000),
+        };
+      }
+
+      if (parsed.error && !parsed.ok) {
+        return { ok: false, error: parsed.error, result: parsed, stdout: parsed.error };
+      }
+
+      const contentType = parsed.content_type ?? "";
+      const finalUrl = parsed.final_url ?? url;
+      const meta = extractPageMeta(parsed.body ?? "");
+
+      // Non-text / binary responses: describe them instead of dumping bytes.
+      if (!isHtmlBody(contentType, finalUrl) && !parsed.body) {
+        const desc = describeBinaryResponse({
+          contentType,
+          url,
+          size: parsed.size ?? 0,
+          finalUrl,
+        });
+        return {
+          ok: true,
+          result: { contentType, size: parsed.size, finalUrl, kind: classifyContentType(contentType, finalUrl), binary: true, content: desc },
+          stdout: desc,
+        };
+      }
+
+      const rawBody = parsed.body ?? "";
+      let content: string;
+      if (format === "html") {
+        content = truncateForOutput(stripNonContent(rawBody));
+      } else if (format === "markdown" && isHtmlBody(contentType, finalUrl)) {
+        content = truncateForOutput(htmlToMarkdown(stripNonContent(rawBody), finalUrl));
+      } else if (format === "text" && isHtmlBody(contentType, finalUrl)) {
+        content = truncateForOutput(htmlToText(rawBody));
+      } else {
+        // Already text/json/xml — return as-is.
+        content = truncateForOutput(rawBody);
+      }
+
+      const prefix =
+        meta.title || meta.description
+          ? `# ${meta.title}${meta.description ? `\n> ${meta.description}` : ""}\n\n`
+          : "";
+
+      const fullOutput = prefix + content;
+      return {
+        ok: true,
+        // Include the cleaned content in `result` so the orchestrator feeds it
+        // back to the model (it pushes JSON.stringify(result) as the tool
+        // message). `stdout` mirrors the same text for the live UI.
+        result: {
+          contentType,
+          finalUrl,
+          size: parsed.size ?? 0,
+          status: parsed.status,
+          format,
+          content: fullOutput,
+        },
+        stdout: fullOutput,
+      };
     }
     // ── Chart & Image Tools ─────────────────────────────────────────────────
     case "chart_create": {

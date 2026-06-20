@@ -56,6 +56,8 @@ model Message {
   role                  String
   encryptedContent      String
   encryptedReasoning    String?
+  encryptedReasoningSegments String? // JSON array of MessageSegment[]
+  encryptedContentSegments  String? // JSON array of MessageSegment[]
   encryptedToolPayload  String?
   encryptedToolCalls    String?  // JSON array of ChatToolCall[]
   usagePromptTokens     Int?

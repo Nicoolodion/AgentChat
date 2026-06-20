@@ -9,11 +9,29 @@ export type ChatListItem = {
   lastMessagePreview: string;
 };
 
+/**
+ * A segment of assistant content (or reasoning) that was emitted *before* the
+ * tool call at `beforeToolIndex`. Segments with `beforeToolIndex >=
+ * toolCalls.length` belong to the tail (after the last tool). This is what lets
+ * the timeline render text/reasoning interleaved with tool calls in true
+ * emission order instead of dumping everything at the bottom.
+ */
+export type MessageSegment = {
+  text: string;
+  beforeToolIndex: number;
+};
+
 export type ChatToolCall = {
   toolCallId: string;
   toolName: string;
   status: "running" | "success" | "error";
   durationMs?: number;
+  /** Parsed arguments captured from the `tool_start` SSE event. */
+  arguments?: Record<string, unknown>;
+  /** Tool stdout/output captured from the `tool_output` SSE event. */
+  output?: string;
+  /** Error message captured from a failed `tool_done` event. */
+  error?: string;
 };
 
 export type ChatMessage = {
@@ -21,7 +39,8 @@ export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   reasoning?: string;
-  reasoningSegments?: Array<{ text: string; beforeToolIndex: number }>;
+  reasoningSegments?: MessageSegment[];
+  contentSegments?: MessageSegment[];
   toolPayload?: string;
   toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;

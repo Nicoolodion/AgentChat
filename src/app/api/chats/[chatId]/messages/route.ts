@@ -381,21 +381,41 @@ async function handleAgentMessage(input: {
       agentSignals.set(sessionId, ac);
 
       const toolCallMap = new Map<string, ChatToolCall>();
-      let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
+      // Tool outputs are captured per toolCallId from the `tool_output` event so
+      // they can be persisted onto the assistant message (and therefore survive
+      // a page refresh / be included in exports).
+      const toolOutputMap = new Map<string, string>();
+      let completionResult: {
+        content: string;
+        reasoning?: string;
+        reasoningSegments?: { text: string; beforeToolIndex: number }[];
+        contentSegments?: { text: string; beforeToolIndex: number }[];
+        toolCallsCount: number;
+      } | null = null;
 
-      // wrap sendEvent to intercept tool_start / tool_done and build ChatToolCalls.
-      // We rely on the database AgentToolCall table for the canonical list of
-      // tool calls (so they survive a page refresh). The in-memory map is only
-      // used to attach timing/status to the final assistant message we persist.
+      // wrap sendEvent to intercept tool_start / tool_output / tool_done and
+      // build ChatToolCalls that carry their arguments + output + error so they
+      // can be persisted on the final assistant message. Persisted tool calls
+      // are the source of truth after a refresh (the in-memory map is only used
+      // to assemble the persisted row).
       const wrappedSendEvent = (event: AgentSseEvent) => {
         if (event.type === "tool_start") {
-          const d = event.data as { toolCallId?: string; toolName?: string };
+          const d = event.data as { toolCallId?: string; toolName?: string; arguments?: Record<string, unknown> };
           const toolCallId = d.toolCallId ?? `tc-${Date.now()}`;
           toolCallMap.set(toolCallId, {
             toolCallId,
             toolName: d.toolName ?? "unknown",
             status: "running",
+            arguments: d.arguments,
           });
+        }
+        if (event.type === "tool_output") {
+          const d = event.data as { toolCallId?: string; output?: string };
+          const toolCallId = d.toolCallId ?? "";
+          if (toolCallId) {
+            const prev = toolOutputMap.get(toolCallId) ?? "";
+            toolOutputMap.set(toolCallId, prev + (d.output ?? ""));
+          }
         }
         if (event.type === "tool_done") {
           const d = event.data as {
@@ -403,19 +423,25 @@ async function handleAgentMessage(input: {
             toolName?: string;
             ok?: boolean;
             durationMs?: number;
+            error?: string;
           };
           const toolCallId = d.toolCallId ?? "";
           const existing = toolCallMap.get(toolCallId);
+          const output = toolOutputMap.get(toolCallId);
           if (existing) {
             existing.status = d.ok ? "success" : "error";
             existing.durationMs = d.durationMs;
+            if (output) existing.output = output;
+            if (d.error) existing.error = d.error;
           } else if (d.toolName) {
             toolCallMap.set(toolCallId, {
               toolCallId,
               toolName: d.toolName,
               status: d.ok ? "success" : "error",
               durationMs: d.durationMs,
-            });
+              output,
+              error: d.error,
+            } as ChatToolCall);
           }
         }
         sendSseEvent(controller, event.type, event.data);
@@ -463,7 +489,8 @@ async function handleAgentMessage(input: {
         return;
       }
 
-      // Persist assistant message with toolCalls
+      // Persist assistant message with toolCalls (incl. arguments + output) and
+      // ordered content/reasoning segments so the timeline survives refresh.
       let assistantMessage;
       const finalToolCalls = Array.from(toolCallMap.values());
       try {
@@ -472,6 +499,8 @@ async function handleAgentMessage(input: {
           role: "assistant",
           content: completionResult.content,
           reasoning: completionResult.reasoning,
+          reasoningSegments: completionResult.reasoningSegments,
+          contentSegments: completionResult.contentSegments,
           toolCalls: finalToolCalls.length ? finalToolCalls : undefined,
           userKey: auth.userKey,
         });

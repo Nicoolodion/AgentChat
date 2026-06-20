@@ -1,15 +1,64 @@
 import type { Chat, Message } from "@prisma/client";
 
 import { decryptString, encryptString } from "@/lib/crypto";
-import type { ChatDetail, ChatListItem, ChatMessage, ChatToolCall } from "@/lib/chat-types";
+import type { ChatDetail, ChatListItem, ChatMessage, ChatToolCall, MessageSegment } from "@/lib/chat-types";
 import { prisma } from "@/lib/prisma";
 import { deleteHostWorkspace } from "@/lib/agent/workspace";
 
 type ChatWithLatestMessage = Chat & { messages: Message[] };
 
+/**
+ * Validate + normalize a persisted ChatToolCall JSON array. Older rows only
+ * store {toolCallId, toolName, status, durationMs}; newer rows also carry
+ * arguments/output/error. We accept both and strip anything malformed so a
+ * single bad row never breaks the whole chat.
+ */
+export function normalizeToolCalls(raw: unknown): ChatToolCall[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: ChatToolCall[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const tc = item as Record<string, unknown>;
+    if (typeof tc.toolCallId !== "string" || typeof tc.toolName !== "string") continue;
+    const status = tc.status === "running" || tc.status === "success" || tc.status === "error" ? tc.status : "running";
+    const call: ChatToolCall = {
+      toolCallId: tc.toolCallId,
+      toolName: tc.toolName,
+      status,
+    };
+    if (typeof tc.durationMs === "number") call.durationMs = tc.durationMs;
+    if (tc.arguments && typeof tc.arguments === "object" && !Array.isArray(tc.arguments)) {
+      call.arguments = tc.arguments as Record<string, unknown>;
+    }
+    if (typeof tc.output === "string") call.output = tc.output;
+    if (typeof tc.error === "string") call.error = tc.error;
+    out.push(call);
+  }
+  return out.length ? out : undefined;
+}
+
+export function normalizeSegments(raw: unknown): MessageSegment[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: MessageSegment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const seg = item as Record<string, unknown>;
+    if (typeof seg.text !== "string") continue;
+    if (typeof seg.beforeToolIndex !== "number") continue;
+    out.push({ text: seg.text, beforeToolIndex: seg.beforeToolIndex });
+  }
+  return out.length ? out : undefined;
+}
+
 function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
   const rawToolCalls = row.encryptedToolCalls
     ? decryptString(row.encryptedToolCalls, userKey)
+    : undefined;
+  const rawReasoningSegments = row.encryptedReasoningSegments
+    ? decryptString(row.encryptedReasoningSegments, userKey)
+    : undefined;
+  const rawContentSegments = row.encryptedContentSegments
+    ? decryptString(row.encryptedContentSegments, userKey)
     : undefined;
   return {
     id: row.id,
@@ -18,10 +67,16 @@ function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
     reasoning: row.encryptedReasoning
       ? decryptString(row.encryptedReasoning, userKey)
       : undefined,
+    reasoningSegments: rawReasoningSegments
+      ? normalizeSegments(safeJson(rawReasoningSegments))
+      : undefined,
+    contentSegments: rawContentSegments
+      ? normalizeSegments(safeJson(rawContentSegments))
+      : undefined,
     toolPayload: row.encryptedToolPayload
       ? decryptString(row.encryptedToolPayload, userKey)
       : undefined,
-    toolCalls: rawToolCalls ? (JSON.parse(rawToolCalls) as ChatMessage["toolCalls"]) : undefined,
+    toolCalls: rawToolCalls ? normalizeToolCalls(safeJson(rawToolCalls)) : undefined,
     usagePromptTokens: row.usagePromptTokens ?? undefined,
     usageCompletionTokens: row.usageCompletionTokens ?? undefined,
     providerModel: row.providerModel ?? undefined,
@@ -29,6 +84,14 @@ function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
     avgTokensPerSecond: row.avgTokensPerSecond ?? undefined,
     createdAt: row.createdAt.toISOString(),
   };
+}
+
+function safeJson(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return undefined;
+  }
 }
 
 function chatToListItem(chat: ChatWithLatestMessage, userKey: Buffer): ChatListItem {
@@ -230,6 +293,8 @@ export async function appendMessageToChat(input: {
   content: string;
   userKey: Buffer;
   reasoning?: string;
+  reasoningSegments?: MessageSegment[];
+  contentSegments?: MessageSegment[];
   toolPayload?: string;
   toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;
@@ -245,6 +310,12 @@ export async function appendMessageToChat(input: {
       encryptedContent: encryptString(input.content, input.userKey),
       encryptedReasoning: input.reasoning
         ? encryptString(input.reasoning, input.userKey)
+        : null,
+      encryptedReasoningSegments: input.reasoningSegments?.length
+        ? encryptString(JSON.stringify(input.reasoningSegments), input.userKey)
+        : null,
+      encryptedContentSegments: input.contentSegments?.length
+        ? encryptString(JSON.stringify(input.contentSegments), input.userKey)
         : null,
       encryptedToolPayload: input.toolPayload
         ? encryptString(input.toolPayload, input.userKey)

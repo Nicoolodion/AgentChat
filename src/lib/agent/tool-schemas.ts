@@ -308,7 +308,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "web_search",
-      description: "Search the web. Returns a list of search results with title, URL, and snippet.",
+      description: "Search the web. Returns a list of search results with title, URL, and snippet. Returns an explicit error field when no results are found.",
       parameters: {
         type: "object",
         properties: {
@@ -323,7 +323,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Fetch a webpage and return its content as text, HTML, or markdown.",
+      description: "Fetch a URL and return its content as text, HTML, or markdown.",
       parameters: {
         type: "object",
         properties: {
