@@ -3,21 +3,29 @@
 # A small two-service deployment of Chatinterface for Unraid (or any host
 # running Docker Compose v2+). Expose only port 3000 to your reverse proxy.
 #
-# Usage:
-#   cp .env.example .env   # then edit secrets
-#   docker compose up -d
+# Images are built by GitHub Actions and published to GHCR, so the host only
+# pulls prebuilt images (no local build needed -> fast updates, low host load).
 #
-# The companion agent sandbox is defined in docker-sandbox/docker-compose.agent.yml.
-# To run everything together:
-#   docker compose -f docker-compose.yml -f docker-sandbox/docker-compose.agent.yml up -d
+# First-time setup:
+#   cp .env.example .env   # then edit secrets
+#   docker compose --profile full up -d   # lastpass: creates & starts everything
+#
+# Update (manual or triggered by CI's SSH step):
+#   docker compose --profile full pull && docker compose --profile full up -d
+#
+# The companion agent sandbox lives in docker-sandbox/ and is built from its
+# own Dockerfile by the same CI workflow.
+
+# Lowercase repo owner is required by GHCR.
+# App:  ghcr.io/nicoolodion/agentchat
+# Sandbox: ghcr.io/nicoolodion/agentchat-agent
 
 services:
   app:
-    build: .
-    image: chatinterface-app:latest
+    image: ghcr.io/nicoolodion/agentchat:latest
     container_name: chatinterface-app
     restart: unless-stopped
-    pull_policy: never
+    pull_policy: always
     env_file: .env
     environment:
       NODE_ENV: production
@@ -48,12 +56,10 @@ services:
   # Optional: only enable if you want the full agent sandbox on the same host.
   # The app will still start without it; agent features will report "sandbox offline".
   agent-sandbox:
-    build:
-      context: docker-sandbox
-    image: chatinterface-agent:latest
+    image: ghcr.io/nicoolodion/agentchat-agent:latest
     container_name: chatinterface-agent-sandbox
     restart: unless-stopped
-    pull_policy: never
+    pull_policy: always
     profiles: ["full"]   # start with: docker compose --profile full up -d
     ports:
       - "18080:8080"

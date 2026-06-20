@@ -1,0 +1,118 @@
+name: Build, publish and deploy
+
+# Builds the app + agent-sandbox images, pushes them to GHCR, then SSHes into
+# the Unraid host to pull the new images and restart the stack. After this is
+# set up, `git push` (or the "Run workflow" button) fully deploys — no manual
+# SSH/git-pull/web-UI steps required.
+#
+# Required GitHub repository secrets (Settings -> Secrets and variables -> Actions):
+#   UNRAID_HOST          e.g. 192.168.1.10  (or your domain)
+#   UNRAID_PORT          SSH port, e.g. 22  (set as plain text secret or var)
+#   UNRAID_USER          SSH user that owns the app directory
+#   UNRAID_SSH_KEY       private key (PEM) matching an authorized key on Unraid
+#   UNRAID_DEPLOY_PATH   absolute path to the repo clone on Unraid
+#
+# The packages are published to:
+#   ghcr.io/nicoolodion/agentchat          (app)
+#   ghcr.io/nicoolodion/agentchat-agent     (sandbox)
+# Visibility defaults to private (inherits repo visibility). The deploy host
+# authenticates via a Personal Access Token with read:packages — see README.
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  # Parsed groups; image names live inline in the matrix below so GHCR's
+  # lowercase requirement is visible next to each build definition.
+
+jobs:
+  build:
+    name: Build & push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # context is the build root; the Dockerfile is resolved as
+          # {context}/Dockerfile for each (docker-sandbox has its own Dockerfile).
+          - image: app
+            context: .
+            target: ghcr.io/nicoolodion/agentchat
+          - image: sandbox
+            context: docker-sandbox
+            target: ghcr.io/nicoolodion/agentchat-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # NOTE: building only linux/amd64 (Unraid). Add arm64 here and re-enable
+        # QEMU below if you ever deploy to ARM.
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.target }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Unraid
+    runs-on: ubuntu-latest
+    needs: build
+    # Don't auto-deploy from dependabot/PR runs; only the real master branch.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: SSH into Unraid and roll the stack
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.UNRAID_HOST }}
+          port: ${{ secrets.UNRAID_PORT }}
+          username: ${{ secrets.UNRAID_USER }}
+          key: ${{ secrets.UNRAID_SSH_KEY }}
+          # Abort early on first error.
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.UNRAID_DEPLOY_PATH }}"
+            echo "==> Updating repo"
+            git fetch --all
+            git reset --hard origin/master
+            echo "==> Pulling new images"
+            docker compose --profile full pull
+            echo "==> Recreating containers"
+            docker compose --profile full up -d --remove-orphans
+            echo "==> Pruning dangling images"
+            docker image prune -f
+            echo "==> Done. Running containers:"
+            docker compose --profile full ps

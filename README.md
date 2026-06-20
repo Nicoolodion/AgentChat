@@ -49,34 +49,74 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 ## Production deploy (Docker)
 
-The repository ships with a multi-stage `Dockerfile` and `docker-compose.yml`.
+The repo ships with a multi-stage `Dockerfile` (app), a `docker-sandbox/Dockerfile`
+(sandbox), and `docker-compose.yml`. **Images are built by GitHub Actions and
+published to GHCR** — the host only pulls prebuilt images, so updates are fast
+and put no build load on Unraid.
 
-```bash
-cp .env.example .env
-# Edit .env (set real keys + DATABASE_URL to a path under /app/data)
-docker compose up -d --build
-```
+### One-time setup on Unraid
 
-The app listens on `127.0.0.1:3000` by default — point your reverse proxy at it.
-All state (DB, encrypted user uploads, agent workspaces) is persisted in the
-host-mounted `./data` directory.
+1. Clone the repo and create the env file (the `.env` is gitignored and never
+   touched by deploys, so your secrets survive updates):
 
-To also run the agent sandbox on the same host:
+   ```bash
+   git clone https://github.com/Nicoolodion/AgentChat.git /mnt/user/appdata/agentchat
+   cd /mnt/user/appdata/agentchat
+   cp .env.example .env
+   # Edit .env: set NANOGPT_API_KEY + the two encryption keys + DATABASE_URL.
+   ```
 
-```bash
-docker compose --profile full up -d
-```
+2. Authenticate Docker to the (private) GHCR package so the host can pull:
 
-### Standalone agent sandbox
+   ```bash
+   # Create a Personal Access Token with read:packages scope at
+   # https://github.com/settings/tokens  (classic), then:
+   docker login ghcr.io -u Nicoolodion
+   ```
 
-The agent runs inside a separate, capability-dropped Docker container. Build and
-start it with the bundled compose file:
+3. Start the stack (app + sandbox):
 
-```bash
-docker compose -f docker-sandbox/docker-compose.agent.yml up -d
-```
+   ```bash
+   docker compose --profile full up -d
+   ```
 
-The Next.js backend talks to it over HTTP at `AGENT_SANDBOX_URL`.
+Point your reverse proxy at `127.0.0.1:3000`. All state (DB, encrypted uploads,
+agent workspaces) persists in the host-mounted `./data` directory.
+
+### Updating
+
+There are two equivalent ways — both only pull prebuilt images and recreate
+containers, so they're fast and identical in effect:
+
+- **Automatic (recommended):** pushing to `master` (or the Actions "Run workflow"
+  button) triggers `.github/workflows/build-and-deploy.yml`, which builds & pushes
+  both images to GHCR, then SSHes into Unraid to `pull` + `up -d`. Nothing to do
+  by hand.
+- **Manual:** on the host,
+
+  ```bash
+  docker compose --profile full pull
+  docker compose --profile full up -d --remove-orphans
+  ```
+
+  This is also what the Unraid web UI "Update Stack (Full)" effectively runs.
+
+### Required GitHub secrets (for automatic deploy)
+
+In **Settings → Secrets and variables → Actions**, add:
+
+| Secret | Example | Purpose |
+| --- | --- | --- |
+| `UNRAID_HOST` | `192.168.1.10` | SSH host of the Unraid box |
+| `UNRAID_PORT` | `22` | SSH port |
+| `UNRAID_USER` | `root` | SSH user owning the app dir |
+| `UNRAID_SSH_KEY` | *(PEM)* | Private key matching an authorized key on Unraid |
+| `UNRAID_DEPLOY_PATH` | `/mnt/user/appdata/agentchat` | Absolute path to the repo clone |
+
+The SSH key needs passwordless sudo only if `docker` requires root (Unraid's
+`docker` typically works for `root`). Generate one with no passphrase:
+`ssh-keygen -t ed25519 -f deploy_key`.
+
 
 ## Auth and security
 
