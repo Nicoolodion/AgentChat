@@ -92,21 +92,78 @@ jobs:
     # Don't auto-deploy from dependabot/PR runs; only the real master branch.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
-      - name: POST to deploy-webhook
+      - name: Trigger deploy-webhook and (if supported) poll status
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
-          echo "Triggering ${{ secrets.WEBHOOK_URL }}"
+          echo "Triggering $WEBHOOK_URL"
+
+          # POST the deploy trigger. The receiver may respond either:
+          #   - 202 Accepted + JSON {run_id}    -> new async receiver: poll status
+          #   - 200 + full deploy output        -> old synchronous receiver: done
+          #   - anything else                   -> error (print body, exit 1)
           code=$(curl -sS -o /tmp/body -w "%{http_code}" \
             -X POST \
-            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
             -H "Content-Type: application/json" \
             --max-time 1200 \
-            "${{ secrets.WEBHOOK_URL }}")
+            "$WEBHOOK_URL")
           echo "----- webhook response (HTTP $code) -----"
-          cat /tmp/body
-          echo
+          cat /tmp/body; echo
           echo "-----------------------------------------"
-          if [ "$code" != "200" ]; then
-            echo "Deploy failed (HTTP $code)"
+
+          if [ "$code" = "200" ]; then
+            echo "Synchronous receiver: deploy output above."
+            exit 0
+          fi
+
+          if [ "$code" != "202" ]; then
+            echo "Deploy trigger failed (HTTP $code)"
             exit 1
           fi
+
+          # Async receiver: parse run_id and poll until finished.
+          run_id=$(python3 -c "import json,sys; print(json.load(open('/tmp/body')).get('run_id',''))" 2>/dev/null || true)
+          if [ -z "$run_id" ]; then
+            echo "202 response had no run_id; cannot poll. Treating as success (check host logs)."
+            exit 0
+          fi
+          echo "Deploy accepted as run $run_id — polling status..."
+
+          # Overall poll budget must be under the webhook's DEPLOY_TIMEOUT
+          # (default 1200s on the receiver).
+          deadline=$(( $(date +%s) + 1150 ))
+          last=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 5
+            sjson=$(curl -sS --max-time 15 \
+              -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+              "$WEBHOOK_URL/status?run=$run_id" || echo '{}')
+            status=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" <<<"$sjson" 2>/dev/null || echo "")
+            echo "  status: $status"
+            if [ "$status" != "running" ] && [ -n "$status" ]; then
+              last="$sjson"
+              break
+            fi
+          done
+
+          echo "----- deploy log -----"
+          curl -sS --max-time 15 \
+            -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            "$WEBHOOK_URL/log?run=$run_id" || true
+          echo
+          echo "----------------------"
+
+          if [ -z "$last" ]; then
+            echo "Deploy timed out while polling status."
+            exit 1
+          fi
+          final=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" <<<"$last" 2>/dev/null || echo "")
+          if [ "$final" = "success" ]; then
+            echo "Deploy succeeded."
+            exit 0
+          fi
+          echo "Deploy did not succeed (final status: $final)."
+          exit 1

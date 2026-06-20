@@ -114,10 +114,14 @@ services:
     volumes:
       - ${HOST_DEPLOY_PATH}:${HOST_DEPLOY_PATH}
       - /var/run/docker.sock:/var/run/docker.sock
+      # Persist deploy run logs + status JSON across webhook container
+      # restarts. Defaults to ./data/deploy-logs inside the host checkout.
+      - ./data/deploy-logs:/app/logs
     environment:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
       - HOST_DEPLOY_PATH=${HOST_DEPLOY_PATH}
       - PORT=9000
+      - DEPLOY_LOG_DIR=/app/logs
     logging:
       driver: json-file
       options:
