@@ -908,6 +908,121 @@ print(json.dumps(out))
         stdout: fullOutput,
       };
     }
+    case "web_download": {
+      const url = String(args.url ?? "");
+      const outputPath = String(args.output_path ?? "").trim();
+      if (!url) return { ok: false, error: "web_download requires a 'url'" };
+      if (!outputPath) return { ok: false, error: "web_download requires an 'output_path'" };
+
+      const urlValidation = validateFetchUrl(url);
+      if (!urlValidation.ok) {
+        return { ok: false, error: urlValidation.error, result: { url }, stdout: urlValidation.error };
+      }
+
+      const headers = buildBrowserHeaders(url);
+      const downloadCode = `
+import json, os, urllib.request, urllib.parse, gzip, zlib, re
+
+def is_blocked_host(host):
+    host = (host or "").lower().strip("[]")
+    blocked = {"localhost", "metadata.google.internal", "metadata", "169.254.169.254", "metadata.aws.internal"}
+    if host in blocked:
+        return True
+    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
+        return True
+    v4 = __import__("re").match(r"^(\\\\d{1,3})\\\\.(\\\\d{1,3})\\\\.(\\\\d{1,3})\\\\.(\\\\d{1,3})$", host)
+    if v4:
+        a, b = int(v4.group(1)), int(v4.group(2))
+        return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
+    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
+        return True
+    return False
+
+url = ${JSON.stringify(url)}
+output_path = ${JSON.stringify(outputPath)}
+headers = ${JSON.stringify(headers)}
+out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "saved_path": output_path, "filename": os.path.basename(output_path), "error": None}
+try:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        # Re-validate the final (post-redirect) host to block SSRF via redirect.
+        final_url = resp.geturl()
+        out["final_url"] = final_url
+        final_host = urllib.parse.urlparse(final_url).hostname or ""
+        if is_blocked_host(final_host):
+            out["error"] = f"Blocked redirect to private/internal host: {final_host}"
+        else:
+            raw = resp.read()
+            out["status"] = resp.status
+            out["content_type"] = resp.headers.get("Content-Type", "") or ""
+            if resp.headers.get("Content-Encoding") == "gzip":
+                try: raw = gzip.decompress(raw)
+                except Exception: pass
+            elif resp.headers.get("Content-Encoding") == "deflate":
+                try: raw = zlib.decompress(raw)
+                except Exception:
+                    try: raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    except Exception: pass
+            # Honor Content-Disposition filename when present.
+            cd = resp.headers.get("Content-Disposition", "") or ""
+            m = re.search(r"filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?", cd, re.I)
+            if m:
+                out["filename"] = urllib.parse.unquote(m.group(1))
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(raw)
+            out["size"] = len(raw)
+            out["saved_path"] = output_path
+except urllib.error.HTTPError as e:
+    out["status"] = e.code
+    out["error"] = f"HTTP Error {e.code}: {e.reason}"
+except Exception as e:
+    out["error"] = f"Download error: {e}"
+out["ok"] = not out["error"]
+print(json.dumps(out))
+`;
+      const res = await sandboxExecPython(sessionId, downloadCode, 70);
+      let parsed: {
+        ok?: boolean;
+        status?: number;
+        content_type?: string;
+        final_url?: string;
+        size?: number;
+        saved_path?: string;
+        filename?: string;
+        error?: string | null;
+      } = {};
+      try {
+        const lastLine = (res.stdout || "").trim().split("\n").filter(Boolean).pop() ?? "";
+        parsed = JSON.parse(lastLine);
+      } catch {
+        return {
+          ok: false,
+          error: "web_download: sandbox returned no parseable response",
+          result: { raw: res.stdout.slice(0, 4000) },
+          stdout: res.stdout.slice(0, 4000),
+        };
+      }
+      const ok = parsed.ok === true;
+      const out = {
+        url,
+        contentType: parsed.content_type ?? "",
+        finalUrl: parsed.final_url ?? url,
+        status: parsed.status,
+        size: parsed.size ?? 0,
+        savedPath: parsed.saved_path ?? outputPath,
+        filename: parsed.filename ?? "",
+      };
+      const stdout = ok
+        ? `Downloaded ${parsed.size ?? 0} bytes → ${parsed.saved_path ?? outputPath} (${parsed.content_type ?? "?"})`
+        : parsed.error ?? "Download failed";
+      return {
+        ok,
+        result: out,
+        error: parsed.error ?? undefined,
+        stdout,
+      };
+    }
     // ── Chart & Image Tools ─────────────────────────────────────────────────
     case "chart_create": {
       const pythonCode = String(args.python_code ?? "");
@@ -935,7 +1050,10 @@ print(json.dumps(out))
 
       const promptBase = String(args.prompt ?? "Describe this image concisely.");
       const detail = (args.detail as "high" | "low") ?? "high";
-      const fullPrompt = `${promptBase} Keep the description concise and focused — under 300 words.`;
+      // Respect the caller's intent: only enforce brevity when the prompt
+      // doesn't already ask for a detailed/thorough description.
+      const wantsDetail = /\b(detailed|thorough|in[- ]?depth|comprehensive|long|exhaustive|extensive|in full)\b/i.test(promptBase);
+      const fullPrompt = wantsDetail ? promptBase : `${promptBase} Keep the description concise and focused — under 300 words.`;
 
       const results: Array<{ path: string; content: string; ok: boolean; error?: string }> = [];
 
