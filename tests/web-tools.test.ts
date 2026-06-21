@@ -8,6 +8,8 @@ import {
   deriveReferer,
   describeBinaryResponse,
   extractPageMeta,
+  extractScriptData,
+  formatScriptData,
   htmlToMarkdown,
   htmlToText,
   isHtmlBody,
@@ -106,6 +108,94 @@ describe("web-tools: stripNonContent", () => {
     expect(out).not.toContain("<!-- c -->");
     expect(out).not.toContain("<title>t</title>");
     expect(out).toContain("<p>hi</p>");
+  });
+});
+
+describe("web-tools: extractScriptData", () => {
+  it("extracts application/json and ld+json scripts always", () => {
+    const html = `
+      <div id="app"></div>
+      <script type="application/json">{"a":1,"b":[2,3]}</script>
+      <script type="application/ld+json">{"@type":"Thing"}</script>
+    `;
+    const data = extractScriptData(html);
+    expect(data).toHaveLength(2);
+    expect(data[0]!.kind).toBe("json");
+    expect(data[0]!.value).toContain('"a":1');
+    expect(data[1]!.kind).toBe("ld-json");
+    expect(data[1]!.value).toContain('Thing');
+  });
+
+  it("extracts JS object/array assignments (the CYOA storyData case)", () => {
+    const html = `
+      <div id="story-container"></div>
+      <script>
+        let storyData = {
+          "title": "Hypnoworld",
+          "initialStats": { "money": 25 }
+        };
+        function render() { console.log(storyData.title); }
+      </script>
+    `;
+    const data = extractScriptData(html, { includeJsAssignments: true });
+    expect(data.some((d) => d.name === "storyData" && d.kind === "js-assignment")).toBe(true);
+    const sd = data.find((d) => d.name === "storyData")!;
+    expect(sd.value).toContain("Hypnoworld");
+    expect(sd.value.startsWith("{")).toBe(true);
+    // Balanced extraction must include the closing brace, not the render() body.
+    expect(sd.value.trim().endsWith("}")).toBe(true);
+    expect(sd.value).not.toContain("function render");
+  });
+
+  it("skips js-assignments by default (avoids dumping app bundles)", () => {
+    const html = `<script>let state = {"x":1};</script>`;
+    expect(extractScriptData(html)).toHaveLength(0);
+    expect(extractScriptData(html, { includeJsAssignments: true })).toHaveLength(1);
+  });
+
+  it("handles nested braces and strings without early-terminating", () => {
+    const html = `<script>const cfg = {"a": "}{", "b": {"c": "}"}};</script>`;
+    const data = extractScriptData(html, { includeJsAssignments: true });
+    const v = data.find((d) => d.name === "cfg")!.value;
+    // Must consume the full literal including the nested closing braces.
+    expect(v).toBe(`{"a": "}{", "b": {"c": "}"}}`);
+  });
+
+  it("does not match == === => operators", () => {
+    const html = `<script>
+      let x = 1, y = 2;
+      if (x == y) {}
+      const arrow = () => ({});
+      const good = {"keep": true};
+    </script>`;
+    const names = extractScriptData(html, { includeJsAssignments: true }).map((d) => d.name);
+    expect(names).toContain("good");
+    expect(names).not.toContain("arrow");
+  });
+
+  it("dedupes identical assignments", () => {
+    const html = `<script>let d = {"k":1};</script><script>let d = {"k":1};</script>`;
+    expect(extractScriptData(html, { includeJsAssignments: true })).toHaveLength(1);
+  });
+
+  it("ignores script-src-less and external-script detail doesn't crash", () => {
+    const html = `<div>hi</div>`;
+    expect(extractScriptData(html)).toEqual([]);
+  });
+});
+
+describe("web-tools: formatScriptData", () => {
+  it("renders an appendix with fenced blocks", () => {
+    const out = formatScriptData([
+      { name: "storyData", kind: "js-assignment", value: '{"a":1}' },
+    ]);
+    expect(out).toContain("Embedded data extracted from <script> tags");
+    expect(out).toContain("### storyData (js-assignment)");
+    expect(out).toContain('```');
+    expect(out).toContain('{"a":1}');
+  });
+  it("returns empty string for no data", () => {
+    expect(formatScriptData([])).toBe("");
   });
 });
 

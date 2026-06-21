@@ -33,6 +33,8 @@ import {
   classifyImageResponse,
   describeBinaryResponse,
   extractPageMeta,
+  extractScriptData,
+  formatScriptData,
   htmlToMarkdown,
   htmlToText,
   isHtmlBody,
@@ -886,16 +888,32 @@ print(json.dumps(out))
       }
 
       const rawBody = parsed.body ?? "";
+      const htmlBody = isHtmlBody(contentType, finalUrl);
       let content: string;
       if (format === "html") {
         content = truncateForOutput(stripNonContent(rawBody));
-      } else if (format === "markdown" && isHtmlBody(contentType, finalUrl)) {
+      } else if (format === "markdown" && htmlBody) {
         content = truncateForOutput(htmlToMarkdown(stripNonContent(rawBody), finalUrl));
-      } else if (format === "text" && isHtmlBody(contentType, finalUrl)) {
+      } else if (format === "text" && htmlBody) {
         content = truncateForOutput(htmlToText(rawBody));
       } else {
         // Already text/json/xml — return as-is.
         content = truncateForOutput(rawBody);
+      }
+
+      // JS-driven pages (SPAs, interactive CYOAs, Next.js apps, ...) embed
+      // their real content as inline JSON/JS-object literals in <script> tags.
+      // `stripNonContent` deletes those, so on a thin/empty shell the model
+      // would see nothing useful and have to resort to many shell+ipython curl
+      // calls. Surface the embedded data directly when the visible body is
+      // thin (or when structured JSON/JSON-LD scripts exist).
+      if (htmlBody) {
+        const visibleText = htmlToText(rawBody).replace(/\s+/g, " ").trim();
+        const thin = visibleText.length < 3000;
+        const scriptData = extractScriptData(rawBody, { includeJsAssignments: thin });
+        if (scriptData.length > 0) {
+          content = truncateForOutput(content + formatScriptData(scriptData), 100_000);
+        }
       }
 
       const prefix =

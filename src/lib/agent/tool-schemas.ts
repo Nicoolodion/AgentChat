@@ -323,7 +323,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Fetch a URL and return its content as text, HTML, or markdown. Returns text/HTML/JSON only — for binary assets (images, video, archives, PDFs) use web_download instead.",
+      description: "Fetch a URL and return its content as text, HTML, or markdown. Returns text/HTML/JSON only — for binary assets (images, video, archives, PDFs) use web_download instead. For JavaScript-driven pages (SPAs, interactive sites) whose visible body is an empty shell, inline JSON/data embedded in <script> tags (including JSON-LD and JS-object literals is automatically extracted and appended to the output, so prefer web_fetch over manual curl+regex.",
       parameters: {
         type: "object",
         properties: {
@@ -457,7 +457,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ### Web & Search
 - web_search(query, max_results?) — search the web (SearXNG or DuckDuckGo)
-- web_fetch(url, format?) — fetch a webpage as html, text, or markdown. Text/HTML/JSON only; do NOT use it for binaries.
+- web_fetch(url, format?) — fetch a webpage as html, text, or markdown. Text/HTML/JSON only; do NOT use it for binaries. For JavaScript-driven pages whose visible body is an empty shell (e.g. SPAs, interactive sites), inline JSON/data embedded in <script> tags (JSON-LD and JS-object literals like \`storyData = {...}\`) is automatically extracted and appended — so you do NOT need to fall back to shell+ipython curl/regex to recover embedded page data.
 - web_download(url, output_path, filename?) — download any binary asset (image, video, PDF, archive) directly into the workspace. Prefer this over \`web_fetch\` + \`shell curl\` for every download.
 
 ### Charts & Images

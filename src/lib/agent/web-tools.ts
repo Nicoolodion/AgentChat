@@ -139,6 +139,160 @@ export function stripNonContent(html: string): string {
     .replace(/<head\b[\s\S]*?<\/head>/gi, "");
 }
 
+// ── Embedded <script> data extraction ────────────────────────────────────────
+//
+// Many pages (SPAs, JS-driven CYOAs, Next.js apps, ...) render their content
+// from an inline JSON / JS-object literal embedded in a <script> tag, e.g.
+//   <script type="application/json">{"a":1}</script>
+//   <script type="application/ld+json">{...}</script>
+//   <script>let storyData = { ...big object... }; function render(){...}</script>
+// `stripNonContent` deletes all of that, leaving an empty shell (e.g. a bare
+// `<div id="app"></div>`), so the model can't see the page's actual data and
+// must fall back to many `shell`/`ipython` curl+regex calls. `extractScriptData`
+// pulls those data payloads back out so `web_fetch` can surface them.
+
+export type ExtractedScriptDatum = {
+  /** Human label: "<json>", "<json-ld>", or the variable name (e.g. "storyData"). */
+  name: string;
+  /** Origin category of the extracted literal. */
+  kind: "json" | "ld-json" | "js-assignment";
+  /** The raw literal text (already entity-decoded). */
+  value: string;
+};
+
+const MAX_EXTRACTED_PER_ITEM = 60_000;
+const MAX_EXTRACTED_TOTAL = 90_000;
+const MIN_JS_ASSIGNMENT_VALUE = 4;
+
+/** Given the index of an opening `{` or `[`, return the slice through its
+ *  matching close, accounting for JS strings and line + block comments.
+ *  Returns null if no matching close is found. */
+function balancedSlice(text: string, open: number): string | null {
+  const openCh = text[open];
+  if (openCh !== "{" && openCh !== "[") return null;
+  const closeCh = openCh === "{" ? "}" : "]";
+  // Quote chars compared by code to avoid parser ambiguity with backtick.
+  const QUOTE_CODES = new Set([0x22, 0x27, 0x60]); // " ' `
+  let depth = 0;
+  let i = open;
+  let inStr: number | null = null;
+  while (i < text.length) {
+    const c = text.charCodeAt(i);
+    if (inStr !== null) {
+      if (c === 0x5c) { i += 2; continue; } // backslash escape
+      if (c === inStr) inStr = null;
+      i += 1;
+      continue;
+    }
+    if (QUOTE_CODES.has(c)) { inStr = c; i += 1; continue; }
+    if (c === 0x2f && text.charCodeAt(i + 1) === 0x2f) { // // line comment
+      const nl = text.indexOf("\n", i);
+      i = nl < 0 ? text.length : nl + 1;
+      continue;
+    }
+    if (c === 0x2f && text.charCodeAt(i + 1) === 0x2a) { // /* comment
+      const end = text.indexOf("*/", i + 2);
+      i = end < 0 ? text.length : end + 2;
+      continue;
+    }
+    if (c === openCh.charCodeAt(0)) depth++;
+    else if (c === closeCh.charCodeAt(0)) {
+      depth--;
+      if (depth === 0) return text.slice(open, i + 1);
+    }
+    i += 1;
+  }
+  return null;
+}
+
+const SCRIPT_RE = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+
+/** Collect the inline JSON / data-object payloads embedded in <script> tags.
+ *
+ *  - `<script type="application/json">` / `application/ld+json` → always
+ *    included (structured data, compact).
+ *  - Inline JS assignments of the form `var|let|const NAME = {…}` /
+ *    `window.NAME = {…}` / `NAME = {…}` (and array literals) → only included
+ *    when `opts.includeJsAssignments` is true, since these can be large app
+ *    bundles. Callers should enable this when the visible (non-script) body is
+ *    thin, i.e. the page is JS-driven and its real content lives in script
+ *    data.
+ *
+ *  Returns at most a handful of deduplicated, size-capped entries. */
+export function extractScriptData(
+  html: string,
+  opts: { includeJsAssignments?: boolean } = {},
+): ExtractedScriptDatum[] {
+  const out: ExtractedScriptDatum[] = [];
+  const seen = new Set<string>();
+
+  // Matches `storyData = {`, `window.__NEXT_DATA__ = [`, `const foo = {`, etc.
+  // Negative-lookbehind on `=`,`<`,`>`,`!` avoids `==`/`===`/`=>`/`>=`/`<=`/`!=`.
+  const assignRe =
+    /(?<![=<>!])(?:\b(?:const|let|var)\s+)?(?:window\.)?([A-Za-z_$][\w$]*)\s*=\s*(?=[{\[])/g;
+
+  const push = (name: string, kind: ExtractedScriptDatum["kind"], value: string, key: string): void => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    let v = value;
+    if (v.length > MAX_EXTRACTED_PER_ITEM) {
+      v = `${v.slice(0, MAX_EXTRACTED_PER_ITEM)}\n// [...truncated ${v.length - MAX_EXTRACTED_PER_ITEM} chars]`;
+    }
+    out.push({ name, kind, value: v });
+  };
+
+  let m: RegExpExecArray | null;
+  while ((m = SCRIPT_RE.exec(html)) !== null) {
+    if (totalExtracted(out) >= MAX_EXTRACTED_TOTAL) return out;
+    const attrs = m[1] ?? "";
+    const inner = decodeEntities(m[2] ?? "").trim();
+    if (!inner) continue;
+    const typeMatch = attrs.match(/\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3] ?? "").toLowerCase();
+
+    if (type === "application/json" || type === "application/ld+json") {
+      push(
+        type === "application/ld+json" ? "<json-ld>" : "<json>",
+        type === "application/ld+json" ? "ld-json" : "json",
+        inner,
+        `${type}:${inner.slice(0, 64)}`,
+      );
+      continue;
+    }
+
+    if (!opts.includeJsAssignments) continue;
+
+    // Scan this script's source for top-level object/array assignments.
+    assignRe.lastIndex = 0;
+    let am: RegExpExecArray | null;
+    while ((am = assignRe.exec(inner)) !== null) {
+      const name = am[1]!;
+      // The `{` / `[` is right after the matched `=` (skipping whitespace).
+      let eqEnd = am.index + am[0].length;
+      while (eqEnd < inner.length && /\s/.test(inner[eqEnd]!)) eqEnd++;
+      const slice = balancedSlice(inner, eqEnd);
+      if (!slice) continue;
+      if (slice.length < MIN_JS_ASSIGNMENT_VALUE) continue;
+      push(name, "js-assignment", slice, `${name}:${slice.slice(0, 64)}`);
+      if (totalExtracted(out) >= MAX_EXTRACTED_TOTAL) return out;
+    }
+  }
+  return out;
+}
+
+function totalExtracted(data: ExtractedScriptDatum[]): number {
+  let n = 0;
+  for (const d of data) n += d.value.length;
+  return n;
+}
+
+/** Render extracted script data as a delimited Markdown appendix. */
+export function formatScriptData(data: ExtractedScriptDatum[]): string {
+  if (!data.length) return "";
+  const blocks = data.map((d) => `### ${d.name} (${d.kind})\n\n\`\`\`\n${d.value}\n\`\`\``);
+  return `\n\n---\n## Embedded data extracted from <script> tags\n\nThe visible page body is JS-driven/empty; this structured/inline data was pulled out of the page's <script> tags.\n\n${blocks.join("\n\n")}`;
+}
+
 function attr(re: RegExp, tag: string): string | null {
   const m = tag.match(re);
   return m ? decodeEntities(m[1] ?? "") : null;
