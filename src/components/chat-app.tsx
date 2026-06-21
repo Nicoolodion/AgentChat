@@ -1153,6 +1153,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                     <button
                       type="button"
                       onClick={(e) => {
+                        e.preventDefault();
                         e.stopPropagation();
                         void deleteChat(c.id);
                         setConfirmDeleteId(null);
@@ -1165,6 +1166,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                     <button
                       type="button"
                       onClick={(e) => {
+                        e.preventDefault();
                         e.stopPropagation();
                         setConfirmDeleteId(c.id);
                         setTimeout(() => setConfirmDeleteId((prev) => prev === c.id ? null : prev), 3000);
