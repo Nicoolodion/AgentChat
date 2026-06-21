@@ -8,7 +8,7 @@ export default async function LoginPage() {
   const auth = await resolveServerAuthContext();
 
   if (!env.AUTH_REQUIRED || auth) {
-    redirect("/chat");
+    redirect("/chat/new-chat");
   }
 
   return (

@@ -368,6 +368,77 @@ export async function deleteMessageForUser(userId: string, chatId: string, messa
   return true;
 }
 
+/**
+ * Append continuation text to an existing assistant message. Used by the
+ * "Continue generating" flow: the model resumes after a truncation and its new
+ * output is grafted onto the same persisted message so the full response stays
+ * coherent. Returns the updated message (decrypted) or null if not found.
+ *
+ * `reasoning` continues are not supported — only content segments are appended.
+ */
+export async function appendContentToMessageForUser(input: {
+  userId: string;
+  chatId: string;
+  messageId: string;
+  userKey: Buffer;
+  appendContent: string;
+}): Promise<ChatMessage | null> {
+  const message = await prisma.message.findFirst({
+    where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
+  });
+  if (!message) return null;
+
+  const existingContent = decryptString(message.encryptedContent, input.userKey);
+  const updated = await prisma.message.update({
+    where: { id: input.messageId },
+    data: {
+      encryptedContent: encryptString(existingContent + input.appendContent, input.userKey),
+    },
+  });
+
+  return decryptMessage(updated, input.userKey);
+}
+
+/**
+ * Append a content segment that was emitted on the *tail* of a message (after
+ * the last tool call). Used by the agent "Continue generating" flow so the
+ * continued text is persisted in the same ordered-segment structure the
+ * timeline renders. `beforeToolIndex` is set to the existing tool-call count so
+ * the continuation renders after everything else.
+ */
+export async function appendTailSegmentToMessageForUser(input: {
+  userId: string;
+  chatId: string;
+  messageId: string;
+  userKey: Buffer;
+  segmentText: string;
+  beforeToolIndex: number;
+}): Promise<ChatMessage | null> {
+  const message = await prisma.message.findFirst({
+    where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
+    include: {},
+  });
+  if (!message) return null;
+
+  const existingSegmentsRaw = message.encryptedContentSegments
+    ? decryptString(message.encryptedContentSegments, input.userKey)
+    : "[]";
+  const existingSegments = (safeJson(existingSegmentsRaw) ?? []) as MessageSegment[];
+  existingSegments.push({ text: input.segmentText, beforeToolIndex: input.beforeToolIndex });
+
+  const existingContent = decryptString(message.encryptedContent, input.userKey);
+
+  const updated = await prisma.message.update({
+    where: { id: input.messageId },
+    data: {
+      encryptedContent: encryptString(existingContent + input.segmentText, input.userKey),
+      encryptedContentSegments: encryptString(JSON.stringify(existingSegments), input.userKey),
+    },
+  });
+
+  return decryptMessage(updated, input.userKey);
+}
+
 export async function getConversationForModel(input: {
   userId: string;
   chatId: string;

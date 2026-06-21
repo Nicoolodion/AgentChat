@@ -153,6 +153,8 @@ export async function runAgentExecution(input: {
   reasoningSegments?: MessageSegment[];
   contentSegments?: MessageSegment[];
   toolCallsCount: number;
+  /** Provider finish_reason for the final assistant turn (e.g. "length" = truncated). */
+  finishReason?: string;
 }> {
   const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort, modelContextLength } = input;
 
@@ -212,6 +214,9 @@ export async function runAgentExecution(input: {
   let finalContent = "";
   let finalReasoning = "";
   let toolCallsCount = 0;
+  // Provider finish_reason for the final assistant turn. Used to detect
+  // truncation ("length") so the client can offer "Continue generating".
+  let lastFinishReason: string | undefined;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
 
   // Ordered content/reasoning segments, indexed by the number of tool calls
@@ -273,7 +278,9 @@ export async function runAgentExecution(input: {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for await (const chunk of response as AsyncIterable<any>) {
-      const delta = chunk.choices?.[0]?.delta;
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
+      if (choice?.finish_reason) lastFinishReason = choice.finish_reason;
       if (!delta) continue;
 
       const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
@@ -346,6 +353,7 @@ export async function runAgentExecution(input: {
         reasoningSegments: reasoningSegments.length ? reasoningSegments : undefined,
         contentSegments: contentSegments.length ? contentSegments : undefined,
         toolCallsCount,
+        finishReason: lastFinishReason,
       };
     }
 
@@ -429,6 +437,7 @@ export async function runAgentExecution(input: {
     reasoningSegments: reasoningSegments.length ? reasoningSegments : undefined,
     contentSegments: contentSegments.length ? contentSegments : undefined,
     toolCallsCount,
+    finishReason: lastFinishReason,
   };
 }
 

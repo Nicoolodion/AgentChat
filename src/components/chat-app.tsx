@@ -14,6 +14,7 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  Lock,
   LogOut,
   MessageSquarePlus,
   Paperclip,
@@ -29,7 +30,7 @@ import {
   Menu,
   Square,
 } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 
 import {
   AgentModeToggle,
@@ -48,7 +49,7 @@ import type {
   ReasoningEffort,
   UploadedAttachment,
 } from "@/lib/chat-types";
-import { decodeUserAttachmentsPayload } from "@/lib/chat-types";
+import { NEW_CHAT_ID, decodeUserAttachmentsPayload } from "@/lib/chat-types";
 import { cn } from "@/lib/ui";
 import { useChatStream } from "./chat/useChatStream";
 import { formatTokensPerSecond, formatTTFT, MessageTimeline } from "./chat/MessageTimeline";
@@ -216,6 +217,7 @@ function AssistantBubble({
   prettyDate,
   isNewest,
   onReroll,
+  onContinue,
   activeModelContextLength,
 }: {
   message: ChatMessage;
@@ -224,6 +226,7 @@ function AssistantBubble({
   prettyDate: (iso: string) => string;
   isNewest: boolean;
   onReroll?: () => void;
+  onContinue?: () => void;
   activeModelContextLength?: number;
 }) {
   const isStreaming = !!message._isStreaming;
@@ -277,17 +280,30 @@ function AssistantBubble({
         </div>
       )}
 
-      {!isStreaming && onReroll && (
-        <div className="mt-2 flex items-center justify-end">
-          <button
-            type="button"
-            onClick={onReroll}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 transition hover:bg-white/10 hover:text-white"
-            title="Regenerate response"
-          >
-            <RefreshCw className="h-3 w-3" />
-            Reroll
-          </button>
+      {!isStreaming && (onReroll || (message._truncated && onContinue)) && (
+        <div className="mt-2 flex items-center justify-end gap-2">
+          {message._truncated && onContinue && (
+            <button
+              type="button"
+              onClick={onContinue}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-teal-300/30 bg-teal-400/10 px-2.5 py-1 text-[11px] text-teal-100 transition hover:bg-teal-400/20 hover:text-white"
+              title="Continue generating (output was truncated)"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Continue
+            </button>
+          )}
+          {onReroll && (
+            <button
+              type="button"
+              onClick={onReroll}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] text-slate-300 transition hover:bg-white/10 hover:text-white"
+              title="Regenerate response"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Reroll
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -296,8 +312,9 @@ function AssistantBubble({
 
 // ── Main app shell ───────────────────────────────────────────────────────────
 
-export function ChatApp() {
+export function ChatApp({ initialChatId }: { initialChatId: string }) {
   const router = useRouter();
+  const pathname = usePathname();
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragCounterRef = useRef(0);
@@ -321,23 +338,43 @@ export function ChatApp() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [reasoningEffort, setReasoningEffort] = useState<"none" | ReasoningEffort>("none");
+  // Inline chat rename: editingChatId holds the chat being renamed; renameDraft
+  // is the live text. Enter/blur commits, Escape cancels.
+  const [editingChatId, setEditingChatId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  // Active agent runs in OTHER chats (so the sidebar can badge them). Polled
+  // every few seconds while the tab is visible.
+  const [activeRunChats, setActiveRunChats] = useState<Record<string, { title: string; status: string }>>({});
 
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
   const modelSearchRef = useRef<HTMLInputElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
 
+  // The transient "new chat" is not persisted until the first message is sent,
+  // so it never appears in /api/chats output. We track whether we are currently
+  // showing it from a fresh route entry (vs. a client-side swap we initiated
+  // ourselves) to drive the initial sync.
+  // Guards the popstate handler from re-triggering our own navigations and
+  // from running before boot is ready.
+  const interactiveRef = useRef(false);
+
   const agent = useAgent(activeChat?.id);
+
+  // A new chat is always shown with web search on when the agent is enabled —
+  // the agent already has web_search / web_fetch as tools, so the toggle is
+  // redundant in agent mode. `webSearchEnabled` stays false on the DB until the
+  // chat is actually persisted.
+  const webSearchActive = agent.isAgentMode ? true : (activeChat?.webSearchEnabled ?? false);
 
   // Stream hook
   const stream = useChatStream({
     chat: activeChat ?? { id: "", messages: [] } as unknown as ChatDetail,
     agentEnabled: agent.isAgentMode,
     onTitleUpdate: (title) => {
-      if (!activeChat) return;
       setActiveChat((c) => (c ? { ...c, title } : c));
       setChats((prev) =>
-        prev.map((c) => (c.id === activeChat.id ? { ...c, title, updatedAt: new Date().toISOString() } : c)),
+        prev.map((c) => (activeChat && c.id === activeChat.id ? { ...c, title, updatedAt: new Date().toISOString() } : c)),
       );
     },
     onChatsRefresh: async () => {
@@ -353,7 +390,31 @@ export function ChatApp() {
     },
   });
 
-  // Boot
+  // ── URL helpers ────────────────────────────────────────────────────────
+  // Chat switches stay in-memory (instant) while the address bar is kept in
+  // sync via the History API. The server-rendered `/chat/[chatId]` route is
+  // only used for deep links / refreshes / new tabs.
+  function chatIdFromPath(path: string | null): string | null {
+    if (!path) return null;
+    const m = path.match(/^\/chat\/([^/]+)$/);
+    return m ? decodeURIComponent(m[1]!) : null;
+  }
+
+  function pushChatUrl(chatId: string, opts?: { replace?: boolean }) {
+    if (typeof window === "undefined") return;
+    const url = `/chat/${chatId}`;
+    const current = window.location.pathname;
+    if (current === url) return;
+    try {
+      if (opts?.replace) window.history.replaceState({ chatId }, "", url);
+      else window.history.pushState({ chatId }, "", url);
+    } catch {
+      // Some environments (e.g. privacy mode) throw on history writes.
+    }
+  }
+
+  // Boot: load identity + model list + chat list, then resolve whatever chat the
+  // URL points at (a real id, or the "new-chat" sentinel for a fresh chat).
   useEffect(() => {
     const boot = async () => {
       try {
@@ -370,8 +431,18 @@ export function ChatApp() {
         ]);
         setModels(modelRows);
         setChats(chatRows);
-        if (chatRows.length > 0) await openChat(chatRows[0]!.id);
-        else await createChat(modelRows[0]?.id);
+
+        const targetId = chatIdFromPath(pathname) ?? initialChatId;
+        if (targetId && targetId !== NEW_CHAT_ID) {
+          const ok = await openChat(targetId, { skipHistory: true });
+          if (!ok) {
+            // Unknown chat id — fall back to a fresh new chat.
+            startNewChat(modelRows[0]?.id, { skipHistory: true, replace: true });
+          }
+        } else {
+          startNewChat(modelRows[0]?.id, { skipHistory: true, replace: true });
+        }
+        interactiveRef.current = true;
       } catch (err) {
         console.error(err);
       } finally {
@@ -381,6 +452,62 @@ export function ChatApp() {
     void boot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // React to browser back/forward between chats (deep-link navigation that we
+  // did not initiate via pushState). Our own navigations set state and update
+  // activeChat directly, so this only fires for genuine history traversals.
+  useEffect(() => {
+    function onPop() {
+      if (!interactiveRef.current) return;
+      const id = chatIdFromPath(window.location.pathname);
+      if (!id) return;
+      if (id === NEW_CHAT_ID) {
+        startNewChat(undefined, { skipHistory: true });
+      } else {
+        void openChat(id, { skipHistory: true });
+      }
+    }
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll for actively-running agent sessions across all of the user's chats so
+  // the sidebar can badge chats that are still executing (e.g. in another tab).
+  // Paused while the tab is hidden to avoid wasted requests.
+  useEffect(() => {
+    let cancelled = false;
+    async function pollActiveRuns() {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const data = await apiFetch<{ sessions: Array<{ chatId: string; title: string; status: string }> }>(
+          "/api/agent/sessions?active=true",
+        );
+        if (cancelled) return;
+        const map: Record<string, { title: string; status: string }> = {};
+        for (const s of data.sessions ?? []) map[s.chatId] = { title: s.title, status: s.status };
+        setActiveRunChats(map);
+      } catch {
+        // ignore — best-effort indicator
+      }
+    }
+    void pollActiveRuns();
+    const id = setInterval(pollActiveRuns, 5000);
+    const onVis = () => { if (!document.hidden) void pollActiveRuns(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
+
+  // The number of OTHER chats (not the one currently open) with active runs —
+  // drives the summary chip at the top of the sidebar.
+  const otherActiveRunCount = useMemo(
+    () => Object.keys(activeRunChats).filter((id) => id !== activeChat?.id).length,
+    [activeRunChats, activeChat?.id],
+  );
 
   // Auto-scroll
   useEffect(() => {
@@ -421,7 +548,7 @@ export function ChatApp() {
     function onKeyDown(e: KeyboardEvent) {
       if (e.ctrlKey && e.key === "n" && !e.shiftKey) {
         e.preventDefault();
-        void createChat(activeChat?.model ?? models[0]?.id);
+        startNewChat(activeChat?.model ?? models[0]?.id);
       }
       if (e.ctrlKey && e.shiftKey && (e.key === "N" || e.key === "n")) {
         e.preventDefault();
@@ -431,6 +558,19 @@ export function ChatApp() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeChat, models]);
+
+  // Keep web search in sync with the agent toggle: enabling the agent forces
+  // web search on (the agent already has web tools). Only persisted for chats
+  // that aren't mode-locked yet (i.e. before the first message) to avoid a
+  // write on every loaded agent chat.
+  useEffect(() => {
+    if (!activeChat) return;
+    if (!agent.isAgentMode) return;
+    if (activeChat.webSearchEnabled) return;
+    if (activeChat.agentModeLocked !== null && activeChat.id !== NEW_CHAT_ID) return;
+    void updateChat({ webSearchEnabled: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.isAgentMode, activeChat?.id, activeChat?.webSearchEnabled, activeChat?.agentModeLocked]);
 
   const displayModels = useMemo(() => {
     const q = modelSearch.trim().toLowerCase();
@@ -464,44 +604,127 @@ export function ChatApp() {
       );
   }, [displayModels]);
 
-  // ── Chat CRUD ────────────────────────────────────────────────────────────
-  async function reloadChatsAndKeepSelection(chatId?: string) {
+  // ── Chat CRUD (URL-driven) ───────────────────────────────────────────────
+  // The active chat is the single source of truth in memory; the address bar
+  // is mirrored via the History API so deep links and browser tabs keep
+  // working. A "new chat" is transient (id = NEW_CHAT_ID) and is NOT persisted
+  // until the first message is sent (see sendMessage).
+
+  function makeTransientChat(modelId?: string): ChatDetail {
+    const now = new Date().toISOString();
+    return {
+      id: NEW_CHAT_ID,
+      title: "New chat",
+      model: modelId ?? models[0]?.id ?? "",
+      webSearchEnabled: false,
+      agentModeLocked: null,
+      createdAt: now,
+      updatedAt: now,
+      messages: [],
+      agentSession: null,
+    };
+  }
+
+  function startNewChat(modelId?: string, opts?: { skipHistory?: boolean; replace?: boolean }) {
+    const transient = makeTransientChat(modelId);
+    // Let the stream hook resync to the (empty) transient messages normally —
+    // there is nothing in-flight to preserve here.
+    setActiveChat(transient);
+    setMessageInput("");
+    setPendingAttachments([]);
+    if (!opts?.skipHistory) pushChatUrl(NEW_CHAT_ID, { replace: opts?.replace });
+  }
+
+  async function reloadChats() {
     const { chats: rows } = await apiFetch<{ chats: ChatListItem[] }>("/api/chats");
     setChats(rows);
-    const target = chatId ?? activeChat?.id ?? rows[0]?.id;
-    if (target) await openChat(target);
+    return rows;
   }
 
-  async function openChat(chatId: string) {
-    const { chat } = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${chatId}`);
-    setActiveChat(chat);
-    void agent.syncChatMode(chat);
+  async function openChat(chatId: string, opts?: { skipHistory?: boolean }): Promise<boolean> {
+    try {
+      const { chat } = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${chatId}`);
+      // NOTE: intentionally NOT calling stream.adoptChatId() here — we want the
+      // hook's resync effect to fire so the freshly-loaded chat's messages are
+      // populated (and any in-flight send from the previous chat is aborted).
+      setActiveChat(chat);
+      setMessageInput("");
+      setPendingAttachments([]);
+      void agent.syncChatMode(chat);
+      if (!opts?.skipHistory) pushChatUrl(chat.id);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  async function createChat(modelId?: string) {
+  async function createChatNow(input: {
+    model?: string;
+    webSearchEnabled: boolean;
+    agentEnabled: boolean;
+  }): Promise<ChatListItem> {
     const { chat } = await apiFetch<{ chat: ChatListItem }>("/api/chats", {
       method: "POST",
-      body: JSON.stringify({ model: modelId, webSearchEnabled: false }),
+      body: JSON.stringify({
+        model: input.model || undefined,
+        webSearchEnabled: input.webSearchEnabled,
+      }),
     });
-    await reloadChatsAndKeepSelection(chat.id);
+    // Deliberately NOT prepended to the sidebar here: the new chat must only
+    // appear once a message has actually been sent. The sidebar is refreshed
+    // from the server in sendMessage after the stream finishes, at which
+    // point the chat has a message and sorts to the top.
+    return chat;
   }
 
   async function updateChat(payload: Partial<Pick<ChatDetail, "title" | "model" | "webSearchEnabled">>) {
-    if (!activeChat) return;
+    if (!activeChat || activeChat.id === NEW_CHAT_ID) {
+      // Transient chat: keep changes client-side until the chat is persisted.
+      setActiveChat((c) => (c ? { ...c, ...payload } : c));
+      return;
+    }
     const { chat } = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${activeChat.id}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
     setActiveChat(chat);
-    await reloadChatsAndKeepSelection(chat.id);
+    setChats((prev) =>
+      prev.map((c) => (c.id === chat.id ? { ...c, title: chat.title, model: chat.model, webSearchEnabled: chat.webSearchEnabled } : c)),
+    );
+  }
+
+  // Commit an inline edit of a sidebar chat title. Patches the chat directly
+  // (independent of which chat is active) so renaming works on any chat.
+  async function commitRename(chatId: string, newTitle: string) {
+    const trimmed = newTitle.trim();
+    setEditingChatId(null);
+    if (!trimmed) return;
+    // Optimistically update the sidebar so the change feels instant; revert via
+    // the server response on success.
+    setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, title: trimmed } : c)));
+    setActiveChat((c) => (c && c.id === chatId ? { ...c, title: trimmed } : c));
+    try {
+      const { chat } = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${chatId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: trimmed }),
+      });
+      setChats((prev) => prev.map((c) => (c.id === chatId ? { ...c, title: chat.title } : c)));
+      setActiveChat((c) => (c && c.id === chatId ? { ...c, title: chat.title } : c));
+    } catch (err) {
+      console.error("Rename failed", err);
+    }
   }
 
   async function deleteChat(chatId: string) {
     await apiFetch(`/api/chats/${chatId}`, { method: "DELETE" });
     const remaining = chats.filter((c) => c.id !== chatId);
     setChats(remaining);
-    if (remaining.length) await openChat(remaining[0]!.id);
-    else await createChat(models[0]?.id);
+    // Move to the next chat, or fall back to a fresh new chat.
+    if (remaining.length && chatId === activeChat?.id) {
+      await openChat(remaining[0]!.id);
+    } else if (chatId === activeChat?.id) {
+      startNewChat(models[0]?.id);
+    }
   }
 
   // ── Attachments ──────────────────────────────────────────────────────────
@@ -575,11 +798,88 @@ export function ChatApp() {
     if (!messageInput.trim() && !pendingAttachments.length) return;
 
     const atts = [...pendingAttachments];
+    const text = messageInput;
     setMessageInput("");
     setPendingAttachments([]);
 
     const effort = reasoningEffort === "none" ? undefined : reasoningEffort;
-    await stream.send({ text: messageInput, attachments: atts, reasoningEffort: effort });
+
+    // A transient "new chat" is persisted lazily on the first message: create
+    // the DB row now, then stream the message against the fresh id, then adopt
+    // that id locally + update the URL so the chat gets a real subpath and
+    // appears in the sidebar.
+    if (activeChat.id === NEW_CHAT_ID) {
+      const usingAgent = agent.isAgentMode;
+      try {
+        const created = await createChatNow({
+          model: activeChat.model || models[0]?.id,
+          // Agent mode always implies web search on (the agent ships web
+          // tools). For normal mode, honour the user's toggle from the
+          // transient chat.
+          webSearchEnabled: usingAgent ? true : (activeChat.webSearchEnabled ?? false),
+          agentEnabled: usingAgent,
+        });
+
+        // For agent runs, materialize the agent session up front so the
+        // sidebar (which needs a session id) is live during the first run.
+        if (usingAgent) {
+          try {
+            const res = await fetch("/api/agent/sessions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
+              body: JSON.stringify({ chatId: created.id }),
+            });
+            const data = (await res.json().catch(() => ({}))) as { session?: { id: string; status: string } };
+            if (data.session) void agent.loadSession(data.session.id);
+          } catch {
+            // The message endpoint will upsert a session as a fallback.
+          }
+        }
+
+        await stream.send({
+          text,
+          attachments: atts,
+          reasoningEffort: effort,
+          chatIdOverride: created.id,
+        });
+
+        // Adopt the real id so the resync effect does not wipe the just-streamed
+        // messages, then mirror the URL and refresh the sidebar so the chat (now
+        // with a message) appears.
+        stream.adoptChatId(created.id);
+        setActiveChat((c) =>
+          c
+            ? {
+                ...c,
+                id: created.id,
+                agentModeLocked: usingAgent ? true : c.agentModeLocked,
+                webSearchEnabled: usingAgent ? true : (c.webSearchEnabled ?? false),
+              }
+            : c,
+        );
+        pushChatUrl(created.id, { replace: true });
+        await reloadChats();
+      } catch (err) {
+        // Restore the composer contents so the user can retry.
+        setMessageInput(text);
+        setPendingAttachments(atts);
+        console.error(err);
+      }
+      return;
+    }
+
+    await stream.send({ text, attachments: atts, reasoningEffort: effort });
+  }
+
+  // Continue a truncated assistant message. Streams the model's continuation
+  // against the existing conversation and appends to the same persisted
+  // message, so the full response stays coherent across both modes.
+  async function continueLatest(index: number) {
+    if (!activeChat || stream.sending) return;
+    const target = stream.messages[index];
+    if (!target || target.role !== "assistant") return;
+    if (activeChat.id === NEW_CHAT_ID) return;
+    await stream.continueGeneration({ messageId: target.id });
   }
 
   async function reroll(index: number) {
@@ -709,6 +1009,12 @@ export function ChatApp() {
     [stream.toolOutputs],
   );
 
+  // The agent sidebar (and the grid column it occupies) only exists once we
+  // have an agent session. On a fresh "new chat" with agent mode toggled on
+  // there is no session yet (it is created when the first message is sent), so
+  // we must not reserve an empty column for it.
+  const showAgentSidebar = agent.isAgentMode && !!agent.agentSession;
+
   if (loading) {
     return (
       <div className="flex h-screen items-center justify-center">
@@ -733,8 +1039,8 @@ export function ChatApp() {
       <div
         className={cn(
           "grid h-full w-full grid-cols-1 overflow-hidden rounded-3xl border border-white/10 bg-slate-950/60 shadow-[0_30px_80px_rgba(2,6,23,.5)] backdrop-blur",
-          agent.isAgentMode && agent.sidebarOpen ? "xl:grid-cols-[320px_minmax(0,1fr)_360px]" :
-            agent.isAgentMode ? "xl:grid-cols-[320px_minmax(0,1fr)_48px]" :
+          showAgentSidebar && agent.sidebarOpen ? "xl:grid-cols-[320px_minmax(0,1fr)_360px]" :
+            showAgentSidebar ? "xl:grid-cols-[320px_minmax(0,1fr)_48px]" :
               "xl:grid-cols-[320px_minmax(0,1fr)]",
         )}
       >
@@ -752,13 +1058,18 @@ export function ChatApp() {
               <div className="text-lg font-semibold text-white">NanoGPT Agent Desk</div>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => createChat(activeChat?.model ?? models[0]?.id)}
+              <a
+                href={`/chat/${NEW_CHAT_ID}`}
+                onClick={(e) => {
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                  e.preventDefault();
+                  startNewChat(activeChat?.model ?? models[0]?.id);
+                }}
                 className="inline-flex items-center gap-2 rounded-full bg-teal-400 px-3 py-2 text-xs font-semibold text-slate-900 transition hover:bg-teal-300"
               >
                 <MessageSquarePlus className="h-4 w-4" />
                 New
-              </button>
+              </a>
               <button
                 onClick={() => setMobileSidebarOpen(false)}
                 className="xl:hidden rounded-lg border border-white/10 p-1.5 text-slate-300 hover:bg-white/10"
@@ -775,26 +1086,69 @@ export function ChatApp() {
             </div>
           </div>
 
+          {otherActiveRunCount > 0 && (
+            <div className="mb-4 flex items-center gap-2 rounded-2xl border border-violet-300/30 bg-violet-400/10 p-3 text-xs text-violet-100">
+              <span className="relative flex h-2 w-2 shrink-0">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-violet-400" />
+              </span>
+              {otherActiveRunCount} agent {otherActiveRunCount === 1 ? "run" : "runs"} active in other chat{otherActiveRunCount === 1 ? "" : "s"}
+            </div>
+          )}
+
           <div className="max-h-[calc(100vh-220px)] space-y-2 overflow-y-auto pr-1">
             {chats.map((c) => (
-              <div
+              <a
                 key={c.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => openChat(c.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    openChat(c.id);
-                  }
+                href={`/chat/${c.id}`}
+                onClick={(e) => {
+                  // Let the browser handle modifier/middle clicks (open in new
+                  // tab) so users can run several chats concurrently. A plain
+                  // left click stays an instant in-memory swap.
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                  e.preventDefault();
+                  void openChat(c.id);
                 }}
                 className={cn(
-                  "group w-full cursor-pointer rounded-2xl border px-3 py-2 text-left transition",
+                  "group block w-full cursor-pointer rounded-2xl border px-3 py-2 text-left transition",
                   activeChat?.id === c.id ? "border-teal-300/60 bg-teal-400/20" : "border-white/10 bg-white/5 hover:bg-white/10",
                 )}
               >
                   <div className="flex items-start justify-between gap-2">
-                  <div className="line-clamp-1 text-sm font-medium text-white">{c.title}</div>
+                  {editingChatId === c.id ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      onDoubleClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitRename(c.id, renameDraft);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          setEditingChatId(null);
+                        }
+                      }}
+                      onBlur={() => void commitRename(c.id, renameDraft)}
+                      className="min-w-0 flex-1 rounded border border-teal-300/50 bg-slate-900 px-1.5 py-0.5 text-sm text-white outline-none"
+                      maxLength={120}
+                    />
+                  ) : (
+                    <div
+                      className="line-clamp-1 text-sm font-medium text-white"
+                      title="Double-click to rename"
+                      onDoubleClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setRenameDraft(c.title);
+                        setEditingChatId(c.id);
+                      }}
+                    >
+                      {c.title}
+                    </div>
+                  )}
                   {confirmDeleteId === c.id ? (
                     <button
                       type="button"
@@ -831,8 +1185,19 @@ export function ChatApp() {
                     </span>
                   )}
                 </div>
-                <div className="mt-1 text-[11px] text-slate-400">{prettyDate(c.updatedAt)}</div>
-              </div>
+                <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-400">
+                  <span>{prettyDate(c.updatedAt)}</span>
+                  {activeRunChats[c.id] && activeChat?.id !== c.id && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-violet-400/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-200" title={`Agent ${activeRunChats[c.id]!.status} in background`}>
+                      <span className="relative flex h-1.5 w-1.5">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-400 opacity-75" />
+                        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-violet-400" />
+                      </span>
+                      running
+                    </span>
+                  )}
+                </div>
+              </a>
             ))}
           </div>
         </aside>
@@ -947,16 +1312,26 @@ export function ChatApp() {
               </div>
 
               <button
-                onClick={() => void updateChat({ webSearchEnabled: !(activeChat?.webSearchEnabled ?? false) })}
+                onClick={() => {
+                  // Web search is forced on while the agent is enabled (the
+                  // agent already has web_search/web_fetch tools), so it can't
+                  // be toggled off in agent mode.
+                  if (agent.isAgentMode) return;
+                  void updateChat({ webSearchEnabled: !(activeChat?.webSearchEnabled ?? false) });
+                }}
+                disabled={agent.isAgentMode}
+                title={agent.isAgentMode ? "Web search is always available to the agent" : "Toggle web search"}
                 className={cn(
-                  "inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm",
-                  activeChat?.webSearchEnabled
+                  "inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm transition",
+                  webSearchActive
                     ? "border-emerald-300/70 bg-emerald-400/20 text-emerald-100"
                     : "border-white/15 bg-slate-900 text-slate-300",
+                  agent.isAgentMode && "cursor-not-allowed",
                 )}
               >
-                {activeChat?.webSearchEnabled ? <Globe className="h-4 w-4" /> : <Search className="h-4 w-4" />}
+                {webSearchActive ? <Globe className="h-4 w-4" /> : <Search className="h-4 w-4" />}
                 Web Search
+                {agent.isAgentMode && <Lock className="h-3 w-3 text-emerald-200/80" />}
               </button>
 
               {activeModelInfo?.supportsReasoningEffort && (
@@ -1035,6 +1410,11 @@ export function ChatApp() {
                     prettyDate={prettyDate}
                     isNewest={i === stream.messages.length - 1}
                     onReroll={!m._isStreaming ? () => void reroll(i) : undefined}
+                    onContinue={
+                      !m._isStreaming && m._truncated && activeChat && activeChat.id !== NEW_CHAT_ID
+                        ? () => void continueLatest(i)
+                        : undefined
+                    }
                     activeModelContextLength={activeModelInfo?.contextLength}
                   />
                 ) : null,
@@ -1095,6 +1475,35 @@ export function ChatApp() {
               <textarea
                 value={messageInput}
                 onChange={(e) => setMessageInput(e.target.value)}
+                onPaste={(e) => {
+                  // Allow pasting images directly into the composer (mirrors the
+                  // drag-and-drop path). Text-only pastes fall through to the
+                  // default so caret/copy-paste keeps working.
+                  const items = e.clipboardData?.items;
+                  if (!items) return;
+                  const imageFiles: File[] = [];
+                  for (const item of Array.from(items)) {
+                    if (item.kind === "file" && item.type.startsWith("image/")) {
+                      const file = item.getAsFile();
+                      if (file) imageFiles.push(file);
+                    }
+                  }
+                  if (imageFiles.length) {
+                    e.preventDefault();
+                    // Give pasted images a friendly filename when the clipboard
+                    // doesn't carry one (common for screenshots). Use window.File so
+                    // the lucide `File` icon import doesn't shadow the DOM ctor.
+                    const DomFile = window.File;
+                    const named = imageFiles.map((f, i) =>
+                      f.name && /\.\w{2,5}$/.test(f.name)
+                        ? f
+                        : new DomFile([f], `pasted-${Date.now()}-${i + 1}.${f.type.split("/")[1] ?? "png"}`, {
+                            type: f.type,
+                          }),
+                    );
+                    void uploadFiles(named);
+                  }
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -1105,7 +1514,7 @@ export function ChatApp() {
                 placeholder={
                   agent.isAgentMode
                     ? "Ask the agent to create documents, analyze files, write code, search the web..."
-                    : "Ask anything, or drop images/docs/PDFs here. Enter sends, Shift+Enter newline."
+                    : "Ask anything, or drop/paste images/docs/PDFs here. Enter sends, Shift+Enter newline."
                 }
                 className="w-full resize-none bg-transparent px-2 py-1 text-sm text-slate-100 outline-none"
               />
@@ -1122,7 +1531,7 @@ export function ChatApp() {
                   </button>
                   <span>
                     {agent.isAgentMode ? "Agent mode active" : "Tools enabled"} • 30-day encrypted files •{" "}
-                    {activeChat?.webSearchEnabled ? "Web search on" : "Web search off"}
+                    {webSearchActive ? "Web search on" : "Web search off"}
                   </span>
                 </div>
                 <button
@@ -1174,7 +1583,7 @@ export function ChatApp() {
         </main>
 
         {/* ── Right: agent sidebar ───────────────────────────────────────── */}
-        {agent.isAgentMode && agent.agentSession && (
+        {showAgentSidebar && agent.agentSession && (
           <AgentSidebar
             open={agent.sidebarOpen}
             onToggle={agent.sidebarOpen ? agent.closeSidebar : agent.openSidebar}

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentArtifact, AgentSession, AgentSseEvent, AgentToolCall } from "@/lib/agent/types";
+import { NEW_CHAT_ID } from "@/lib/chat-types";
 
 export type TerminalEntry =
   | { type: "status"; message: string; timestamp: number }
@@ -50,6 +51,19 @@ export function useAgent(chatId: string | undefined) {
     if (state.modeLocked) return;
 
     const next = !state.isAgentMode;
+
+    // For a transient "new chat" there is no persisted chat row yet, so we
+    // can't create an agent session on the server. Flip the client state
+    // only — the real agent session is created during the first-message send.
+    if (chatId === NEW_CHAT_ID) {
+      setState((s) => ({
+        ...s,
+        isAgentMode: next,
+        sidebarOpen: next,
+        error: null,
+      }));
+      return;
+    }
 
     if (next) {
       setState((s) => ({ ...s, isInitializing: true, isAgentMode: true, sidebarOpen: true, error: null }));

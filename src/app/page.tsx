@@ -7,11 +7,11 @@ export default async function HomePage() {
   const auth = await resolveServerAuthContext();
 
   if (!env.AUTH_REQUIRED) {
-    redirect("/chat");
+    redirect("/chat/new-chat");
   }
 
   if (auth) {
-    redirect("/chat");
+    redirect("/chat/new-chat");
   }
 
   redirect("/login");

@@ -8,7 +8,7 @@ export default async function RegisterPage() {
   const auth = await resolveServerAuthContext();
 
   if (!env.AUTH_REQUIRED || auth) {
-    redirect("/chat");
+    redirect("/chat/new-chat");
   }
 
   return (

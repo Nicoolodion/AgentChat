@@ -54,11 +54,34 @@ export type UseChatStream = {
   toolArguments: Record<string, Record<string, unknown>>;
   sending: boolean;
   error: string | null;
-  send: (input: { text: string; attachments: UploadedAttachment[]; reasoningEffort?: ReasoningEffort }) => Promise<void>;
+  send: (input: {
+    text: string;
+    attachments: UploadedAttachment[];
+    reasoningEffort?: ReasoningEffort;
+    /**
+     * Override the chat id used for the message POST. This is used when a
+     * message is sent from a still-unpersistised "new chat": the caller first
+     * creates the chat, then streams against the fresh id while keeping the
+     * in-memory chat identity stable until the stream finishes.
+     */
+    chatIdOverride?: string;
+  }) => Promise<void>;
   cancel: () => void;
   restore: () => void;
   applyAssistantMessage: (msg: ChatMessage) => void;
   reset: (newMessages: ChatMessage[]) => void;
+  /**
+   * Continue generating a truncated assistant message. Appends the model's
+   * continuation to the given message id (both client-side and server-side).
+   */
+  continueGeneration: (input: { chatIdOverride?: string; messageId: string }) => Promise<void>;
+  /**
+   * Mark `chatId` as already-synced so the next time the parent swaps the
+   * active chat to this id the resync effect does NOT wipe the in-flight /
+   * freshly-streamed message list. Used right after a transient→real chat is
+   * created so the persisted messages we just received aren't thrown away.
+   */
+  adoptChatId: (chatId: string) => void;
 };
 
 export function useChatStream(options: UseChatStreamOptions): UseChatStream {
@@ -72,6 +95,11 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
   const sendAbortRef = useRef<AbortController | null>(null);
   const restoreAbortRef = useRef<AbortController | null>(null);
   const lastSyncedChatIdRef = useRef<string | null>(null);
+  // The chat id an in-flight send is streaming against. Lets the resync
+  // effect abort only sends that belong to a *different* chat than the one we
+  // are switching to (so flipping chats cancels the old stream instead of
+  // letting its events mutate the newly-selected chat's message list).
+  const sendTargetChatIdRef = useRef<string | null>(null);
   // True while re-attaching to a session that is still running on the server.
   // On `done` we then pull the freshly-persisted chat detail so the timeline
   // reflects the canonical assistant message (tool calls + segments).
@@ -84,11 +112,33 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
   // per chatId even if React fires the effect twice in StrictMode.
   useEffect(() => {
     if (lastSyncedChatIdRef.current === chat.id) return;
+    // Abort any in-flight send that belongs to the chat we are leaving. A
+    // send for the *new* chat is never in-flight yet at this point (it is
+    // only ever triggered by a user action after this render commits).
+    if (sendAbortRef.current && sendTargetChatIdRef.current && sendTargetChatIdRef.current !== chat.id) {
+      sendAbortRef.current.abort();
+      sendAbortRef.current = null;
+      setSending(false);
+    }
     lastSyncedChatIdRef.current = chat.id;
     setMessages(chat.messages);
     setToolOutputs({});
     setToolArguments({});
   }, [chat.id, chat.messages]);
+
+  // Abort any orphaned streams when the hook unmounts (e.g. navigating to a
+  // different route). The server-side agent keeps running independently; the
+  // client simply stops consuming the SSE feed.
+  useEffect(() => {
+    return () => {
+      sendAbortRef.current?.abort();
+      restoreAbortRef.current?.abort();
+    };
+  }, []);
+
+  const adoptChatId = useCallback((chatId: string) => {
+    lastSyncedChatIdRef.current = chatId;
+  }, []);
 
   const cancel = useCallback(() => {
     sendAbortRef.current?.abort();
@@ -120,8 +170,9 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
 
   // ── Send a new message ────────────────────────────────────────────────────
   const send = useCallback(
-    async ({ text, attachments, reasoningEffort }: { text: string; attachments: UploadedAttachment[]; reasoningEffort?: ReasoningEffort }) => {
+    async ({ text, attachments, reasoningEffort, chatIdOverride }: { text: string; attachments: UploadedAttachment[]; reasoningEffort?: ReasoningEffort; chatIdOverride?: string }) => {
       if (sending) return;
+      const targetChatId = chatIdOverride ?? chat.id;
       const content = text.trim() || "Please analyze the attached files.";
       const atts = [...attachments];
 
@@ -132,6 +183,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
 
       if (sendAbortRef.current) sendAbortRef.current.abort();
       sendAbortRef.current = new AbortController();
+      sendTargetChatIdRef.current = targetChatId;
 
       const tempId = `temp-${Date.now()}`;
       const optimisticRefs: MessageAttachmentRef[] = atts.map((a) => ({
@@ -217,7 +269,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
       };
 
       try {
-        const res = await fetch(`/api/chats/${chat.id}/messages`, {
+        const res = await fetch(`/api/chats/${targetChatId}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
           body: JSON.stringify({
@@ -317,6 +369,8 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
               });
             }
             if (asst) {
+              const meta = data.meta as { finishReason?: string } | undefined;
+              const truncated = meta?.finishReason === "length";
               applyContent((m) => ({
                 ...asst,
                 _isStreaming: false,
@@ -329,6 +383,7 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
                 reasoningSegments: asst.reasoningSegments ?? m.reasoningSegments,
                 contentSegments: asst.contentSegments ?? m.contentSegments,
                 avgTokensPerSecond: asst.avgTokensPerSecond ?? m.avgTokensPerSecond,
+                _truncated: truncated,
               }));
             } else {
               applyContent((m) => ({ ...m, _isStreaming: false }));
@@ -346,9 +401,106 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
         setMessages((current) => current.filter((m) => !m.id.startsWith("temp-")));
       } finally {
         setSending(false);
+        sendTargetChatIdRef.current = null;
       }
     },
     [chat.id, agentEnabled, sending, onTitleUpdate, onChatsRefresh],
+  );
+
+  // ── Continue generating (truncated response) ──────────────────────────────
+  // Re-streams a completion against the existing conversation (which ends with
+  // the truncated assistant message) and appends the new output to that same
+  // message, both in-memory and server-side. Works for normal and agent-locked
+  // chats — the server decide whether to extend raw content (normal) or append
+  // a tail content segment (agent, to preserve tool-call ordering).
+  const continueGeneration = useCallback(
+    async ({ chatIdOverride, messageId }: { chatIdOverride?: string; messageId: string }) => {
+      if (sending) return;
+      const targetChatId = chatIdOverride ?? chat.id;
+      setError(null);
+      setSending(true);
+
+      if (sendAbortRef.current) sendAbortRef.current.abort();
+      sendAbortRef.current = new AbortController();
+      sendTargetChatIdRef.current = targetChatId;
+
+      // Mark the target message as streaming again so the UI shows the active
+      // indicator and disables controls while the continuation streams.
+      setMessages((current) =>
+        current.map((m) => (m.id === messageId ? { ...m, _isStreaming: true, _truncated: false } : m)),
+      );
+
+      const applyContent = (updater: (msg: ChatMessage) => ChatMessage) => {
+        setMessages((current) => {
+          const idx = current.findIndex((m) => m.id === messageId);
+          if (idx === -1) return current;
+          const copy = current.slice();
+          copy[idx] = updater(copy[idx]!);
+          return copy;
+        });
+      };
+
+      try {
+        const res = await fetch(`/api/chats/${targetChatId}/messages/${messageId}/continue`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Requested-With": "ChatInterface" },
+          signal: sendAbortRef.current.signal,
+        });
+
+        if (!res.ok) {
+          const j = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(j.error ?? "Continue request failed");
+        }
+        if (!res.body) throw new Error("No response body");
+
+        await consumeSse(res.body, (event, data) => {
+          onSseEvent?.(event, data);
+          if (event === "ttft") {
+            applyContent((m) => ({ ...m, ttftMs: data.ttftMs as number }));
+            return;
+          }
+          if (event === "content" && typeof data.text === "string") {
+            applyContent((m) => ({ ...m, content: m.content + data.text, _isStreaming: true }));
+            return;
+          }
+          if (event === "error") {
+            setError((data.message as string) ?? "Continue stream error");
+            return;
+          }
+          if (event === "done") {
+            const asst = data.assistantMessage as ChatMessage | undefined;
+            const meta = data.meta as { finishReason?: string } | undefined;
+            const truncated = meta?.finishReason === "length";
+            if (asst) {
+              applyContent((m) => ({
+                ...asst,
+                _isStreaming: false,
+                ttftMs: asst.ttftMs ?? m.ttftMs,
+                content: asst.content,
+                contentSegments: asst.contentSegments ?? m.contentSegments,
+                toolCalls: asst.toolCalls ?? m.toolCalls,
+                _truncated: truncated,
+              }));
+            } else {
+              applyContent((m) => ({ ...m, _isStreaming: false, _truncated: truncated }));
+            }
+            if (onChatsRefresh) void onChatsRefresh();
+          }
+        });
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        setError(err instanceof Error ? err.message : "Continue failed");
+      } finally {
+        setSending(false);
+        sendTargetChatIdRef.current = null;
+        // If we never got a done event, flip the streaming flag off so the
+        // message isn't stuck showing the active state.
+        setMessages((current) =>
+          current.map((m) => (m.id === messageId ? { ...m, _isStreaming: false } : m)),
+        );
+      }
+    },
+    [chat.id, sending, onSseEvent, onChatsRefresh],
   );
 
   // ── Restore live state after refresh ─────────────────────────────────────
@@ -534,6 +686,8 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
     restore,
     applyAssistantMessage,
     reset,
+    adoptChatId,
+    continueGeneration,
   };
 }
 

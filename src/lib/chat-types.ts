@@ -10,6 +10,14 @@ export type ChatListItem = {
 };
 
 /**
+ * Sentinel chat id used for an unsaved "new chat" before the first message is
+ * sent. It is never persisted: the URL `/chat/new-chat` shows a transient chat
+ * that only gets a real id (and appears in the sidebar) once the first message
+ * is sent.
+ */
+export const NEW_CHAT_ID = "new-chat";
+
+/**
  * A segment of assistant content (or reasoning) that was emitted *before* the
  * tool call at `beforeToolIndex`. Segments with `beforeToolIndex >=
  * toolCalls.length` belong to the tail (after the last tool). This is what lets
@@ -50,6 +58,10 @@ export type ChatMessage = {
   avgTokensPerSecond?: number;
   createdAt: string;
   _isStreaming?: boolean;
+  /** True when the provider reported finish_reason "length" for this message
+   *  (output truncated by max_output_tokens). Surfaces a "Continue generating"
+   *  action. Transient — not persisted. */
+  _truncated?: boolean;
 };
 
 export type ChatDetail = {

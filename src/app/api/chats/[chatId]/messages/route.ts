@@ -263,6 +263,7 @@ export async function POST(
             usageCompletionTokens: completion.usageCompletionTokens,
             ttftMs: completion.ttftMs,
             avgTokensPerSecond,
+            finishReason: completion.finishReason,
           },
         });
 
@@ -391,6 +392,7 @@ async function handleAgentMessage(input: {
         reasoningSegments?: { text: string; beforeToolIndex: number }[];
         contentSegments?: { text: string; beforeToolIndex: number }[];
         toolCallsCount: number;
+        finishReason?: string;
       } | null = null;
 
       // wrap sendEvent to intercept tool_start / tool_output / tool_done and
@@ -533,6 +535,7 @@ async function handleAgentMessage(input: {
         meta: {
           totalToolCalls: completionResult.toolCallsCount,
           totalDurationMs: 0,
+          finishReason: completionResult.finishReason,
         },
         assistantMessage: assistantMessage ?? undefined,
         userMessage,

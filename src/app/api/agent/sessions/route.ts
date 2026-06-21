@@ -4,6 +4,7 @@ import { z } from "zod";
 import { resolveAuthContext } from "@/lib/auth";
 import { requireCsrfHeader } from "@/lib/csrf";
 import { getChatByIdForUser } from "@/lib/chat-store";
+import { decryptString } from "@/lib/crypto";
 import { prisma } from "@/lib/prisma";
 import { sandboxCreateWorkspace, sandboxHealthCheck } from "@/lib/agent/sandbox";
 import { createHostWorkspace } from "@/lib/agent/workspace";
@@ -11,6 +12,51 @@ import { createHostWorkspace } from "@/lib/agent/workspace";
 const createSchema = z.object({
   chatId: z.string().min(1),
 });
+
+const ACTIVE_STATUSES = ["thinking", "executing"];
+
+/**
+ * GET /api/agent/sessions?active=true
+ * Returns the user's actively-running agent sessions (joined to their chat so
+ * the sidebar can badge them). Lightweight enough to poll every few seconds.
+ */
+export async function GET(request: Request) {
+  const auth = await resolveAuthContext(request);
+  if (!auth) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const url = new URL(request.url);
+  const onlyActive = url.searchParams.get("active") === "true";
+
+  if (!onlyActive) {
+    return NextResponse.json({ sessions: [] });
+  }
+
+  const rows = await prisma.agentSession.findMany({
+    where: { userId: auth.userId, status: { in: ACTIVE_STATUSES } },
+    include: { chat: { select: { id: true, encryptedTitle: true } } },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  const sessions = rows.map((s) => {
+    let title = "Chat";
+    try {
+      if (s.chat) title = decryptString(s.chat.encryptedTitle, auth.userKey);
+    } catch {
+      // fall back to generic title
+    }
+    return {
+      id: s.id,
+      chatId: s.chatId,
+      status: s.status,
+      title,
+      updatedAt: s.updatedAt.toISOString(),
+    };
+  });
+
+  return NextResponse.json({ sessions });
+}
 
 /**
  * POST /api/agent/sessions

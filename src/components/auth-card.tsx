@@ -43,7 +43,7 @@ export function AuthCard({ mode, registrationEnabled }: AuthCardProps) {
     try {
       if (isLogin) {
         await requestJson("/api/auth/login", { username, password });
-        router.replace("/chat");
+        router.replace("/chat/new-chat");
       } else {
         await requestJson("/api/auth/register", { username, password });
         setRegistered(true);

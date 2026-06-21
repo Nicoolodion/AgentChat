@@ -385,6 +385,12 @@ type CompletionResult = {
   providerModel?: string;
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
+  /**
+   * The provider's finish_reason (e.g. "stop", "length", "tool_calls").
+   * "length" means the output was truncated by max_output_tokens — surfaced
+   * to the client so it can offer a "Continue generating" action.
+   */
+  finishReason?: string;
 };
 
 export async function runNanoGPTCompletion(input: {
@@ -462,8 +468,10 @@ export async function streamCompletionWithCallbacks(
 
   type StreamChunk = {
     usage?: { prompt_tokens?: number; completion_tokens?: number };
-    choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: unknown[] } }>;
+    choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: unknown[] }; finish_reason?: string | null }>;
   };
+
+  let lastFinishReason: string | undefined;
 
   const drain = async (response: AsyncIterable<StreamChunk>) => {
     for await (const chunk of response) {
@@ -471,6 +479,9 @@ export async function streamCompletionWithCallbacks(
       if (usage) lastUsage = usage;
       const choice = chunk.choices?.[0];
       const delta = choice?.delta;
+      // The provider reports finish_reason on the final chunk (often with an
+      // empty delta). Capture it so the caller can detect truncation ("length").
+      if (choice?.finish_reason) lastFinishReason = choice.finish_reason;
 
       if (!ttftEmitted && (delta?.content || delta?.reasoning)) {
         ttftMs = Date.now() - startTime;
@@ -528,6 +539,7 @@ export async function streamCompletionWithCallbacks(
     providerModel,
     usagePromptTokens,
     usageCompletionTokens,
+    finishReason: lastFinishReason,
     ttftMs: ttftMs ?? Date.now() - startTime,
   };
 }
