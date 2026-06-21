@@ -357,6 +357,17 @@ async function handleAgentMessage(input: {
     }
   }
 
+  // Fetch the conversation history BEFORE persisting the new user message.
+  // Otherwise getConversationForModel would include the just-appended message
+  // and the orchestrator would append it again (duplication the model saw as a
+  // repeated user turn).
+  const priorConversation = await getConversationForModel({
+    userId: auth.userId,
+    chatId: chat.id,
+    userKey: auth.userKey,
+    maxMessages: 30,
+  });
+
   // Persist user message (with attachment refs so the UI can render them)
   const userMessage = await appendMessageToChat({
     chatId: chat.id,
@@ -366,13 +377,6 @@ async function handleAgentMessage(input: {
       ? encodeUserAttachmentsPayload(attachmentRefs)
       : undefined,
     userKey: auth.userKey,
-  });
-
-  const priorConversation = await getConversationForModel({
-    userId: auth.userId,
-    chatId: chat.id,
-    userKey: auth.userKey,
-    maxMessages: 30,
   });
 
   const stream = new ReadableStream({
