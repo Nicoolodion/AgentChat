@@ -32,6 +32,8 @@ import {
   classifyContentType,
   classifyImageResponse,
   describeBinaryResponse,
+  extractExternalScriptSrcs,
+  extractJsonStringsFromJs,
   extractPageMeta,
   extractScriptData,
   formatScriptData,
@@ -1026,6 +1028,73 @@ print(json.dumps(out))
         const scriptData = extractScriptData(rawBody, { includeJsAssignments: thin });
         if (scriptData.length > 0) {
           content = truncateForOutput(content + formatScriptData(scriptData), 100_000);
+        } else if (thin) {
+          // No inline data but the body is an empty shell → the page likely
+          // keeps its data in a same-origin external JS bundle (e.g. Vue SPAs
+          // built with the Interactive CYOA Creator, where the whole project
+          // is a JSON string embedded in app.js). Follow a few same-origin
+          // <script src> files and mine JSON string literals out of them.
+          const srcs = extractExternalScriptSrcs(rawBody, finalUrl).slice(0, 3);
+          for (const src of srcs) {
+            const v2 = validateFetchUrl(src.url);
+            if (!v2.ok) continue;
+            const extHeaders = buildBrowserHeaders(src.url);
+            const extCode = `
+import json, urllib.request, gzip, zlib
+url = ${JSON.stringify(src.url)}
+headers = ${JSON.stringify(extHeaders)}
+out = {"ok": False, "status": 0, "content_type": "", "size": 0, "body": None, "error": None}
+try:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read()
+        out["status"] = resp.status
+        out["content_type"] = resp.headers.get("Content-Type", "") or ""
+        out["size"] = len(raw)
+        if resp.headers.get("Content-Encoding") == "gzip":
+            try: raw = gzip.decompress(raw)
+            except Exception: pass
+        elif resp.headers.get("Content-Encoding") == "deflate":
+            try: raw = zlib.decompress(raw)
+            except Exception:
+                try: raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                except Exception: pass
+        ct = out["content_type"].lower()
+        looks_text = ct == "" or ct.startswith("text/") or "javascript" in ct or "json" in ct
+        if ct == "" and b"\\x00" in raw[:4096]:
+            looks_text = False
+        if looks_text:
+            charset = "utf-8"
+            if "charset=" in ct:
+                charset = ct.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+            try: body = raw.decode(charset, errors="replace")
+            except LookupError: body = raw.decode("utf-8", errors="replace")
+            out["body"] = body[:600000]
+    out["ok"] = True
+except Exception as e:
+    out["error"] = f"Fetch error: {e}"
+print(json.dumps(out))
+`;
+            const extRes = await sandboxExecPython(sessionId, extCode, 30);
+            let extParsed: { ok?: boolean; body?: string | null; error?: string | null } = {};
+            try {
+              const lastLine = (extRes.stdout || "").trim().split("\n").filter(Boolean).pop() ?? "";
+              extParsed = JSON.parse(lastLine);
+            } catch {
+              continue;
+            }
+            if (extParsed.error && !extParsed.ok) continue;
+            const jsBody = extParsed.body ?? "";
+            if (!jsBody) continue;
+            const fromJs = extractJsonStringsFromJs(jsBody);
+            if (fromJs.length > 0) {
+              content = truncateForOutput(
+                content + formatScriptData(fromJs, `external script: ${src.url}`),
+                100_000,
+              );
+              break;
+            }
+          }
         }
       }
 

@@ -7,6 +7,8 @@ import {
   decodeEntities,
   deriveReferer,
   describeBinaryResponse,
+  extractExternalScriptSrcs,
+  extractJsonStringsFromJs,
   extractPageMeta,
   extractScriptData,
   formatScriptData,
@@ -196,6 +198,122 @@ describe("web-tools: formatScriptData", () => {
   });
   it("returns empty string for no data", () => {
     expect(formatScriptData([])).toBe("");
+  });
+  it("honours the source label for external scripts", () => {
+    const out = formatScriptData(
+      [{ name: "<embedded-json>", kind: "json", value: '{"x":1}' }],
+      "external script: https://x.test/app.js",
+    );
+    expect(out).toContain("external script: https://x.test/app.js");
+  });
+});
+
+describe("web-tools: extractExternalScriptSrcs", () => {
+  it("resolves same-origin relative script srcs", () => {
+    const html = `<script src="js/app.123.js"></script><script src="/static/main.js"></script>`;
+    const out = extractExternalScriptSrcs(html, "https://x.test/Cyoa/Mindslaver/");
+    expect(out.map((s) => s.url)).toEqual([
+      "https://x.test/Cyoa/Mindslaver/js/app.123.js",
+      "https://x.test/static/main.js",
+    ]);
+    expect(out.every((s) => s.sameOrigin)).toBe(true);
+  });
+  it("skips cross-origin (CDN) scripts", () => {
+    const html = `<script src="https://cdn.jsdelivr.net/vue.js"></script><script src="js/app.js"></script>`;
+    const out = extractExternalScriptSrcs(html, "https://x.test/");
+    expect(out.map((s) => s.url)).toEqual(["https://x.test/js/app.js"]);
+  });
+  it("skips data:/blob:/javascript: sources", () => {
+    const html = `<script src="data:application/javascript,alert(1)"></script><script src="js/app.js"></script>`;
+    expect(extractExternalScriptSrcs(html, "https://x.test/").map((s) => s.url)).toEqual([
+      "https://x.test/js/app.js",
+    ]);
+  });
+  it("dedupes repeated srcs", () => {
+    const html = `<script src="js/a.js"></script><script src="js/a.js"></script>`;
+    expect(extractExternalScriptSrcs(html, "https://x.test/")).toHaveLength(1);
+  });
+});
+
+describe("web-tools: extractJsonStringsFromJs", () => {
+  // Build a JS source whose data is a JSON string literal (the SPA-bundle case
+  // where the project JSON is embedded as an escaped double-quoted string). To
+  // mirror minified bundles, the JSON is split into concatenated string chunks.
+  function bundleWith(projectJson: Record<string, unknown>): string {
+    const jsonStr = JSON.stringify(projectJson);
+    const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    // Split the *original* (unescaped) JSON at safe boundaries, then escape
+    // each chunk independently and join with `+` — mirrors how terser splits
+    // large string constants without breaking escape sequences.
+    const chunks: string[] = [];
+    for (let i = 0; i < jsonStr.length; i += 500) chunks.push(`"${esc(jsonStr.slice(i, i + 500))}"`);
+    return (
+      'var webpackJsonp=function(){};(function(){var t="use strict";' +
+      'var d=' + chunks.join("+") + ';var p=JSON.parse(d);return p;})();'
+    );
+  }
+
+  it("extracts a large JSON string literal embedded in a JS bundle", () => {
+    const project = {
+      title: "Mindslaver",
+      rows: Array.from({ length: 400 }, (_, i) => ({
+        id: `r${i}`,
+        title: `Row ${i}`,
+        objects: [{ id: `o${i}`, text: "choice description".repeat(3) }],
+      })),
+      settings: { foo: "bar", baz: 42 },
+    };
+    const out = extractJsonStringsFromJs(bundleWith(project));
+    expect(out.length).toBeGreaterThan(0);
+    const v = out[0]!.value;
+    expect(v).toContain("Mindslaver");
+    expect(v).toContain("Row 0");
+    expect(v.length).toBeGreaterThan(5000);
+  });
+
+  it("ignores small string literals (below threshold)", () => {
+    const out = extractJsonStringsFromJs('var x = "{\\"a\\":1}";');
+    expect(out).toHaveLength(0);
+  });
+
+  it("ignores string literals that are not objects/arrays", () => {
+    const big = '"hello " + '.repeat(2000);
+    const out = extractJsonStringsFromJs(`var x=${big}"world";`);
+    // None decode to JSON objects → nothing extracted.
+    expect(out).toHaveLength(0);
+  });
+
+  it("extracts a large JSON object literal embedded directly in JS (Mindslaver SPA shape)", () => {
+    // The project object appears as a native JS object literal in the minified
+    // bundle (unescaped double-quoted keys), with base64 image string values.
+    const img = "data:image/jpeg;base64," + "A".repeat(300);
+    const project = {
+      title: "Mindslaver",
+      rows: Array.from({ length: 400 }, (_, i) => ({
+        id: `r${i}`,
+        title: `Row ${i}`,
+        objects: [{ id: `o${i}`, text: "desc", image: img }],
+      })),
+      settings: { foo: "bar" },
+    };
+    const objLit = JSON.stringify(project, null, 0);
+    const js = `var t="use strict";var d=${objLit};register(d);`;
+    const out = extractJsonStringsFromJs(js);
+    expect(out.length).toBeGreaterThan(0);
+    const v = out[0]!.value;
+    expect(v).toContain("Mindslaver");
+    expect(v).toContain("Row 0");
+    // base64 must have been stripped to a placeholder.
+    expect(v).not.toContain("AAAA");
+    expect(v).toContain("base64");
+  });
+
+  it("ignores non-data JSON objects (too few keys)", () => {
+    // Large JSON object with too few keys and no data hints → skipped.
+    const json = JSON.stringify({ a: "x".repeat(9000) });
+    const escaped = json.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const out = extractJsonStringsFromJs(`var x="${escaped}";`);
+    expect(out).toHaveLength(0);
   });
 });
 

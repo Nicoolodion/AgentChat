@@ -287,10 +287,357 @@ function totalExtracted(data: ExtractedScriptDatum[]): number {
 }
 
 /** Render extracted script data as a delimited Markdown appendix. */
-export function formatScriptData(data: ExtractedScriptDatum[]): string {
+export function formatScriptData(data: ExtractedScriptDatum[], sourceLabel = "<script> tags"): string {
   if (!data.length) return "";
   const blocks = data.map((d) => `### ${d.name} (${d.kind})\n\n\`\`\`\n${d.value}\n\`\`\``);
-  return `\n\n---\n## Embedded data extracted from <script> tags\n\nThe visible page body is JS-driven/empty; this structured/inline data was pulled out of the page's <script> tags.\n\n${blocks.join("\n\n")}`;
+  return `\n\n---\n## Embedded data extracted from ${sourceLabel}\n\nThe visible page body is JS-driven/empty; this structured/inline data was pulled out of the page's ${sourceLabel}.\n\n${blocks.join("\n\n")}`;
+}
+
+// ── External script + JSON-string extraction (SPAs with bundled data) ────────
+//
+// Some JS-driven pages (e.g. Vue/React SPAs built with the "Interactive CYOA
+// Creator") keep *all* their data inside an external, minified JS bundle
+// (`<script src="js/app.xxxx.js">`) rather than an inline script. The data is
+// typically a large JSON object embedded as a JS string literal that the app
+// `JSON.parse()`s at runtime. These helpers locate same-origin external script
+// sources and mine JSON string literals out of JS source so `web_fetch` can
+// surface that data instead of leaving the model to curl+grep the bundle.
+
+export type ExternalScriptSrc = {
+  /** Resolved absolute URL of the script. */
+  url: string;
+  /** True when the script is on the same origin as the page (we only follow
+   *  same-origin scripts to avoid random third-party bundles). */
+  sameOrigin: boolean;
+};
+
+/** Extract same-origin `<script src>` URLs from HTML, resolved against
+ *  `baseUrl`. External cross-origin scripts (CDNs, analytics, vendor bundles)
+ *  are ignored — only scripts hosted on the page's own origin are followed. */
+export function extractExternalScriptSrcs(html: string, baseUrl: string | null): ExternalScriptSrc[] {
+  const out: ExternalScriptSrc[] = [];
+  const seen = new Set<string>();
+  let baseOrigin = "";
+  try { baseOrigin = baseUrl ? new URL(baseUrl).origin : ""; } catch { /* ignore */ }
+
+  const re = /<script\b([^>]*)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const attrs = m[1] ?? "";
+    const raw = m[2] ?? m[3] ?? m[4] ?? "";
+    if (!raw) continue;
+    // Skip inline data: / blob: / javascript: sources.
+    if (/^(?:data|blob|javascript):/i.test(raw)) continue;
+    const resolved = resolveUrl(raw, baseUrl);
+    if (!resolved) continue;
+    // Ignore a script that has type="application/json" etc. (handled inline).
+    if (/\btype\s*=\s*["']?(?:application\/(?:json|ld\+json))/i.test(attrs)) continue;
+    let sameOrigin = true;
+    try {
+      sameOrigin = baseOrigin === new URL(resolved).origin;
+    } catch { /* treat as cross-origin → skip */ }
+    if (!sameOrigin) continue;
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    out.push({ url: resolved, sameOrigin });
+  }
+  return out;
+}
+
+const JS_QUOTE_CODES = new Set([0x22, 0x27, 0x60]); // " ' `
+
+const MIN_JSON_STRING_LEN = 8000;
+const MAX_JSON_STRINGS = 4;
+// While following a string-concatenation chain, never accumulate more than
+// this many decoded chars — large base64 blobs can be megabytes.
+const MAX_CHAIN_ACCUM = 600_000;
+const MAX_PRETTY_LEN = 60_000;
+const MAX_TOTAL_LEN = 120_000;
+
+/** Key names that mark a JSON payload as page/application data worth surfacing
+ *  (vs. e.g. a CSS-in-JS blob or a locale dictionary). */
+const DATA_KEY_HINTS = new Set([
+  "title", "rows", "sections", "choices", "objects", "pointtypes", "settings",
+  "storydata", "intro", "levels", "items", "options", "questions", "answers",
+  "currency", "skills", "points", "choiceslist", "data", "config", "content",
+]);
+
+function looksLikeDataObject(parsed: unknown): boolean {
+  if (!parsed || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length < 3) return false;
+  // Either many keys (≥ 8) or at least one well-known data key.
+  if (keys.length >= 8) return true;
+  return keys.some((k) => DATA_KEY_HINTS.has(k.toLowerCase()));
+}
+
+/** Decode a single JS string literal (`"..."`, `'...'`). Returns the decoded
+ *  content and the index just past the closing quote, or null if no valid
+ *  literal starts at `start`. Handles `\\` escapes and rejects literals that
+ *  contain a raw (unescaped) newline. */
+function readStringLiteral(js: string, start: number): { content: string; end: number } | null {
+  const q = js.charCodeAt(start);
+  if (!JS_QUOTE_CODES.has(q)) return null;
+  const len = js.length;
+  let out = "";
+  let i = start + 1;
+  const bufCheck = start + 1;
+  // Reject literals containing an unescaped raw newline up front-ish.
+  while (i < len) {
+    const c = js.charCodeAt(i);
+    if (c === 0x5c) {
+      const n = js.charCodeAt(i + 1);
+      switch (n) {
+        case 0x6e: out += "\n"; break;
+        case 0x72: out += "\r"; break;
+        case 0x74: out += "\t"; break;
+        case 0x62: out += "\b"; break;
+        case 0x66: out += "\f"; break;
+        case 0x76: out += "\v"; break;
+        case 0x30: out += "\0"; break;
+        case 0x22: out += '"'; break;
+        case 0x27: out += "'"; break;
+        case 0x60: out += "`"; break;
+        case 0x5c: out += "\\"; break;
+        case 0x2f: out += "/"; break;
+        case 0x75: {
+          const hex = js.slice(i + 2, i + 6);
+          if (/^[0-9a-fA-F]{4}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); i += 4; }
+          else { out += js.slice(i, i + 2); }
+          break;
+        }
+        case 0x78: {
+          const hex = js.slice(i + 2, i + 4);
+          if (/^[0-9a-fA-F]{2}$/.test(hex)) { out += String.fromCharCode(parseInt(hex, 16)); i += 2; }
+          else { out += js.slice(i, i + 2); }
+          break;
+        }
+        default: out += js.slice(i, i + 2); break;
+      }
+      i += 2;
+      continue;
+    }
+    if (c === 0x0a || c === 0x0d) return null; // raw newline → not a literal
+    if (c === q) return { content: out, end: i + 1 };
+    out += js[i]!;
+    i += 1;
+  }
+  void bufCheck;
+  return null;
+}
+
+/** Skip whitespace and // line comments between tokens. */
+function skipWsAndComments(js: string, i: number): number {
+  const len = js.length;
+  while (i < len) {
+    const c = js.charCodeAt(i);
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d || c === 0x0c) { i += 1; continue; }
+    if (c === 0x2f && js.charCodeAt(i + 1) === 0x2f) {
+      const nl = js.indexOf("\n", i + 2);
+      i = nl < 0 ? len : nl + 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+/** Recursively walk a parsed JSON value and replace any string that looks like
+ *  a data: URL or a long base64 blob with a compact placeholder, so the
+ *  surfaced data stays small (the CYOA structure matters, not the image bytes). */
+const DATA_URL_RE = /^data:[^,]+,/i;
+function stripBase64(value: unknown): unknown {
+  if (typeof value === "string") {
+    if (DATA_URL_RE.test(value) || /^[A-Za-z0-9+/]{200,}={0,2}$/.test(value)) {
+      return `[binary/base64 string, ${value.length} chars]`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    // Cap absurdly long arrays to a representative sample.
+    const cap = value.length > 200 ? value.slice(0, 200) : value;
+    const arr = cap.map(stripBase64);
+    if (value.length > 200) arr.push(`[...${value.length - 200} more entries]` as unknown);
+    return arr;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = stripBase64(v);
+    return out;
+  }
+  return value;
+}
+
+/** Scan JS source for large JSON payloads embedded as string literals.
+ *
+ *  Handles two shapes:
+ *   1. A single big string literal whose decoded content is JSON
+ *      (e.g. `var d = "{...}"; JSON.parse(d)`).
+ *   2. A **concatenation chain** of string literals (`"chunk" + "chunk" + ...`)
+ *      — minifiers (webpack/terser) split very large string constants this way,
+ *      so each chunk alone isn't valid JSON but the concatenation is. This is
+ *      how "Interactive CYOA Creator" bundles store their project data.
+ *
+ *  Returns the decoded, base64-stripped, pretty-printed JSON, deduped and
+ *  size-capped. */
+export function extractJsonStringsFromJs(js: string): ExtractedScriptDatum[] {
+  const out: ExtractedScriptDatum[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  let i = 0;
+  const len = js.length;
+
+  while (i < len && out.length < MAX_JSON_STRINGS) {
+    const c = js.charCodeAt(i);
+    if (c !== 0x22 && c !== 0x27) { i += 1; continue; } // " and ' only (skip `)
+    const first = readStringLiteral(js, i);
+    if (!first) { i += 1; continue; }
+    let acc = first.content;
+    let p = first.end;
+    // Only bother extending a chain if the first piece could be JSON data
+    // (starts with { or [); otherwise skip per-literal parsing.
+    const headCh = acc.slice(0, 1);
+    if (headCh === "{" || headCh === "[") {
+      // Follow `"..." + "..." + ...` chains.
+      let guard = 0;
+      while (guard++ < 5_000 && acc.length < MAX_CHAIN_ACCUM) {
+        const q2 = skipWsAndComments(js, p);
+        if (js.charCodeAt(q2) !== 0x2b) break; // '+'
+        const q3 = skipWsAndComments(js, q2 + 1);
+        const next = readStringLiteral(js, q3);
+        if (!next) break;
+        acc += next.content;
+        p = next.end;
+      }
+    }
+    i = p;
+    if (acc.length < MIN_JSON_STRING_LEN) continue;
+    if (headCh !== "{" && headCh !== "[") continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(acc);
+    } catch {
+      continue;
+    }
+    if (!looksLikeDataObject(parsed)) continue;
+
+    const stripped = stripBase64(parsed);
+    const pretty = JSON.stringify(stripped, null, 1);
+    const key = pretty.slice(0, 64);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    let value = pretty;
+    if (value.length > MAX_PRETTY_LEN) {
+      value = `${value.slice(0, MAX_PRETTY_LEN)}\n// [...truncated ${value.length - MAX_PRETTY_LEN} chars]`;
+    }
+    const remaining = MAX_TOTAL_LEN - total;
+    if (remaining <= 0) break;
+    if (value.length > remaining) {
+      value = `${value.slice(0, remaining - 60)}\n// [...truncated ${value.length - remaining + 60} chars]`;
+    }
+    out.push({ name: "<embedded-json>", kind: "json", value });
+    total += value.length;
+  }
+
+  // SPA bundles (e.g. the "Interactive CYOA Creator") often embed the whole
+  // project as a *raw JS object literal* in the minified bundle — not as a
+  // JSON string. Recover those via single-pass brace matching.
+  const objResults = extractObjectLiteralsFromJs(js);
+  for (const o of objResults) {
+    if (total >= MAX_TOTAL_LEN) break;
+    const key = o.value.slice(0, 64);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let value = o.value;
+    if (value.length > MAX_PRETTY_LEN) {
+      value = `${value.slice(0, MAX_PRETTY_LEN)}\n// [...truncated ${value.length - MAX_PRETTY_LEN} chars]`;
+    }
+    const remaining = MAX_TOTAL_LEN - total;
+    if (remaining <= 0) break;
+    if (value.length > remaining) {
+      value = `${value.slice(0, remaining - 60)}\n// [...truncated ${value.length - remaining + 60} chars]`;
+    }
+    out.push({ name: "<embedded-object-literal>", kind: "json", value });
+    total += value.length;
+  }
+  return out;
+}
+
+const MIN_OBJECT_LITERAL_LEN = 20_000;
+const MAX_OBJECT_LITERAL_LEN = 5_000_000;
+
+/** Single-pass scan of JS source for large `{...}` object-literal spans that
+ *  parse as strict JSON and look like application data. Uses a brace stack
+ *  that respects JS strings and `//` / block comments so quoted braces inside
+ *  string values (and base64 blobs) don't break matching.
+ *
+ *  Returns the largest non-nested data objects first, deduped by content. */
+function extractObjectLiteralsFromJs(js: string): ExtractedScriptDatum[] {
+  const candidates: { start: number; end: number; span: string }[] = [];
+  const stack: number[] = [];
+  const len = js.length;
+  let i = 0;
+  let inStr: number | null = null;
+
+  while (i < len) {
+    const c = js.charCodeAt(i);
+    if (inStr !== null) {
+      if (c === 0x5c) { i += 2; continue; }
+      if (c === inStr) inStr = null;
+      i += 1;
+      continue;
+    }
+    if (c === 0x22 || c === 0x27 || c === 0x60) { inStr = c; i += 1; continue; }
+    if (c === 0x2f && js.charCodeAt(i + 1) === 0x2f) {
+      const nl = js.indexOf("\n", i + 2);
+      i = nl < 0 ? len : nl + 1;
+      continue;
+    }
+    if (c === 0x2f && js.charCodeAt(i + 1) === 0x2a) {
+      const e = js.indexOf("*/", i + 2);
+      i = e < 0 ? len : e + 2;
+      continue;
+    }
+    if (c === 0x7b) { stack.push(i); } // {
+    else if (c === 0x7d) { // }
+      const start = stack.pop();
+      if (start === undefined) { i += 1; continue; }
+      const spanLen = i - start + 1;
+      if (spanLen >= MIN_OBJECT_LITERAL_LEN && spanLen <= MAX_OBJECT_LITERAL_LEN) {
+        candidates.push({ start, end: i, span: js.slice(start, i + 1) });
+      }
+    }
+    i += 1;
+  }
+
+  const results: ExtractedScriptDatum[] = [];
+  const seen = new Set<string>();
+  // Process largest first so we can skip candidates subsumed by an accepted
+  // parent object.
+  candidates.sort((a, b) => b.end - b.start - (a.end - a.start));
+  const accepted: { start: number; end: number }[] = [];
+  for (const cand of candidates) {
+    if (accepted.some((a) => cand.start >= a.start && cand.end <= a.end)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(cand.span);
+    } catch {
+      continue;
+    }
+    if (!looksLikeDataObject(parsed)) continue;
+    const stripped = stripBase64(parsed);
+    const pretty = JSON.stringify(stripped, null, 1);
+    const key = pretty.slice(0, 64);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push({ name: "<embedded-object-literal>", kind: "json", value: pretty });
+    accepted.push({ start: cand.start, end: cand.end });
+    if (results.length >= MAX_JSON_STRINGS) break;
+  }
+  return results;
 }
 
 function attr(re: RegExp, tag: string): string | null {

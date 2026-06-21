@@ -17,7 +17,11 @@ import {
   buildBrowserHeaders,
   classifyContentType,
   describeBinaryResponse,
+  extractExternalScriptSrcs,
+  extractJsonStringsFromJs,
   extractPageMeta,
+  extractScriptData,
+  formatScriptData,
   htmlToMarkdown,
   htmlToText,
   isHtmlBody,
@@ -114,6 +118,42 @@ async function fetchOne(rawUrl: string, format: FetchFormat = "markdown"): Promi
       content = truncateForOutput(body);
     }
 
+    // Mirror the orchestrator: when the visible body is thin (JS-driven shell),
+    // surface inline JSON/JS-object data embedded in <script> tags.
+    const visibleText = htmlToText(body).replace(/\s+/g, " ").trim();
+    const thin = visibleText.length < 3000;
+    const scriptData = extractScriptData(body, { includeJsAssignments: thin });
+    if (scriptData.length > 0) {
+      content = truncateForOutput(content + formatScriptData(scriptData), 100_000);
+    } else if (thin) {
+      // No inline data but empty shell → follow same-origin external <script src>
+      // bundles and mine JSON string literals out of them.
+      const srcs = extractExternalScriptSrcs(body, finalUrl).slice(0, 3);
+      for (const src of srcs) {
+        try {
+          const jsResp = await fetch(src.url, {
+            method: "GET",
+            headers: buildBrowserHeaders(src.url),
+            redirect: "follow",
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!jsResp.ok) continue;
+          const jsRaw = Buffer.from(await jsResp.arrayBuffer());
+          const jsBody = jsRaw.toString("utf-8");
+          const fromJs = extractJsonStringsFromJs(jsBody);
+          if (fromJs.length > 0) {
+            content = truncateForOutput(
+              content + formatScriptData(fromJs, `external script: ${src.url}`),
+              100_000,
+            );
+            break;
+          }
+        } catch {
+          /* skip unreachable external script */
+        }
+      }
+    }
+
     return {
       url: rawUrl, ok: true, status: resp.status, contentType, finalUrl, size, format,
       kind, content: meta(pageMeta.title, pageMeta.description) + content,
@@ -129,6 +169,8 @@ async function main(): Promise<void> {
     { url: "https://portal.neuralwatt.com/docs/api/models", format: "markdown" },
     { url: "https://gelbooru.com/index.php?page=post&s=list&tags=mind_control&pid=42", format: "markdown" },
     { url: "https://gelbooru.com/index.php?page=post&s=view&id=14314537&tags=mind_control", format: "markdown" },
+    { url: "https://themindcontroller.neocities.org", format: "markdown" },
+    { url: "https://godling-of-aliot.neocities.org/Cyoa/Mindslaver/", format: "markdown" },
   ];
 
   mkdirSync(OUT_DIR, { recursive: true });
