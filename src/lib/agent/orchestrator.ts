@@ -71,6 +71,33 @@ export type SseController = {
 
 const MAX_CONVERSATION_CHARS = 80000;
 
+/** Matches JSON-parse error signatures thrown or echoed back by LLM
+ *  providers/gateways when the model emits malformed tool-call arguments,
+ *  e.g. `Expecting ',' delimiter: line 1 column 843 (char 842)` (Python's
+ *  json module) or `Unexpected token ... in JSON` (V8). These are surfaced
+ *  by the gateway instead of the tool call, so without recovery the agent
+ *  silently stops mid-task. */
+const JSON_PARSE_ERROR_RE =
+  /(?:Expecting\b|Unexpected token|JSONDecodeError|Failed to parse|invalid json|SyntaxError: JSON|Expecting property name enclosed in double quotes|Expecting value: line)/i;
+
+/** Build the guidance note fed back to the model when its last tool-call
+ *  arguments were rejected as malformed JSON by the provider gateway, so it
+ *  can recover on the next iteration (e.g. by writing the payload to a file
+ *  and passing the path instead of a huge inline argument). */
+function malformedArgsGuidance(rawError: string): string {
+  const detail = rawError.slice(0, 300);
+  return (
+    `[Tool call rejected] The previous tool call could not be sent because its ` +
+    `arguments were not valid JSON (${detail}). This happens when large or ` +
+    `complex arguments (e.g. inline \`sections\` for docx_template_fill) contain ` +
+    `unescaped characters or stray quotes.\n` +
+    `Recover by simplifying the arguments: for any tool that accepts a path variant ` +
+    `(such as docx_template_fill's \`sections_path\`), write the data to a file first ` +
+    `with file_write, then pass the file path. Do NOT re-emit the same oversized inline ` +
+    `argument. Retry the intended tool now with corrected, file-path-based arguments.`
+  );
+}
+
 /** Rough token estimate (~4 chars/token) used for context-budget checks. */
 function estimateTokens(messages: ChatCompletionMessageParam[]): number {
   let chars = 0;
@@ -220,6 +247,12 @@ export async function runAgentExecution(input: {
   // truncation ("length") so the client can offer "Continue generating".
   let lastFinishReason: string | undefined;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
+  // Guards recovery when the provider rejects a streamed tool call's JSON
+  // arguments mid-session. We let the model retry with file-path-based args
+  // rather than aborting the whole task, but cap retries to avoid an infinite
+  // error loop.
+  let consecutiveStreamErrors = 0;
+  const MAX_CONSECUTIVE_STREAM_ERRORS = 3;
 
   // Ordered content/reasoning segments, indexed by the number of tool calls
   // that had already started when the segment was emitted. This is what lets
@@ -271,58 +304,115 @@ export async function runAgentExecution(input: {
       createOptions.reasoning_effort = effectiveReasoningEffort;
     }
 
-    const response = await client.chat.completions.create(
+    let response: AsyncIterable<unknown>;
+    try {
+      response = await client.chat.completions.create(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        createOptions as any,
+        { signal },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      createOptions as any,
-      { signal },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ) as any;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    for await (const chunk of response as AsyncIterable<any>) {
-      const choice = chunk.choices?.[0];
-      const delta = choice?.delta;
-      if (choice?.finish_reason) lastFinishReason = choice.finish_reason;
-      if (!delta) continue;
-
-      const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
-      if (reasoningDelta) {
-        finalReasoning += reasoningDelta;
-        currentReasoningSeg += reasoningDelta;
-        sendEvent({ type: "reasoning", data: { text: reasoningDelta } });
+      ) as any;
+    } catch (streamErr) {
+      if ((streamErr as Error).name === "AbortError") throw streamErr;
+      consecutiveStreamErrors++;
+      if (consecutiveStreamErrors > MAX_CONSECUTIVE_STREAM_ERRORS) {
+        throw streamErr;
       }
+      const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      await updateSessionStatus(sessionId, "executing");
+      sendEvent({ type: "status", data: { status: "executing", step: "Recovering from a stream error" } });
+      messages.push({ role: "user", content: malformedArgsGuidance(msg) });
+      continue;
+    }
 
-      if (delta.content) {
-        contentBuffer += delta.content;
-        finalContent += delta.content;
-        currentContentSeg += delta.content;
-        sendEvent({ type: "content", data: { text: delta.content } });
-      }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for await (const chunk of response as AsyncIterable<any>) {
+        const choice = chunk.choices?.[0];
+        const delta = choice?.delta;
+        if (choice?.finish_reason) lastFinishReason = choice.finish_reason;
+        if (!delta) continue;
 
-      const toolCalls = delta.tool_calls ?? [];
-      for (const toolCall of toolCalls) {
-        const idx = toolCall.index ?? 0;
-        if (idx !== currentToolCallIndex) {
-          currentToolCallIndex = idx;
-          accumulatedToolCalls[idx] = {
-            id: toolCall.id ?? `call_${Date.now()}_${idx}`,
-            type: toolCall.type ?? "function",
-            function: {
-              name: toolCall.function?.name ?? "",
-              arguments: toolCall.function?.arguments ?? "",
-            },
-          };
-        } else {
-          const funcArgs = toolCall.function?.arguments;
-          if (funcArgs) {
-            accumulatedToolCalls[idx].function.arguments += funcArgs;
+        const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
+        if (reasoningDelta) {
+          finalReasoning += reasoningDelta;
+          currentReasoningSeg += reasoningDelta;
+          sendEvent({ type: "reasoning", data: { text: reasoningDelta } });
+        }
+
+        if (delta.content) {
+          contentBuffer += delta.content;
+          finalContent += delta.content;
+          currentContentSeg += delta.content;
+          sendEvent({ type: "content", data: { text: delta.content } });
+        }
+
+        const toolCalls = delta.tool_calls ?? [];
+        for (const toolCall of toolCalls) {
+          const idx = toolCall.index ?? 0;
+          if (idx !== currentToolCallIndex) {
+            currentToolCallIndex = idx;
+            accumulatedToolCalls[idx] = {
+              id: toolCall.id ?? `call_${Date.now()}_${idx}`,
+              type: toolCall.type ?? "function",
+              function: {
+                name: toolCall.function?.name ?? "",
+                arguments: toolCall.function?.arguments ?? "",
+              },
+            };
+          } else {
+            const funcArgs = toolCall.function?.arguments;
+            if (funcArgs) {
+              accumulatedToolCalls[idx].function.arguments += funcArgs;
+            }
           }
         }
       }
+    } catch (streamErr) {
+      if ((streamErr as Error).name === "AbortError") throw streamErr;
+      consecutiveStreamErrors++;
+      if (consecutiveStreamErrors > MAX_CONSECUTIVE_STREAM_ERRORS) {
+        throw streamErr;
+      }
+      const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      await updateSessionStatus(sessionId, "executing");
+      sendEvent({ type: "status", data: { status: "executing", step: "Recovering from a stream error" } });
+      messages.push({ role: "user", content: malformedArgsGuidance(msg) });
+      continue;
     }
 
     // Validate and finalize tool calls
     const validToolCalls = accumulatedToolCalls.filter((tc) => tc?.function?.name);
+
+    // Recovery: if the provider rejected the tool call's JSON arguments and
+    // returned the JSON-parse error as plain content (no tool calls), do not
+    // treat it as a normal completion — feed guidance back and let the model
+    // retry with file-path-based arguments.
+    if (validToolCalls.length === 0 && JSON_PARSE_ERROR_RE.test(contentBuffer)) {
+      consecutiveStreamErrors++;
+      if (consecutiveStreamErrors > MAX_CONSECUTIVE_STREAM_ERRORS) {
+        flushSegments();
+        await updateSessionStatus(sessionId, "error");
+        sendEvent({ type: "status", data: { status: "error", step: "Repeated malformed tool-call arguments" } });
+        return {
+          content: finalContent,
+          reasoning: finalReasoning || undefined,
+          reasoningSegments: reasoningSegments.length ? reasoningSegments : undefined,
+          contentSegments: contentSegments.length ? contentSegments : undefined,
+          toolCallsCount,
+          finishReason: lastFinishReason,
+        };
+      }
+      await updateSessionStatus(sessionId, "executing");
+      sendEvent({ type: "status", data: { status: "executing", step: "Recovering from malformed tool-call arguments" } });
+      messages.push({ role: "user", content: malformedArgsGuidance(contentBuffer.slice(0, 500)) });
+      currentContentSeg = "";
+      contentBuffer = "";
+      continue;
+    }
+    // A clean iteration (tool calls produced or a normal final answer) resets
+    // the consecutive-error counter.
+    consecutiveStreamErrors = 0;
 
     // Anything the model emitted as reasoning/content *before* these tool calls
     // belongs to a segment positioned just before them.
@@ -561,13 +651,36 @@ async function executeSandboxTool(
     case "docx_template_fill": {
       const templatePath = String(args.template_path ?? "");
       const outputPath = String(args.output_path ?? "");
-      const sectionsPath = String(args.sections_path ?? "");
-      let sections = Array.isArray(args.sections) ? args.sections : [];
+      let sectionsPath = String(args.sections_path ?? "");
+      const inlineSections = Array.isArray(args.sections) ? args.sections : [];
+      let sections: unknown[] = [...inlineSections];
       const keepCoverPage = args.keep_cover_page !== false;
       const coverReplacements = (args.cover_replacements as Record<string, string>) ?? {};
       if (!templatePath) {
         return { ok: false, error: "docx_template_fill requires template_path" };
       }
+
+      // If the model passed large inline `sections`, spill them to a temp file
+      // and continue via `sections_path`. This keeps the oversized JSON out of
+      // the conversation context (the inline copy would otherwise be stored on
+      // the assistant tool call and resent every iteration, increasing the
+      // chance of a gateway JSON-parse rejection) and matches the tool's
+      // documented guidance to prefer the file path for non-trivial payloads.
+      if (!sectionsPath && inlineSections.length > 0) {
+        const serialized = JSON.stringify(inlineSections);
+        if (serialized.length > 4096) {
+          const spillPath = `temp/docx_template_sections_${Date.now()}.json`;
+          try {
+            await sandboxFileWrite(sessionId, spillPath, serialized, "utf8");
+            sectionsPath = spillPath;
+            sections = [];
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { ok: false, error: `Failed to spill inline sections to ${spillPath}: ${msg}` };
+          }
+        }
+      }
+
       if (sectionsPath && sections.length === 0) {
         try {
           const fileRes = await sandboxFileRead(sessionId, sectionsPath, "utf8");

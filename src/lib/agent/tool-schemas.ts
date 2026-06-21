@@ -183,7 +183,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "docx_template_fill",
-      description: "Fill a .docx template with new content while preserving the template's cover page, tables, headers/footers, and styles. IMPORTANT for complex sections with many images: first write the JSON sections array to a file (e.g. 'temp/sections.json') using file_write, then pass sections_path. This avoids JSON parsing failures with large arguments.",
+      description: "Fill a .docx template with new content while preserving the template's cover page, tables, headers/footers, and styles. ALWAYS prefer sections_path: first write the JSON sections array to a file (e.g. 'temp/sections.json') with file_write, then pass sections_path. Only use inline sections for tiny payloads (a few hundred chars). Emitting large/complex inline arguments causes JSON parse failures that abort the tool call.",
       parameters: {
         type: "object",
         properties: {
@@ -191,7 +191,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
           output_path: { type: "string", description: "Output path for the new document (e.g. 'output/Protokoll.docx')" },
           sections: {
             type: "array",
-            description: "Content sections to add after the cover page. For large/complex sections, use sections_path instead.",
+            description: "Inline content sections. Avoid for non-trivial content — use sections_path instead. If a large inline array is provided, it is automatically spilled to a temp file.",
             items: {
               type: "object",
               properties: {
@@ -448,7 +448,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - pdf_from_html(html_path, output_path) — convert HTML to PDF via Playwright
 - docx_to_pdf(input_path, output_path) — convert DOCX to PDF via LibreOffice
 - docx_read(path) — read and parse a .docx file (returns structured content: paragraphs, tables, images). Use this instead of file_read for .docx files.
-- docx_template_fill(template_path, output_path, sections?, sections_path?, keep_cover_page?, cover_replacements?) — fill a .docx template with new content. For complex sections with many images, write the sections JSON to a file first and use sections_path to avoid JSON parsing failures.
+- docx_template_fill(template_path, output_path, sections?, sections_path?, keep_cover_page?, cover_replacements?) — fill a .docx template with new content. ALWAYS prefer sections_path: write the sections JSON to a file with file_write first and pass sections_path. Large inline sections arguments cause JSON-parse failures that abort the tool call.
 - docx_create(output_path, python_code) — create Word doc using python-docx
 - docx_build(output_path, program_cs_path?, program_cs?) — build high-quality Word doc using C# + OpenXML SDK. IMPORTANT: write Program.cs via file_write first, then pass the path in program_cs_path.
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
