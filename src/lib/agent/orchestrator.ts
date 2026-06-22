@@ -103,6 +103,123 @@ function malformedArgsGuidance(rawError: string): string {
   );
 }
 
+/**
+ * Streaming splitter that detects "thinking" tags the model sometimes wraps
+ * its private reasoning in — `<thinking>…</thinking>`, `<thought>`,
+ * `<reasoning>`, `<reflection>`, `<analysis>`, `<inner_thought>`,
+ * `<reasoning_content>`, `<scratchpad>` — and reroutes the wrapped text to
+ * the reasoning channel (without the tags) instead of letting it leak into
+ * visible content.
+ *
+ * It is streaming-safe: an opening or closing tag split across deltas is
+ * held back until enough text arrives to decide.
+ */
+class ThinkingSplitter {
+  private buf = "";
+  private inThinking = false;
+  private openTag = "";
+  // We deliberately treat ` Nikki_ᵁ` block markers too.
+
+  constructor(
+    private onContent: (text: string) => void,
+    private onReasoning: (text: string) => void,
+  ) {}
+
+  private static OPEN_TAG_RE =
+    /<(thinking|thought|think|reasoning|reflection|analysis|inner_thought|reasoning_content|scratchpad)\b[^>]*>/i;
+
+  push(text: string): void {
+    this.buf += text;
+    this.drain();
+  }
+
+  flush(): void {
+    if (this.inThinking) {
+      // Unterminated thinking block — keep its content as reasoning.
+      if (this.buf) this.onReasoning(this.buf);
+    } else if (this.buf) {
+      this.onContent(this.buf);
+    }
+    this.buf = "";
+    this.inThinking = false;
+    this.openTag = "";
+  }
+
+  private drain(): void {
+    while (this.buf) {
+      if (this.inThinking) {
+        // Look for the matching closing tag.
+        const closeRe = new RegExp(`</${this.openTag}\\s*>`, "i");
+        const m = this.buf.match(closeRe);
+        if (m && m.index !== undefined) {
+          const inner = this.buf.slice(0, m.index);
+          if (inner) this.onReasoning(inner);
+          this.buf = this.buf.slice(m.index + m[0].length);
+          this.inThinking = false;
+          this.openTag = "";
+          continue;
+        }
+        // No close tag yet. Hold back a small suffix that might be the start
+        // of `</thinking>` so we don't emit it as reasoning prematurely.
+        if (this.buf.length > 12) {
+          const safe = this.buf.length - 12;
+          this.onReasoning(this.buf.slice(0, safe));
+          this.buf = this.buf.slice(safe);
+        }
+        return;
+      }
+      // Not in a thinking block: scan for an opening tag.
+      const m = this.buf.match(ThinkingSplitter.OPEN_TAG_RE);
+      if (m && m.index !== undefined) {
+        if (m.index > 0) this.onContent(this.buf.slice(0, m.index));
+        this.buf = this.buf.slice(m.index + m[0].length);
+        this.inThinking = true;
+        this.openTag = m[1]!.toLowerCase();
+        continue;
+      }
+      // No full opening tag found. The tail of `buf` might be a partial tag
+      // (`<thi…`) that could become a thinking tag once more deltas arrive.
+      // Hold back from the last `<` (within a reasonable window) and emit the
+      // safe prefix as content.
+      const lt = this.buf.lastIndexOf("<");
+      if (lt >= 0 && lt > this.buf.length - 24) {
+        if (lt > 0) {
+          this.onContent(this.buf.slice(0, lt));
+          this.buf = this.buf.slice(lt);
+        }
+        return; // wait for more
+      }
+      this.onContent(this.buf);
+      this.buf = "";
+    }
+  }
+}
+
+/** Format a human-readable status line for a file-producing tool call,
+ *  surfaced as the tool's output so the UI/operator always sees a clear
+ *  success or failure message (never an empty result). */
+function fileToolStatus(
+  label: string,
+  outputPath: string,
+  res: { error?: string | null; stdout?: string },
+  sizeBytes?: number,
+): string {
+  const trimmedStdout = (res.stdout ?? "").trim();
+  if (res.error) {
+    const detail = trimmedStdout ? `\n${trimmedStdout}` : "";
+    return `${label} FAILED → ${outputPath}\n${res.error}${detail}`;
+  }
+  const sizeStr = sizeBytes != null ? ` (${formatBytes(sizeBytes)})` : "";
+  const extra = trimmedStdout ? `\n${trimmedStdout.slice(0, 800)}` : "";
+  return `${label} OK → ${outputPath}${sizeStr}${extra}`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
 /** Rough token estimate (~4 chars/token) used for context-budget checks. */
 function estimateTokens(messages: ChatCompletionMessageParam[]): number {
   let chars = 0;
@@ -335,7 +452,24 @@ export async function runAgentExecution(input: {
     }
 
     let response: AsyncIterable<unknown>;
+    // Detects thinking-tag-wrapped reasoning (`<thinking>…</thinking>` etc.)
+    // in the streamed content and reroutes it to the reasoning channel so it
+    // doesn't appear as visible answer text.
+    const thinker = new ThinkingSplitter(
+      (text) => {
+        contentBuffer += text;
+        finalContent += text;
+        currentContentSeg += text;
+        sendEvent({ type: "content", data: { text } });
+      },
+      (text) => {
+        finalReasoning += text;
+        currentReasoningSeg += text;
+        sendEvent({ type: "reasoning", data: { text } });
+      },
+    );
     try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       response = await client.chat.completions.create(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         createOptions as any,
@@ -371,10 +505,9 @@ export async function runAgentExecution(input: {
         }
 
         if (delta.content) {
-          contentBuffer += delta.content;
-          finalContent += delta.content;
-          currentContentSeg += delta.content;
-          sendEvent({ type: "content", data: { text: delta.content } });
+          // Route through the thinking-tag splitter so wrapped reasoning is
+          // moved to the reasoning channel instead of leaking into content.
+          thinker.push(delta.content);
         }
 
         const toolCalls = delta.tool_calls ?? [];
@@ -398,6 +531,9 @@ export async function runAgentExecution(input: {
           }
         }
       }
+      // Stream for this turn finished — flush any buffered/partial thinking
+      // tag content so it is attributed to the correct segment.
+      thinker.flush();
     } catch (streamErr) {
       if ((streamErr as Error).name === "AbortError") throw streamErr;
       consecutiveStreamErrors++;
@@ -523,14 +659,27 @@ export async function runAgentExecution(input: {
       const durationMs = Date.now() - startMs;
       await completeToolCall(toolCallRecord.id, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
 
-      // For streamed tools (e.g. ipython) the output was already emitted
-      // incrementally as tool_output chunks; sending it again here would
-      // duplicate it in both the live UI and the persisted tool call.
+      // For streamed tools (e.g. ipython) stdout was already emitted
+      // incrementally as tool_output chunks; sending the full capture again
+      // would duplicate it. But the stderr/error trace is NOT streamed (it is
+      // buffered by the wrapper), so on failure we emit the error as a final
+      // chunk. On success with no streamed output, a brief "OK" note keeps the
+      // result area from being empty.
       if (!streamed) {
         sendEvent({
           type: "tool_output",
           data: { toolCallId, output: output.slice(0, 4000) },
         });
+      } else {
+        let summary = "";
+        if (result.error) {
+          summary = `Error: ${result.error}`.slice(0, 4000);
+        } else if (!output.trim()) {
+          summary = "OK (executed, no output)";
+        }
+        if (summary) {
+          sendEvent({ type: "tool_output", data: { toolCallId, output: summary } });
+        }
       }
       sendEvent({
         type: "tool_done",
@@ -685,14 +834,24 @@ async function executeSandboxTool(
     case "pdf_from_html": {
       const htmlPath = String(args.html_path ?? "");
       const outputPath = String(args.output_path ?? "");
-      const res = await sandboxConvertHtmlToPdf(sessionId, htmlPath, outputPath);
-      return { ok: true, result: res, stdout: `PDF created: ${outputPath} (${res.size} bytes)` };
+      try {
+        const res = await sandboxConvertHtmlToPdf(sessionId, htmlPath, outputPath);
+        return { ok: true, result: res, stdout: fileToolStatus("pdf_from_html", outputPath, {}, res.size) };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: msg, stdout: fileToolStatus("pdf_from_html", outputPath, { error: msg }) };
+      }
     }
     case "docx_to_pdf": {
       const inputPath = String(args.input_path ?? "");
       const outputPath = String(args.output_path ?? "");
-      const res = await sandboxConvertDocxToPdf(sessionId, inputPath, outputPath);
-      return { ok: true, result: res, stdout: `PDF created: ${outputPath} (${res.size} bytes)` };
+      try {
+        const res = await sandboxConvertDocxToPdf(sessionId, inputPath, outputPath);
+        return { ok: true, result: res, stdout: fileToolStatus("docx_to_pdf", outputPath, {}, res.size) };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: msg, stdout: fileToolStatus("docx_to_pdf", outputPath, { error: msg }) };
+      }
     }
     case "docx_read": {
       const docxPath = String(args.path ?? "");
@@ -782,11 +941,13 @@ async function executeSandboxTool(
       const dirPath = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(dirPath)}, exist_ok=True)`, 10);
       const res = await sandboxExecPython(sessionId, pythonCode, 120);
+      let sizeBytes: number | undefined;
+      try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist on failure */ }
       return {
         ok: !res.error,
         result: res,
         error: res.error ?? undefined,
-        stdout: res.stdout || `DOCX created: ${outputPath}`,
+        stdout: fileToolStatus("docx_create", outputPath, res, sizeBytes),
       };
     }
     case "docx_build": {
@@ -808,7 +969,7 @@ async function executeSandboxTool(
       return {
         ok: true,
         result: res,
-        stdout: res.stdout || `DOCX built: ${outputPath} (${res.size} bytes)`,
+        stdout: fileToolStatus("docx_build", outputPath, { stdout: res.stdout }, res.size),
       };
     }
     case "xlsx_create": {
@@ -817,11 +978,13 @@ async function executeSandboxTool(
       const dirPath = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(dirPath)}, exist_ok=True)`, 10);
       const res = await sandboxExecPython(sessionId, pythonCode, 120);
+      let sizeBytes: number | undefined;
+      try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist on failure */ }
       return {
         ok: !res.error,
         result: res,
         error: res.error ?? undefined,
-        stdout: res.stdout || `XLSX created: ${outputPath}`,
+        stdout: fileToolStatus("xlsx_create", outputPath, res, sizeBytes),
       };
     }
     case "pptx_create": {
@@ -830,26 +993,31 @@ async function executeSandboxTool(
       const dirPath = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(dirPath)}, exist_ok=True)`, 10);
       const res = await sandboxExecPython(sessionId, pythonCode, 120);
+      let sizeBytes: number | undefined;
+      try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist on failure */ }
       return {
         ok: !res.error,
         result: res,
         error: res.error ?? undefined,
-        stdout: res.stdout || `PPTX created: ${outputPath}`,
+        stdout: fileToolStatus("pptx_create", outputPath, res, sizeBytes),
       };
     }
     case "libreoffice_convert": {
       const inputPath = String(args.input_path ?? "");
       const outputFormat = String(args.output_format ?? "pdf").replace(/[^a-z0-9]/g, "");
-      const outputPath = String(args.output_path ?? "");
+      const outputPath = String(args.output_path ?? "") || `output/${inputPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "converted"}.${outputFormat}`;
       const outDir = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(outDir)}, exist_ok=True)`, 10);
       const cmd = `HOME=/tmp libreoffice --headless --nologo --convert-to ${outputFormat} --outdir "${outDir.replace(/"/g, '\\"')}" "${inputPath.replace(/"/g, '\\"')}"`;
       const res = await sandboxExecShell(sessionId, cmd, "/", 120);
+      let sizeBytes: number | undefined;
+      try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist */ }
       return {
         ok: res.exit_code === 0 && !res.error,
         result: res,
         error: res.error ?? (res.exit_code !== 0 ? `Exit code ${res.exit_code}` : undefined),
-        stdout: res.stdout || `Converted ${inputPath} to ${outputFormat}`,
+        stdout: fileToolStatus("libreoffice_convert", outputPath,
+          { error: res.error ?? (res.exit_code !== 0 ? `Exit code ${res.exit_code}` : null), stdout: res.stdout }, sizeBytes),
       };
     }
     // ── Web & Search Tools ──────────────────────────────────────────────────
@@ -1352,11 +1520,16 @@ print(json.dumps(out))
       const dirPath = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(dirPath)}, exist_ok=True)`, 10);
       const res = await sandboxExecPython(sessionId, pythonCode, 120);
+      let sizeBytes: number | undefined;
+      try {
+        const info = await sandboxFileInfo(sessionId, outputPath);
+        sizeBytes = info.size;
+      } catch { /* file may not exist on failure */ }
       return {
         ok: !res.error,
         result: res,
         error: res.error ?? undefined,
-        stdout: res.stdout || `Chart saved to ${outputPath}`,
+        stdout: fileToolStatus("chart_create", outputPath, res, sizeBytes),
       };
     }
     case "image_analyze": {

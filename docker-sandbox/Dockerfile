@@ -53,7 +53,8 @@ RUN pip install --no-cache-dir \
     numpy pandas scipy \
     scikit-learn sqlalchemy statsmodels \
     requests beautifulsoup4 \
-    plotly seaborn altair kaleido \
+    plotly seaborn altair \
+    kaleido==0.2.1 vl-convert-python \
     flask gunicorn dill \
     playwright
 
