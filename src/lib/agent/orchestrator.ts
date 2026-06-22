@@ -56,6 +56,7 @@ import {
   sandboxExecPython,
   sandboxExecPythonStream,
   sandboxExecShell,
+  sandboxPptxRun,
   sandboxWebRender,
   type SandboxCookie,
   sandboxFileDelete,
@@ -349,6 +350,18 @@ export async function runAgentExecution(input: {
     }
     if (msgLower.includes("pdf") || msgLower.includes("report")) {
       neededSkills.add("pdf");
+    }
+    if (
+      msgLower.includes("ppt") ||
+      msgLower.includes("pptx") ||
+      msgLower.includes("pptd") ||
+      msgLower.includes("powerpoint") ||
+      msgLower.includes("presentation") ||
+      msgLower.includes("slides") ||
+      msgLower.includes("slide deck") ||
+      msgLower.includes("folien")
+    ) {
+      neededSkills.add("pptx");
     }
     for (const skill of neededSkills) {
       try {
@@ -987,20 +1000,62 @@ async function executeSandboxTool(
         stdout: fileToolStatus("xlsx_create", outputPath, res, sizeBytes),
       };
     }
-    case "pptx_create": {
+    case "pptx_render": {
+      const inputPath = String(args.input_path ?? "");
       const outputPath = String(args.output_path ?? "");
-      const pythonCode = String(args.python_code ?? "");
-      const dirPath = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
-      await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(dirPath)}, exist_ok=True)`, 10);
-      const res = await sandboxExecPython(sessionId, pythonCode, 120);
-      let sizeBytes: number | undefined;
-      try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist on failure */ }
-      return {
-        ok: !res.error,
-        result: res,
-        error: res.error ?? undefined,
-        stdout: fileToolStatus("pptx_create", outputPath, res, sizeBytes),
-      };
+      if (!inputPath) return { ok: false, error: "pptx_render requires input_path" };
+      if (!outputPath) return { ok: false, error: "pptx_render requires output_path" };
+      try {
+        const res = await sandboxPptxRun(sessionId, "convert", { input_path: inputPath, output_path: outputPath });
+        const sizeBytes = res.size;
+        const label = "pptx_render";
+        const trimmed = (res.stdout ?? "").trim();
+        const ok = res.exit_code === 0;
+        const stdout = ok
+          ? fileToolStatus(label, outputPath, { stdout: trimmed }, sizeBytes)
+          : `${label} FAILED → ${outputPath}\n${trimmed}\n${(res.stderr ?? "").trim()}`.slice(0, 4000);
+        return { ok, result: res, error: ok ? undefined : `pptx_render failed (exit ${res.exit_code})`, stdout };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: msg, stdout: fileToolStatus("pptx_render", outputPath, { error: msg }) };
+      }
+    }
+    case "pptx_check": {
+      const inputPath = String(args.input_path ?? "");
+      if (!inputPath) return { ok: false, error: "pptx_check requires input_path" };
+      try {
+        const res = await sandboxPptxRun(sessionId, "check", { input_path: inputPath });
+        const ok = res.exit_code === 0;
+        const report = [res.stdout ?? "", res.stderr ?? ""].filter(Boolean).join("\n").trim();
+        return {
+          ok,
+          result: res,
+          error: ok ? undefined : `pptx_check reported errors (exit ${res.exit_code})`,
+          stdout: report.slice(0, 12000) || (ok ? "OK — 0 errors, 0 warnings" : "Checker returned no output"),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `pptx_check failed: ${msg}` };
+      }
+    }
+    case "pptx_screenshot": {
+      const inputPath = String(args.input_path ?? "");
+      const outputPath = String(args.output_path ?? "");
+      const pages = String(args.pages ?? "");
+      if (!inputPath) return { ok: false, error: "pptx_screenshot requires input_path" };
+      if (!outputPath) return { ok: false, error: "pptx_screenshot requires output_path" };
+      try {
+        const res = await sandboxPptxRun(sessionId, "screenshot", { input_path: inputPath, output_path: outputPath, pages });
+        const ok = res.exit_code === 0;
+        const imgs = Array.isArray(res.images) ? res.images : [];
+        const summary = ok
+          ? `Rendered ${imgs.length} screenshot(s) → ${outputPath}\n${imgs.slice(0, 30).join("\n")}`
+          : `pptx_screenshot FAILED\n${(res.stdout ?? "").trim()}\n${(res.stderr ?? "").trim()}`.slice(0, 4000);
+        return { ok, result: res, error: ok ? undefined : `pptx_screenshot failed (exit ${res.exit_code})`, stdout: summary };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `pptx_screenshot failed: ${msg}` };
+      }
     }
     case "libreoffice_convert": {
       const inputPath = String(args.input_path ?? "");
@@ -1801,7 +1856,7 @@ async function scanForArtifacts(
   sendEvent: (event: AgentSseEvent) => void
 ): Promise<void> {
   // After file write or conversion tools, scan the output directory for new artifacts
-  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_create", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
+  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_render", "pptx_screenshot", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
 
   try {
     const files = await sandboxFileList(sessionId, "output/");

@@ -457,7 +457,9 @@ function toolCallLabel(toolName: string, args?: Record<string, unknown>): string
     docx_create: "output_path",
     docx_build: "output_path",
     xlsx_create: "output_path",
-    pptx_create: "output_path",
+    pptx_render: "output_path",
+    pptx_check: "input_path",
+    pptx_screenshot: "input_path",
     libreoffice_convert: "input_path",
   };
   const key = singleArgTools[toolName];

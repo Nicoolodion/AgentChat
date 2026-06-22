@@ -48,6 +48,35 @@ export async function GET(
       // No references directory
     }
 
+    // Some skills (e.g. pptx) organize their docs under format/ and guideline/
+    // instead of references/. Surface those recursively so the detail endpoint
+    // gives a complete picture of the skill's reference tree.
+    for (const sub of ["format", "guideline"]) {
+      try {
+        const subDir = path.join(skillDir, sub);
+        const stack: Array<{ dir: string; rel: string }> = [{ dir: subDir, rel: sub }];
+        while (stack.length > 0) {
+          const { dir, rel } = stack.pop()!;
+          let entries: import("node:fs").Dirent[];
+          try {
+            entries = await readdir(dir, { withFileTypes: true });
+          } catch {
+            continue;
+          }
+          for (const entry of entries) {
+            const childRel = `${rel}/${entry.name}`;
+            if (entry.isDirectory()) {
+              stack.push({ dir: path.join(dir, entry.name), rel: childRel });
+            } else if (entry.isFile() && entry.name.endsWith(".md")) {
+              references.push({ name: childRel, path: childRel });
+            }
+          }
+        }
+      } catch {
+        // optional directory
+      }
+    }
+
     const skill: SkillDetail = {
       name: skillName,
       SKILL_md: skillMd,

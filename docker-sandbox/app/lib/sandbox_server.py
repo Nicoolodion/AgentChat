@@ -11,6 +11,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1224,6 +1225,161 @@ def docx_build() -> Response:
         return make_error("DOCX build timed out", 504)
     except Exception as e:
         return make_error(f"DOCX build error: {e}", 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PPTX (PPTD skill) — runs the bundled kimi_pptd binary
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The kimi_pptd runtime ships as a Nuitka-compiled ELF plus sibling .so libs
+# under skills/pptx/scripts/runtime/. The skills mount is read-only, and the
+# host may not preserve the executable bit (Windows copies, some CI checkouts).
+# We therefore use the in-place binary when it is already executable, and fall
+# back to a cached, chmod'd copy in /tmp otherwise.
+_KIMI_RUNTIME_CACHE = Path("/tmp/kimi_pptd_runtime")
+
+
+def _resolve_kimi_pptd() -> tuple[Path, Path]:
+    """Return (binary_path, runtime_dir) for the kimi_pptd executable,
+    preparing a cached executable copy if the mounted binary is not exec."""
+    runtime_dir = SKILLS_ROOT / "pptx" / "scripts" / "runtime"
+    binary = runtime_dir / "kimi_pptd"
+    if not binary.exists():
+        raise FileNotFoundError(
+            "kimi_pptd binary not found at /app/skills/pptx/scripts/runtime/kimi_pptd"
+        )
+
+    # Fast path: mounted binary is already executable (e.g. Docker Desktop).
+    if os.access(str(binary), os.X_OK):
+        return binary, runtime_dir
+
+    # Fallback: copy the runtime into a writable location and chmod the binary.
+    cache_binary = _KIMI_RUNTIME_CACHE / "kimi_pptd"
+    ready = _KIMI_RUNTIME_CACHE / ".ready"
+    if not ready.exists():
+        if _KIMI_RUNTIME_CACHE.exists():
+            shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
+        shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
+        os.chmod(cache_binary, 0o755)
+        ready.touch()
+    return cache_binary, _KIMI_RUNTIME_CACHE
+
+
+@app.route("/pptx/run", methods=["POST"])
+def pptx_run() -> Response:
+    """Run a kimi_pptd subcommand (check | convert | screenshot) on a
+    workspace file. This is the PPTD skill's execution backend."""
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id", "default")
+    action = (data.get("action") or "").strip()
+    input_path = data.get("input_path", "")
+    output_path = data.get("output_path", "")
+    pages = data.get("pages", "")
+
+    if action not in ("check", "convert", "screenshot"):
+        return make_error(
+            "Invalid 'action'; must be one of check, convert, screenshot", 400
+        )
+    if not input_path:
+        return make_error("Missing 'input_path'", 400)
+
+    ensure_session_dirs(session_id)
+    try:
+        in_file = resolve_workspace_path(session_id, input_path)
+    except ValueError:
+        return make_error("Invalid input_path", 400)
+    if not in_file.exists():
+        return make_error(f"Input file not found: {input_path}", 404)
+
+    out_file: Optional[Path] = None
+    if output_path:
+        try:
+            out_file = resolve_workspace_path(session_id, output_path)
+        except ValueError:
+            return make_error("Invalid output_path", 400)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        # screenshot writes into a directory; reverse convert (pptx -> pptd)
+        # is invoked with a trailing-slash output dir. mirror that.
+        if action == "screenshot" or output_path.endswith("/"):
+            out_file.mkdir(parents=True, exist_ok=True)
+
+    try:
+        binary, runtime_dir = _resolve_kimi_pptd()
+    except FileNotFoundError as e:
+        return make_error(str(e), 500)
+
+    argv = [str(binary), action, str(in_file)]
+    if action in ("convert", "screenshot") and out_file is not None:
+        argv += ["-o", str(out_file)]
+    if action == "screenshot" and pages:
+        argv += ["-p", str(pages)]
+
+    env = os.environ.copy()
+    # Match scripts/*.sh locale handling so UTF-8 paths work under POSIX/C.
+    env["PYTHONUTF8"] = "1"
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
+    # Let the binary resolve its bundled shared libraries relative to itself.
+    env["LD_LIBRARY_PATH"] = (
+        str(runtime_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    )
+
+    # Run with cwd = the input file's directory so any (legacy) relative page
+    # references resolve against the .pptd's own location.
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(in_file.parent),
+            env=env,
+        )
+        duration_ms = int((time.time() - start) * 1000)
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        result: dict[str, Any] = {
+            "action": action,
+            "exit_code": proc.returncode,
+            "stdout": stdout[-MAX_OUTPUT_SIZE:] if len(stdout) > MAX_OUTPUT_SIZE else stdout,
+            "stderr": stderr[-MAX_OUTPUT_SIZE:] if len(stderr) > MAX_OUTPUT_SIZE else stderr,
+            "duration_ms": duration_ms,
+        }
+
+        if out_file is not None and out_file.exists():
+            if out_file.is_file():
+                result["output_path"] = str(out_file)
+                result["size"] = out_file.stat().st_size
+            elif action == "screenshot":
+                # screenshot directory: list generated images (relative to
+                # workspace) so the orchestrator can surface them.
+                session_workspace = (WORKSPACE_ROOT / session_id).resolve()
+                rel_files: list[str] = []
+                for child in sorted(out_file.iterdir()):
+                    if child.is_file() and child.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                        try:
+                            rel_files.append(str(child.relative_to(session_workspace)))
+                        except ValueError:
+                            rel_files.append(child.name)
+                result["output_dir"] = str(out_file)
+                result["images"] = rel_files
+            else:
+                # reverse convert (pptx -> pptd) produced a project directory.
+                result["output_dir"] = str(out_file)
+
+        if proc.returncode != 0:
+            return make_error(
+                f"kimi_pptd {action} failed (exit {proc.returncode}):\n{stdout}\n{stderr}",
+                500,
+            )
+        return make_success(result)
+    except subprocess.TimeoutExpired:
+        return make_error(f"kimi_pptd {action} timed out", 504)
+    except Exception as e:  # pragma: no cover
+        logger.exception("pptx_run error")
+        return make_error(f"kimi_pptd {action} error: {e}", 500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

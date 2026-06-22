@@ -277,15 +277,45 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "pptx_create",
-      description: "Create a PowerPoint presentation using python-pptx. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/file.pptx'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
+      name: "pptx_render",
+      description: "Render a PPTD project (.pptd) to a .pptx file using the pptx skill's kimi_pptd runtime. This is the deliverable-producing step for presentations — after authoring the .pptd + pages/ files with file_write and validating with pptx_check, call this to produce the final .pptx. Pass input_path pointing at the .pptd main entry file and output_path ending in .pptx. Converting a user-uploaded .pptx to .pptd (to read/edit its structure) is also supported: pass a .pptx as input_path and a directory (or .pptd path) as output_path. Do NOT use python-pptx / pptx_create for presentations — the PPTD pipeline is the only allowed path.",
       parameters: {
         type: "object",
         properties: {
-          output_path: { type: "string", description: "Relative path for output PPTX (e.g. 'output/slides.pptx')" },
-          python_code: { type: "string", description: "Python code using python-pptx to build the presentation. Use relative paths or WORKSPACE_DIR for absolute paths." },
+          input_path: { type: "string", description: "Relative path to the .pptd main entry file (e.g. 'output/mydeck/deck.pptd') or a .pptx for reverse conversion" },
+          output_path: { type: "string", description: "Relative path for the output .pptx (e.g. 'output/mydeck.pptx'), or an output directory when converting .pptx -> .pptd" },
         },
-        required: ["output_path", "python_code"],
+        required: ["input_path", "output_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pptx_check",
+      description: "Validate a .pptd presentation project (format errors, text overflow/occlusion/drift/underfill, out-of-bounds elements) using the pptx skill's kimi_pptd checker. MUST be run after generating the .pptd + .page files and before delivering. Returns the full checker report (read it entirely — do not grep). Fix every ERROR and every unexpected WARNING, then re-run until the Summary reports 0 errors, 0 warnings.",
+      parameters: {
+        type: "object",
+        properties: {
+          input_path: { type: "string", description: "Relative path to the .pptd main entry file (e.g. 'output/mydeck/deck.pptd')" },
+        },
+        required: ["input_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pptx_screenshot",
+      description: "Render pages of a .pptx (or .pptd) presentation to PNG screenshots via the pptx skill's kimi_pptd runtime. Use this to visually inspect a user-uploaded .pptx (reference its design/style) or to verify your generated deck before delivery. Returns a list of generated image paths under the output directory.",
+      parameters: {
+        type: "object",
+        properties: {
+          input_path: { type: "string", description: "Relative path to the .pptx or .pptd file (e.g. 'upload/template.pptx')" },
+          output_path: { type: "string", description: "Relative path to an output directory for the PNGs (e.g. 'temp/screens/')" },
+          pages: { type: "string", description: "Optional page selector: comma list '1,3,5' or range '2-6'. Omit to render all pages." },
+        },
+        required: ["input_path", "output_path"],
       },
     },
   },
@@ -429,6 +459,9 @@ export const SKILL_EXTENSIONS: Record<string, string> = {
   ".docx": "docx",
   ".doc": "docx",
   ".pdf": "pdf",
+  ".pptx": "pptx",
+  ".ppt": "pptx",
+  ".pptd": "pptx",
 };
 
 const AGENT_SYSTEM_PROMPT_BASE = `You are the Chatinterface Agent — an autonomous reasoning engine that helps users create documents, analyze files, write code, search the web, and perform multi-step tasks.
@@ -469,7 +502,9 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - docx_create(output_path, python_code) — create Word doc using python-docx
 - docx_build(output_path, program_cs_path?, program_cs?) — build high-quality Word doc using C# + OpenXML SDK. IMPORTANT: write Program.cs via file_write first, then pass the path in program_cs_path.
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
-- pptx_create(output_path, python_code) — create PowerPoint using python-pptx
+- pptx_render(input_path, output_path) — render a .pptd project to the final .pptx (or convert a user .pptx to .pptd) via the pptx skill's kimi_pptd runtime. This is the ONLY allowed way to produce presentations — do NOT use python-pptx.
+- pptx_check(input_path) — validate a .pptd project (format + overflow/occlusion checks). Always run after authoring and before delivery.
+- pptx_screenshot(input_path, output_path, pages?) — render .pptx/.pptd pages to PNG screenshots (inspect uploaded decks or verify your output).
 - libreoffice_convert(input_path, output_format, output_path?) — convert office formats
 
 ### Web & Search
@@ -489,6 +524,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 Skills are mounted at /app/skills/ and provide domain expertise for document generation tasks. The relevant SKILL.md content for your task is automatically injected below when applicable.
 - /app/skills/docx/ — Word documents (C# + OpenXML SDK creation, WIR editing)
 - /app/skills/pdf/ — PDF generation from HTML
+- /app/skills/pptx/ — Presentations via the PPTD domain-specific language. Author a .pptd entry file + pages/*.page files with file_write, validate with pptx_check, then render to .pptx with pptx_render. Direct creation via python-pptx is prohibited; always use the PPTD pipeline. Read format/pptd.md, format/shapes.md, format/fonts.md and the guideline/ docs (generate_slides.md, edit_user_slides.md, content/*, design/*) under /app/skills/pptx/ before writing PPTD.
 
 If you need a skill not included below, use file_read with the path /app/skills/<skill>/SKILL.md.
 

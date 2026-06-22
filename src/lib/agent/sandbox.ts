@@ -534,3 +534,41 @@ export async function sandboxDocxBuild(
   })) as { output_path: string; size: number; stdout: string };
   return res;
 }
+
+// ── PPTX / PPTD skill ────────────────────────────────────────────────────────
+
+export type SandboxPptxRunResult = {
+  action: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+  output_path?: string;
+  size?: number;
+  output_dir?: string;
+  images?: string[];
+};
+
+/**
+ * Run a kimi_pptd subcommand (the PPTD skill's runtime binary) on a workspace
+ * file. Actions: `check` (validate a .pptd), `convert` (.pptd <-> .pptx, auto
+ * detected by extension), `screenshot` (render .pptx/.pptd pages to PNGs).
+ */
+export async function sandboxPptxRun(
+  sessionId: string,
+  action: "check" | "convert" | "screenshot",
+  params: { input_path: string; output_path?: string; pages?: string }
+): Promise<SandboxPptxRunResult> {
+  const res = (await sandboxFetch("/pptx/run", {
+    method: "POST",
+    body: JSON.stringify({
+      action,
+      session_id: sessionId,
+      input_path: params.input_path,
+      output_path: params.output_path ?? "",
+      pages: params.pages ?? "",
+    }),
+    timeout: 310_000,
+  })) as SandboxPptxRunResult;
+  return res;
+}
