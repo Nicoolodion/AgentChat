@@ -1261,6 +1261,12 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
             shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
         shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
         os.chmod(cache_binary, 0o755)
+        # The bundled python-pptx resolves template XMLs via the relative path
+        # pptx/oxml/../templates/*.xml. Nuitka reports the oxml module's path
+        # under this tree, so the pptx/oxml/ directory MUST physically exist —
+        # otherwise convert/screenshot (which import pptx) fail with
+        # FileNotFoundError even though pptx/templates/*.xml are present.
+        (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
         ready.touch()
     return cache_binary, _KIMI_RUNTIME_CACHE
 
