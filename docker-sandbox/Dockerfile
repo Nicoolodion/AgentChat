@@ -50,8 +50,11 @@ RUN pip install --no-cache-dir \
     python-docx docxtpl python-pptx openpyxl lxml \
     pikepdf pdfplumber weasyprint \
     Pillow matplotlib opencv-python \
-    numpy pandas requests beautifulsoup4 \
-    flask gunicorn \
+    numpy pandas scipy \
+    scikit-learn sqlalchemy statsmodels \
+    requests beautifulsoup4 \
+    plotly seaborn altair kaleido \
+    flask gunicorn dill \
     playwright
 
 # ── Playwright browsers & deps ────────────────────────────────────────────────

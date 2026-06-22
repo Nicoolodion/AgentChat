@@ -54,7 +54,10 @@ import {
   sandboxDocxRead,
   sandboxDocxTemplateFill,
   sandboxExecPython,
+  sandboxExecPythonStream,
   sandboxExecShell,
+  sandboxWebRender,
+  type SandboxCookie,
   sandboxFileDelete,
   sandboxFileList,
   sandboxFileRead,
@@ -210,10 +213,14 @@ export async function runAgentExecution(input: {
 
   // Auto-detect relevant skills from uploaded files
   const skillContent = new Map<string, string>();
+  // Files present in upload/ when the run starts. Surfaced to the model
+  // directly (below) so it does not need a round-trip file_list call to
+  // discover that the user attached files.
+  let uploadFiles: Awaited<ReturnType<typeof sandboxFileList>> = [];
   try {
-    const files = await sandboxFileList(sessionId, "upload/");
+    uploadFiles = await sandboxFileList(sessionId, "upload/");
     const neededSkills = new Set<string>();
-    for (const file of files) {
+    for (const file of uploadFiles) {
       const ext = file.name.includes(".") ? "." + file.name.split(".").pop()!.toLowerCase() : "";
       const skill = SKILL_EXTENSIONS[ext];
       if (skill) neededSkills.add(skill);
@@ -239,8 +246,29 @@ export async function runAgentExecution(input: {
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: systemPrompt },
     ...priorConversation.map((m) => ({ role: m.role, content: m.content }) as ChatCompletionMessageParam),
-    { role: "user", content: userMessage },
   ];
+
+  // Inject a manifest of the files currently in upload/ right before the user
+  // message. Without this the model often does not realize it has files until
+  // it calls file_list. Keep it compact (name/size/kind) so it's cheap on
+  // context.
+  if (uploadFiles.length > 0) {
+    const lines = uploadFiles
+      .filter((f) => !f.is_directory)
+      .map((f) => {
+        const kind = f.mime_type ? ` (${f.mime_type})` : "";
+        const sizeKb = f.size > 0 ? `, ${(f.size / 1024).toFixed(f.size < 1024 * 10 ? 1 : 0)} KB` : "";
+        return `- upload/${f.name}${sizeKb}${kind}`;
+      });
+    if (lines.length > 0) {
+      const manifest =
+        `The following file(s) were just placed in your workspace upload/ directory by the user for this request:\n${lines.join("\n")}\n` +
+        `Use them directly with file_read / docx_read / ipython / image_analyze as appropriate. You do not need to call file_list first.`;
+      messages.push({ role: "system", content: manifest });
+    }
+  }
+
+  messages.push({ role: "user", content: userMessage });
 
   let finalContent = "";
   let finalReasoning = "";
@@ -473,11 +501,16 @@ export async function runAgentExecution(input: {
       const startMs = Date.now();
       let result: { ok: boolean; result?: unknown; error?: string };
       let output = "";
+      let streamed = false;
 
       try {
-        const execResult = await executeSandboxTool(sessionId, toolName, toolArgs, model);
+        const execResult = await executeSandboxTool(sessionId, toolName, toolArgs, model, {
+          sendEvent,
+          toolCallId,
+        });
         result = { ok: execResult.ok, result: execResult.result, error: execResult.error };
         output = execResult.stdout ?? "";
+        streamed = !!execResult.streamed;
 
         // Detect artifacts after file-writing tools
         await scanForArtifacts(sessionId, toolName, toolArgs, sendEvent);
@@ -490,10 +523,15 @@ export async function runAgentExecution(input: {
       const durationMs = Date.now() - startMs;
       await completeToolCall(toolCallRecord.id, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
 
-      sendEvent({
-        type: "tool_output",
-        data: { toolCallId, output: output.slice(0, 4000) },
-      });
+      // For streamed tools (e.g. ipython) the output was already emitted
+      // incrementally as tool_output chunks; sending it again here would
+      // duplicate it in both the live UI and the persisted tool call.
+      if (!streamed) {
+        sendEvent({
+          type: "tool_output",
+          data: { toolCallId, output: output.slice(0, 4000) },
+        });
+      }
       sendEvent({
         type: "tool_done",
         data: { toolCallId, toolName, ok: result.ok, durationMs, error: result.error },
@@ -541,8 +579,9 @@ async function executeSandboxTool(
   sessionId: string,
   toolName: string,
   args: Record<string, unknown>,
-  model: string
-): Promise<{ ok: boolean; result?: unknown; error?: string; stdout?: string }> {
+  model: string,
+  streamCtx?: { sendEvent: (event: AgentSseEvent) => void; toolCallId: string }
+): Promise<{ ok: boolean; result?: unknown; error?: string; stdout?: string; streamed?: boolean }> {
   switch (toolName) {
     // ── File Tools ──────────────────────────────────────────────────────────
     case "file_read": {
@@ -587,6 +626,27 @@ async function executeSandboxTool(
       const compileCheck = await sandboxExecPython(sessionId, `compile(${JSON.stringify(code)}, '<string>', 'exec')`, 10);
       if (compileCheck.error) {
         return { ok: false, error: `Syntax error: ${compileCheck.stderr || compileCheck.error}`, result: null };
+      }
+      // When the caller supports streaming, emit stdout/stderr chunks as
+      // tool_output events in real time so long-running commands show
+      // progress instead of only the final capture. Falls back to the
+      // non-streaming endpoint otherwise.
+      if (streamCtx) {
+        let accumulated = "";
+        const res = await sandboxExecPythonStream(sessionId, code, timeout, (stream, text) => {
+          accumulated += text;
+          streamCtx.sendEvent({
+            type: "tool_output",
+            data: { toolCallId: streamCtx.toolCallId, output: text },
+          });
+        });
+        return {
+          ok: !res.error,
+          result: res,
+          error: res.error ?? undefined,
+          stdout: res.stdout || res.stderr || accumulated,
+          streamed: true,
+        };
       }
       const res = await sandboxExecPython(sessionId, code, timeout);
       return {
@@ -657,6 +717,7 @@ async function executeSandboxTool(
       const inlineSections = Array.isArray(args.sections) ? args.sections : [];
       let sections: unknown[] = [...inlineSections];
       const keepCoverPage = args.keep_cover_page !== false;
+      const includeToc = args.include_toc === true;
       const coverReplacements = (args.cover_replacements as Record<string, string>) ?? {};
       if (!templatePath) {
         return { ok: false, error: "docx_template_fill requires template_path" };
@@ -707,7 +768,7 @@ async function executeSandboxTool(
             content?: string;
             images?: Array<{ path: string; caption?: string; width?: number }>;
           }>,
-          { keepCoverPage, coverReplacements }
+          { keepCoverPage, coverReplacements, includeToc }
         );
         return { ok: true, result: res, stdout: res.summary };
       } catch (err) {
@@ -870,6 +931,13 @@ print(json.dumps({"results": results[:max_results], "error": error}))
     case "web_fetch": {
       const url = String(args.url ?? "");
       const format = (args.format as FetchFormat) ?? "text";
+      // Optional: force a headless-browser render (for SPAs whose static HTML
+      // is an empty shell) instead of the fast static fetch.
+      const renderJs = args.render_js === true;
+      const waitFor = String(args.wait_for ?? "").trim();
+      const cookies: SandboxCookie[] = Array.isArray(args.cookies)
+        ? args.cookies.filter((c): c is SandboxCookie => typeof c === "object" && c !== null && typeof (c as { name?: unknown }).name === "string" && typeof (c as { value?: unknown }).value === "string")
+        : [];
       // SSRF guard: reject non-http(s) and private/loopback/internal hosts
       // before issuing the request.
       const urlValidation = validateFetchUrl(url);
@@ -877,6 +945,9 @@ print(json.dumps({"results": results[:max_results], "error": error}))
         return { ok: false, error: urlValidation.error, result: { url }, stdout: urlValidation.error };
       }
       const headers = buildBrowserHeaders(url);
+      if (cookies.length > 0) {
+        headers["Cookie"] = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+      }
       const fetchCode = `
 import json, urllib.request, urllib.parse, gzip, zlib
 
@@ -1004,6 +1075,9 @@ print(json.dumps(out))
 
       const rawBody = parsed.body ?? "";
       const htmlBody = isHtmlBody(contentType, finalUrl);
+      // Title/URL that may be overridden by a headless-browser render below.
+      let displayTitle = meta.title;
+      let displayUrl = finalUrl;
       let content: string;
       if (format === "html") {
         content = truncateForOutput(stripNonContent(rawBody));
@@ -1023,9 +1097,41 @@ print(json.dumps(out))
       // calls. Surface the embedded data directly when the visible body is
       // thin (or when structured JSON/JSON-LD scripts exist).
       if (htmlBody) {
+        let workingBody = rawBody;
         const visibleText = htmlToText(rawBody).replace(/\s+/g, " ").trim();
         const thin = visibleText.length < 3000;
-        const scriptData = extractScriptData(rawBody, { includeJsAssignments: thin });
+
+        // If the static body is a thin shell (or the caller explicitly asked
+        // for a JS render), re-fetch the page with a headless browser so the
+        // DOM is actually built. This is what makes modern SPAs return real
+        // content instead of an empty `<div id="app"></div>`.
+        if (renderJs || thin) {
+          try {
+            const rendered = await sandboxWebRender(sessionId, url, {
+              cookies,
+              waitFor,
+              timeout: 35,
+            });
+            if (rendered.html && rendered.html.length > 0) {
+              workingBody = rendered.html;
+              displayUrl = rendered.final_url || finalUrl;
+              displayTitle = rendered.title || meta.title;
+              // Re-derive content from the rendered DOM.
+              if (format === "html") {
+                content = truncateForOutput(stripNonContent(workingBody));
+              } else if (format === "markdown") {
+                content = truncateForOutput(htmlToMarkdown(stripNonContent(workingBody), displayUrl));
+              } else {
+                content = truncateForOutput(htmlToText(workingBody));
+              }
+            }
+          } catch {
+            // Rendering unavailable or failed — continue with the static body
+            // and the inline/external script extraction below.
+          }
+        }
+
+        const scriptData = extractScriptData(workingBody, { includeJsAssignments: thin });
         if (scriptData.length > 0) {
           content = truncateForOutput(content + formatScriptData(scriptData), 100_000);
         } else if (thin) {
@@ -1034,7 +1140,7 @@ print(json.dumps(out))
           // built with the Interactive CYOA Creator, where the whole project
           // is a JSON string embedded in app.js). Follow a few same-origin
           // <script src> files and mine JSON string literals out of them.
-          const srcs = extractExternalScriptSrcs(rawBody, finalUrl).slice(0, 3);
+          const srcs = extractExternalScriptSrcs(workingBody, displayUrl).slice(0, 3);
           for (const src of srcs) {
             const v2 = validateFetchUrl(src.url);
             if (!v2.ok) continue;
@@ -1099,8 +1205,8 @@ print(json.dumps(out))
       }
 
       const prefix =
-        meta.title || meta.description
-          ? `# ${meta.title}${meta.description ? `\n> ${meta.description}` : ""}\n\n`
+        displayTitle || meta.description
+          ? `# ${displayTitle}${meta.description ? `\n> ${meta.description}` : ""}\n\n`
           : "";
 
       const fullOutput = prefix + content;
@@ -1111,10 +1217,11 @@ print(json.dumps(out))
         // message). `stdout` mirrors the same text for the live UI.
         result: {
           contentType,
-          finalUrl,
+          finalUrl: displayUrl,
           size: parsed.size ?? 0,
           status: parsed.status,
           format,
+          rendered: renderJs,
           content: fullOutput,
         },
         stdout: fullOutput,
@@ -1366,6 +1473,81 @@ print(json.dumps(out))
             ? `All vision models failed: ${failures.join("; ")}`
             : "All vision models failed to produce a usable response",
         });
+      }
+
+      // Multi-image cross-reasoning: when more than one image is provided,
+      // send them all in a single vision call so the model can compare,
+      // contrast, and reason across them together (instead of describing each
+      // in isolation and leaving the cross-image synthesis to a later step).
+      if (paths.length > 1) {
+        const loaded: { path: string; dataUrl: string }[] = [];
+        const readErrors: { path: string; error: string }[] = [];
+        const mimeMap: Record<string, string> = {
+          jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+        };
+        for (const p of paths) {
+          try {
+            const fr = await sandboxFileRead(sessionId, p, "base64");
+            if (!fr.content || fr.content.length < 100) {
+              readErrors.push({ path: p, error: `Failed to read image data (${fr.content?.length ?? 0} bytes)` });
+              continue;
+            }
+            const ext = p.includes(".") ? p.split(".").pop()!.toLowerCase() : "png";
+            const mime = mimeMap[ext] ?? "image/png";
+            loaded.push({ path: p, dataUrl: `data:${mime};base64,${fr.content}` });
+          } catch (err) {
+            if ((err as Error).name === "AbortError") throw err;
+            readErrors.push({ path: p, error: sanitizeVisionError(err instanceof Error ? err.message : String(err)) });
+          }
+        }
+
+        if (loaded.length >= 2) {
+          const multiPrompt =
+            `You are given ${loaded.length} images, in order (Image 1 … Image ${loaded.length}). ` +
+            `First give a concise per-image description, each prefixed with "Image N:". ` +
+            `Then address the following request, comparing / contrasting / reasoning ACROSS the images where relevant:\n${promptBase}`;
+          let multiFailed = false;
+          for (const modelId of candidateModels) {
+            for (const useDetail of [detail, "low"] as const) {
+              try {
+                const client = getOpenAIClientForModel(modelId);
+                const response = await client.chat.completions.create({
+                  model: resolveApiModelId(modelId),
+                  messages: [
+                    { role: "system", content: VISION_SYSTEM_PROMPT },
+                    { role: "user", content: [
+                      { type: "text", text: multiPrompt },
+                      ...loaded.map((im) => ({ type: "image_url" as const, image_url: { url: im.dataUrl, detail: useDetail } })),
+                    ] },
+                  ],
+                  max_tokens: 2048,
+                });
+                const content = response.choices[0]?.message?.content ?? "";
+                const status = classifyImageResponse(content);
+                if (status === "ok") {
+                  const errLines = readErrors.map((e) => `--- ${e.path} ---\nError: ${e.error}`);
+                  const combined = [content, ...errLines].filter(Boolean).join("\n\n");
+                  const descResults = [
+                    { path: loaded.map((l) => l.path).join(", "), content, ok: true },
+                    ...readErrors.map((e) => ({ path: e.path, content: "", ok: false, error: e.error })),
+                  ];
+                  return {
+                    ok: readErrors.length === 0,
+                    result: { descriptions: descResults, combined, multiImage: true },
+                    stdout: combined,
+                  };
+                }
+              } catch (err) {
+                if ((err as Error).name === "AbortError") throw err;
+                multiFailed = true;
+                // Fall through to the next candidate model / detail level.
+              }
+            }
+          }
+          // If the multi-image call was attempted but every model failed to
+          // produce a usable answer, fall back to per-image analysis below.
+          void multiFailed;
+        }
       }
 
       // Process ALL images in batches with limited concurrency

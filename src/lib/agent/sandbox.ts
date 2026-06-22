@@ -151,6 +151,92 @@ export async function sandboxExecPython(
 }
 
 /**
+ * Execute Python code with real-time streaming of stdout/stderr. The
+ * `onChunk` callback fires for each line of output as it is produced, so
+ * long-running commands show progress in the UI instead of only after
+ * completion. Returns the final result record.
+ */
+export async function sandboxExecPythonStream(
+  sessionId: string,
+  code: string,
+  timeout: number,
+  onChunk: (stream: "stdout" | "stderr", text: string) => void
+): Promise<SandboxExecPythonResult> {
+  const url = `${SANDBOX_BASE_URL}/exec/python/stream`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), (timeout + 10) * 1000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, session_id: sessionId, timeout }),
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body) {
+      // Fall back to non-streaming execution on any error.
+      const r = await sandboxExecPython(sessionId, code, timeout);
+      if (r.stdout) onChunk("stdout", r.stdout);
+      if (r.stderr) onChunk("stderr", r.stderr);
+      return r;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: SandboxExecPythonResult | null = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        let evt: { t?: string; s?: string; data?: SandboxExecPythonResult };
+        try {
+          evt = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (evt.t === "stdout" && typeof evt.s === "string") {
+          onChunk("stdout", evt.s);
+        } else if (evt.t === "stderr" && typeof evt.s === "string") {
+          onChunk("stderr", evt.s);
+        } else if (evt.t === "result" && evt.data) {
+          result = evt.data;
+        }
+      }
+    }
+    if (result) return result;
+    // No result record arrived — fall back.
+    return await sandboxExecPython(sessionId, code, timeout);
+  } catch (err) {
+    // Abort due to our own timeout: surface a clean timeout error.
+    if ((err as Error).name === "AbortError") {
+      return {
+        stdout: "",
+        stderr: "",
+        images: [],
+        error: `Execution timed out after ${timeout}s`,
+        execution_time_ms: timeout * 1000,
+      };
+    }
+    // Network/sandbox error — fall back to non-streaming path which has its
+    // own graceful-unavailable handling.
+    try {
+      const r = await sandboxExecPython(sessionId, code, timeout);
+      if (r.stdout) onChunk("stdout", r.stdout);
+      if (r.stderr) onChunk("stderr", r.stderr);
+      return r;
+    } catch {
+      throw err;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Execute a shell command inside the sandbox.
  */
 export async function sandboxExecShell(
@@ -255,6 +341,54 @@ export async function sandboxFileInfo(
 
 // ── Conversions ──────────────────────────────────────────────────────────────
 
+export type SandboxWebRenderResult = {
+  url: string;
+  final_url: string;
+  title: string;
+  content_type: string;
+  html: string;
+  size: number;
+};
+
+export type SandboxCookie = {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  http_only?: boolean;
+  secure?: boolean;
+};
+
+/**
+ * Render a URL with headless Chromium (Playwright) so that JavaScript-heavy
+ * SPAs build their DOM before capture. Supports an optional cookie jar for
+ * authenticated browsing of user-specified sites.
+ */
+export async function sandboxWebRender(
+  sessionId: string,
+  url: string,
+  options?: {
+    cookies?: SandboxCookie[];
+    waitFor?: string;
+    timeout?: number;
+  }
+): Promise<SandboxWebRenderResult> {
+  const res = (await sandboxFetch("/web/render", {
+    method: "POST",
+    body: JSON.stringify({
+      url,
+      session_id: sessionId,
+      cookies: options?.cookies ?? [],
+      wait_for: options?.waitFor ?? "",
+      timeout: options?.timeout ?? 35,
+    }),
+    timeout: (options?.timeout ?? 35) * 1000 + 10_000,
+  })) as SandboxWebRenderResult;
+  return res;
+}
+
+// ── Conversions (continued) ─────────────────────────────────────────────────
+
 export type SandboxDocxReadResult = {
   path: string;
   paragraphs: Array<{
@@ -329,6 +463,7 @@ export async function sandboxDocxTemplateFill(
   options?: {
     keepCoverPage?: boolean;
     coverReplacements?: Record<string, string>;
+    includeToc?: boolean;
   }
 ): Promise<SandboxDocxTemplateFillResult> {
   const res = (await sandboxFetch("/docx/template-fill", {
@@ -340,6 +475,7 @@ export async function sandboxDocxTemplateFill(
       session_id: sessionId,
       keep_cover_page: options?.keepCoverPage ?? true,
       cover_replacements: options?.coverReplacements ?? {},
+      include_toc: options?.includeToc ?? false,
     }),
     timeout: 120_000,
   })) as SandboxDocxTemplateFillResult;

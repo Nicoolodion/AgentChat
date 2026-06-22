@@ -93,7 +93,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "ipython",
-      description: "Execute Python code with persistent session state. Matplotlib, Pillow, pandas, numpy, opencv, openpyxl, python-docx, pikepdf are available.",
+      description: "Execute Python code with persistent session state. Variables you define (including dataframes, numpy arrays, fitted sklearn models) survive across calls within the same session; packages installed via pip_install also persist. Pre-installed: matplotlib, seaborn, plotly(+kaleido), altair, pandas, numpy, scipy, scikit-learn, sqlalchemy, opencv, openpyxl, python-docx, pikepdf, requests, beautifulsoup4, lxml, Pillow.",
       parameters: {
         type: "object",
         properties: {
@@ -217,6 +217,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
           },
           sections_path: { type: "string", description: "Path to a JSON file containing the sections array (written via file_write). Preferred over inline sections for complex documents with many images." },
           keep_cover_page: { type: "boolean", default: true, description: "Preserve the template's cover page (first tables before any heading)" },
+          include_toc: { type: "boolean", default: false, description: "Insert an automatic Table of Contents (built from the headings in the sections) right after the cover page. Word/LibreOffice will populate the page numbers when the document is opened/printed." },
           cover_replacements: {
             type: "object",
             description: "Text replacements on the cover page: {search_text: replacement_text}",
@@ -323,12 +324,28 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "web_fetch",
-      description: "Fetch a URL and return its content as text, HTML, or markdown. Returns text/HTML/JSON only — for binary assets (images, video, archives, PDFs) use web_download instead. For JavaScript-driven pages (SPAs, interactive sites) whose visible body is an empty shell, inline JSON/data embedded in <script> tags (including JSON-LD and JS-object literals is automatically extracted and appended to the output, so prefer web_fetch over manual curl+regex.",
+      description: "Fetch a URL and return its content as text, HTML, or markdown. Returns text/HTML/JSON only — for binary assets (images, video, archives, PDFs) use web_download instead. For JavaScript-driven pages (SPAs, interactive sites) whose visible body is an empty shell, inline JSON/data embedded in <script> tags (including JSON-LD and JS-object literals) is automatically extracted and appended. Set render_js=true to force a headless-browser render (Chromium) which is the most reliable way to capture SPA content that only exists after JS executes. Pass cookies for authenticated browsing of user-specified sites.",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string" },
           format: { type: "string", enum: ["html", "text", "markdown"], default: "text" },
+          render_js: { type: "boolean", default: false, description: "Force a headless-browser (Chromium) render instead of a static fetch. Use for SPAs / pages whose content is built by JavaScript." },
+          wait_for: { type: "string", description: "CSS selector to wait for before capturing (only with render_js). Useful when content loads via XHR after initial paint." },
+          cookies: {
+            type: "array",
+            description: "Cookies to send with the request, for authenticated access to user-specified sites.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                value: { type: "string" },
+                domain: { type: "string" },
+                path: { type: "string" },
+              },
+              required: ["name", "value"],
+            },
+          },
         },
         required: ["url"],
       },
@@ -354,11 +371,11 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "chart_create",
-      description: "Create a chart using matplotlib and save it as an image. The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/chart.png'). The output/ directory exists. You can also use the WORKSPACE_DIR variable for absolute paths.",
+      description: "Create a chart and save it as an image. Backends: matplotlib (default), seaborn, plotly (exports a static PNG via kaleido), or altair (save as PNG/SVG). The working directory is already set to your session workspace. Use RELATIVE paths (e.g. 'output/chart.png'). The output/ directory exists. For consistent, document-ready styling use a built-in theme: matplotlib `plt.style.use('seaborn-v0_8-whitegrid')`, plotly `template='plotly_white'`, or altair default theming.",
       parameters: {
         type: "object",
         properties: {
-          python_code: { type: "string", description: "Python code using matplotlib to create the chart. Use relative paths or WORKSPACE_DIR for absolute paths." },
+          python_code: { type: "string", description: "Python code using matplotlib/seaborn/plotly/altair to create the chart. Save the figure to the output path with a relative path. Use plt.savefig() for matplotlib/seaborn, fig.write_image() for plotly, or chart.save() for altair (supports .png and .svg)." },
           output_path: { type: "string", description: "Relative path for output image (e.g. output/chart.png)" },
         },
         required: ["python_code", "output_path"],
@@ -369,12 +386,12 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "image_analyze",
-      description: "Analyze one or more image files using the vision-capable model. Returns an array of descriptions, one per image, in the same order as the input paths. The tool is batched automatically, so you can pass many paths at once.",
+      description: "Analyze one or more image files using the vision-capable model. Pass ALL relevant images in a single call — when more than one image is provided the model is asked to reason across them (compare, contrast, find differences, sequence, or combine information) as well as describe each. Returns an array of descriptions in input order. The tool is batched automatically.",
       parameters: {
         type: "object",
         properties: {
-          paths: { type: "array", items: { type: "string" }, description: "Relative paths to the image files in the workspace (e.g. ['upload/photo1.jpg', 'upload/photo2.png'])." },
-          prompt: { type: "string", description: "What to ask about each image. Default: 'Describe this image concisely.'", default: "Describe this image concisely." },
+          paths: { type: "array", items: { type: "string" }, description: "Relative paths to the image files in the workspace (e.g. ['upload/photo1.jpg', 'upload/photo2.png']). Pass multiple to enable cross-image reasoning." },
+          prompt: { type: "string", description: "What to ask about the image(s). For multiple images, phrase a comparative question (e.g. 'What are the differences between these two screenshots?'). Default: 'Describe this image concisely.'", default: "Describe this image concisely." },
           detail: { type: "string", enum: ["high", "low"], description: "Vision detail level. Use 'low' for a faster, cheaper overview. Default: 'high'", default: "high" },
         },
         required: ["paths"],
@@ -440,7 +457,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - file_info(path) — get file metadata
 
 ### Code Execution
-- ipython(code, timeout?) — execute Python with persistent session state (matplotlib, Pillow, pandas, numpy, opencv, openpyxl, python-docx, pikepdf available)
+- ipython(code, timeout?) — execute Python with persistent session state. Variables (dataframes, numpy arrays, fitted sklearn models, etc.) and pip-installed packages survive across calls in the same session. Output is streamed live. Pre-installed stack: matplotlib, seaborn, plotly(+kaleido), altair, pandas, numpy, scipy, scikit-learn, sqlalchemy, opencv, openpyxl, python-docx, pikepdf, requests, beautifulsoup4, lxml, Pillow.
 - shell(command, working_dir?, timeout?) — run shell commands
 - pip_install(package) — install a Python package
 
@@ -448,7 +465,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - pdf_from_html(html_path, output_path) — convert HTML to PDF via Playwright
 - docx_to_pdf(input_path, output_path) — convert DOCX to PDF via LibreOffice
 - docx_read(path) — read and parse a .docx file (returns structured content: paragraphs, tables, images). Use this instead of file_read for .docx files.
-- docx_template_fill(template_path, output_path, sections?, sections_path?, keep_cover_page?, cover_replacements?) — fill a .docx template with new content. ALWAYS prefer sections_path: write the sections JSON to a file with file_write first and pass sections_path. Large inline sections arguments cause JSON-parse failures that abort the tool call.
+- docx_template_fill(template_path, output_path, sections?, sections_path?, keep_cover_page?, include_toc?, cover_replacements?) — fill a .docx template with new content. Set include_toc=true to insert an automatic Table of Contents built from the section headings. ALWAYS prefer sections_path: write the sections JSON to a file with file_write first and pass sections_path. Large inline sections arguments cause JSON-parse failures that abort the tool call.
 - docx_create(output_path, python_code) — create Word doc using python-docx
 - docx_build(output_path, program_cs_path?, program_cs?) — build high-quality Word doc using C# + OpenXML SDK. IMPORTANT: write Program.cs via file_write first, then pass the path in program_cs_path.
 - xlsx_create(output_path, python_code) — create Excel sheet using openpyxl
@@ -457,12 +474,12 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 
 ### Web & Search
 - web_search(query, max_results?) — search the web (SearXNG or DuckDuckGo)
-- web_fetch(url, format?) — fetch a webpage as html, text, or markdown. Text/HTML/JSON only; do NOT use it for binaries. For JavaScript-driven pages whose visible body is an empty shell (e.g. SPAs, interactive sites), inline JSON/data embedded in <script> tags (JSON-LD and JS-object literals like \`storyData = {...}\`) is automatically extracted and appended — so you do NOT need to fall back to shell+ipython curl/regex to recover embedded page data.
+- web_fetch(url, format?, render_js?, wait_for?, cookies?) — fetch a webpage as html, text, or markdown. Text/HTML/JSON only; do NOT use it for binaries. Inline <script> JSON (incl. JSON-LD and JS-object literals) is automatically extracted and appended. Set render_js=true to force a headless Chromium render — the most reliable way to capture SPA content that only exists after JS runs. Pass cookies=[{name,value,…}] for authenticated browsing of user-specified sites.
 - web_download(url, output_path, filename?) — download any binary asset (image, video, PDF, archive) directly into the workspace. Prefer this over \`web_fetch\` + \`shell curl\` for every download.
 
 ### Charts & Images
-- chart_create(python_code, output_path) — create matplotlib chart
-- image_analyze(paths, prompt?, detail?) — analyze multiple images in one call. Pass all relevant image paths together; the tool batches them automatically.
+- chart_create(python_code, output_path) — create a chart. Backends: matplotlib (default), seaborn, plotly (fig.write_image), or altair (chart.save .png/.svg). Use a built-in theme for document-ready styling (e.g. plt.style.use('seaborn-v0_8-whitegrid'), or plotly template='plotly_white').
+- image_analyze(paths, prompt?, detail?) — analyze images. Pass ALL relevant images in one call: with more than one image the model reasons ACROSS them (compare/contrast/differences/sequence) as well as describing each. The tool batches automatically.
 
 ### Project Management
 - todo_create(items) — create a todo list

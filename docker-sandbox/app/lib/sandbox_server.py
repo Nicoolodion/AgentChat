@@ -22,6 +22,10 @@ from typing import Any, Optional
 
 from flask import Flask, request, jsonify, Response
 
+# Local helper module (same directory): persistent, streaming, leak-proof
+# Python execution. See python_exec.py for details.
+from python_exec import run_python
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -127,164 +131,8 @@ def health() -> Response:
 # Python Execution (IPython-like, persistent per session_id)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# In-memory code execution for single-worker mode; for multi-worker, consider
-# a persistent kernel process per session managed externally.
-SESSION_PYTHON_STATE: dict[str, dict[str, Any]] = {}
-
-
-def _run_python_single(code: str, session_id: str, timeout: int) -> dict[str, Any]:
-    """Execute Python code in a restricted subprocess with captured output."""
-    session_workspace = ensure_session_dirs(session_id)
-
-    # Build wrapper script that sets up the environment and captures images
-    wrapper_code = f'''
-import sys
-import json
-import base64
-import io
-import os
-import traceback
-from contextlib import redirect_stdout, redirect_stderr
-
-os.chdir({str(session_workspace)!r})
-os.environ["WORKSPACE_DIR"] = {str(session_workspace)!r}
-
-# Add session-local pip install target to sys.path so packages installed via
-# pip_install --target are importable
-local_libs = os.path.join({str(session_workspace)!r}, "python_libs")
-if local_libs not in sys.path:
-    sys.path.insert(0, local_libs)
-
-# Redirect stdout/stderr
-out_buffer = io.StringIO()
-err_buffer = io.StringIO()
-
-result = {{"stdout": "", "stderr": "", "images": [], "error": None, "execution_time_ms": 0}}
-
-# Try to restore session globals from a persisted file
-session_globals = {{}}
-globals_file = os.path.join({str(session_workspace)!r}, ".session_globals.json")
-if os.path.exists(globals_file):
-    try:
-        with open(globals_file, "r") as f:
-            session_globals = json.load(f)
-    except Exception:
-        pass
-
-# We can't pickle all objects, but we can keep a simple exec context
-exec_globals = {{"__name__": "__main__", **session_globals}}
-
-try:
-    start = time.time() if "time" in globals() else 0
-    import time as _time
-    start = _time.time()
-
-    with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
-        exec({code!r}, exec_globals)
-
-    result["execution_time_ms"] = int((_time.time() - start) * 1000)
-    result["stdout"] = out_buffer.getvalue()
-    result["stderr"] = err_buffer.getvalue()
-
-    # Persist simple globals for next call
-    persist_globals = {{}}
-    for k, v in exec_globals.items():
-        if k.startswith("_"):
-            continue
-        if k in ("sys", "json", "base64", "io", "os", "traceback", "redirect_stdout", "redirect_stderr"):
-            continue
-        try:
-            json.dumps(v)
-            persist_globals[k] = v
-        except (TypeError, ValueError):
-            pass
-
-    with open(globals_file, "w") as f:
-        json.dump(persist_globals, f)
-
-except Exception as e:
-    result["error"] = traceback.format_exc()
-    result["stdout"] = out_buffer.getvalue()
-    result["stderr"] = err_buffer.getvalue()
-
-# Collect any matplotlib images generated
-image_dir = os.path.join({str(session_workspace)!r}, ".session_images")
-os.makedirs(image_dir, exist_ok=True)
-for fname in os.listdir(image_dir):
-    fpath = os.path.join(image_dir, fname)
-    try:
-        with open(fpath, "rb") as img_file:
-            b64 = base64.b64encode(img_file.read()).decode("ascii")
-            mime = "image/png" if fname.endswith(".png") else "image/jpeg"
-            result["images"].append(f"data:{{mime}};base64,{{b64}}")
-    except Exception:
-        pass
-
-print(json.dumps(result))
-'''
-
-    # Run the wrapper in a subprocess for isolation
-    cmd = [sys.executable, "-c", wrapper_code]
-    start = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=min(timeout, MAX_EXECUTION_TIME),
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "stdout": "",
-            "stderr": "",
-            "images": [],
-            "error": f"Execution timed out after {timeout}s",
-            "execution_time_ms": int((time.time() - start) * 1000),
-        }
-    except Exception as e:
-        return {
-            "stdout": "",
-            "stderr": "",
-            "images": [],
-            "error": str(e),
-            "execution_time_ms": int((time.time() - start) * 1000),
-        }
-
-    if proc.returncode != 0:
-        return {
-            "stdout": proc.stdout[-MAX_OUTPUT_SIZE:] if len(proc.stdout) > MAX_OUTPUT_SIZE else proc.stdout,
-            "stderr": proc.stderr[-MAX_OUTPUT_SIZE:] if len(proc.stderr) > MAX_OUTPUT_SIZE else proc.stderr,
-            "images": [],
-            "error": f"Subprocess exited with code {proc.returncode}",
-            "execution_time_ms": int((time.time() - start) * 1000),
-        }
-
-    # Parse result from stdout
-    lines = proc.stdout.strip().splitlines()
-    if not lines:
-        return {
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "images": [],
-            "error": None,
-            "execution_time_ms": int((time.time() - start) * 1000),
-        }
-
-    try:
-        result = json.loads(lines[-1])
-        # Prepend any extra stdout before the JSON line
-        extra_stdout = "\n".join(lines[:-1])
-        if extra_stdout:
-            result["stdout"] = extra_stdout + "\n" + result.get("stdout", "")
-        return result
-    except json.JSONDecodeError:
-        return {
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "images": [],
-            "error": None,
-            "execution_time_ms": int((time.time() - start) * 1000),
-        }
+# Python execution lives in python_exec.run_python (persistent state, real-time
+# streaming, process-group timeouts). The routes below just adapt it to HTTP.
 
 
 @app.route("/exec/python", methods=["POST"])
@@ -300,8 +148,58 @@ def exec_python() -> Response:
 
     logger.info(f"[python] session={session_id} timeout={timeout}")
 
-    result = _run_python_single(code, session_id, timeout)
+    result = run_python(code, session_id, timeout, WORKSPACE_ROOT)
     return jsonify(result)
+
+
+@app.route("/exec/python/stream", methods=["POST"])
+def exec_python_stream():
+    """Stream Python execution output as it happens.
+
+    Emits a JSON object per line:
+      {"t":"stdout","s":"..."} / {"t":"stderr","s":"..."}  — live chunks
+      {"t":"result", ...}                                   — final result record
+    """
+    data = request.get_json(force=True) or {}
+    code = data.get("code", "")
+    session_id = data.get("session_id", "default")
+    timeout = int(data.get("timeout", DEFAULT_TIMEOUT))
+
+    if not code:
+        return make_error("Missing 'code' field", 400)
+
+    logger.info(f"[python/stream] session={session_id} timeout={timeout}")
+
+    def generate():
+        # Run execution in a worker thread; forward live chunks (stdout/stderr
+        # lines) through a queue as newline-delimited JSON, then emit the
+        # final result record.
+        import queue as _q
+        import threading as _t
+
+        out_q: "_q.Queue" = _q.Queue()
+
+        def worker():
+            def cb(stream, text):
+                out_q.put({"t": stream, "s": text})
+            try:
+                res = run_python(code, session_id, timeout, WORKSPACE_ROOT, on_chunk=cb)
+                out_q.put({"t": "result", "data": res})
+            except Exception as e:  # pragma: no cover
+                out_q.put({"t": "result", "data": {
+                    "stdout": "", "stderr": "", "images": [],
+                    "error": str(e), "execution_time_ms": 0,
+                }})
+
+        th = _t.Thread(target=worker, daemon=True)
+        th.start()
+        while True:
+            item = out_q.get(timeout=timeout + 10)
+            yield json.dumps(item) + "\n"
+            if item.get("t") == "result":
+                break
+
+    return Response(generate(), mimetype="application/x-ndjson")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -649,6 +547,127 @@ def file_info() -> Response:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Web rendering (Playwright headless) — for JS-heavy SPAs whose static HTML
+# is an empty shell. Used as a fallback by the agent's web_fetch tool.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _block_private_route(url: str) -> bool:
+    """Reject private/loopback/internal hosts before launching a browser at them."""
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower().strip("[]")
+    blocked = {"localhost", "metadata.google.internal", "metadata",
+              "169.254.169.254", "metadata.aws.internal"}
+    if host in blocked:
+        return True
+    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
+        return True
+    import re as _re
+    v4 = _re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$", host)
+    if v4:
+        a, b = int(v4.group(1)), int(v4.group(2))
+        if a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) \
+                or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127):
+            return True
+    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
+        return True
+    return False
+
+
+@app.route("/web/render", methods=["POST"])
+def web_render() -> Response:
+    """Render a URL with a headless Chromium and return the fully-built HTML.
+
+    Optional:
+      - cookies: list of {name, value, domain?, path?} for authenticated
+        browsing of user-specified sites.
+      - wait_for: a CSS selector to wait for before capturing (default: waits
+        for networkidle, capped, then a short timeout).
+      - timeout: total seconds (default 35).
+    """
+    data = request.get_json(force=True) or {}
+    url = data.get("url", "")
+    cookies = data.get("cookies", []) or []
+    wait_for = data.get("wait_for", "")
+    timeout = min(int(data.get("timeout", 35)), 90)
+
+    if not url:
+        return make_error("Missing 'url' field", 400)
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return make_error("Only http(s) URLs can be rendered", 400)
+    if _block_private_route(url):
+        return make_error("Blocked private/internal host", 400)
+
+    logger.info(f"[web/render] url={url[:80]} cookies={len(cookies)} wait_for={wait_for}")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return make_error("Playwright is not installed in the sandbox", 500)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 1800},
+            )
+            if cookies:
+                norm_cookies = []
+                for c in cookies:
+                    if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+                        continue
+                    norm_cookies.append({
+                        "name": str(c["name"]),
+                        "value": str(c["value"]),
+                        "domain": c.get("domain") or None,
+                        "path": c.get("path") or "/",
+                        "httpOnly": bool(c.get("http_only", False)),
+                        "secure": bool(c.get("secure", False)),
+                    })
+                if norm_cookies:
+                    try:
+                        context.add_cookies(norm_cookies)
+                    except Exception as e:
+                        logger.warning(f"[web/render] add_cookies failed: {e}")
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            except Exception as e:
+                browser.close()
+                return make_error(f"Navigation failed: {e}", 502)
+
+            try:
+                if wait_for:
+                    page.wait_for_selector(wait_for, timeout=timeout * 1000)
+                else:
+                    # Give SPAs time to hydrate / fetch data.
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=min(timeout, 8) * 1000)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            html = page.content()
+            final_url = page.url
+            title = page.title()
+            content_type = "text/html"
+            browser.close()
+
+        return make_success({
+            "url": url,
+            "final_url": final_url,
+            "title": title,
+            "content_type": content_type,
+            "html": html[:2_000_000],
+            "size": len(html),
+        })
+    except Exception as e:
+        return make_error(f"Render failed: {e}", 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DOCX Read (extract structured content from .docx files)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -873,6 +892,8 @@ def docx_template_fill() -> Response:
         from docx.shared import Inches, Pt, Cm, RGBColor
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.oxml.ns import qn
+        from docx.oxml import parse_xml as docx_oxml_parse_xml
+        docx_Pt = Pt
         import copy
         import re
         
@@ -942,6 +963,41 @@ def docx_template_fill() -> Response:
                     for elem in to_remove:
                         body.remove(elem)
         
+        # Optional: insert an automatic Table of Contents (built from the
+        # headings added below) right after the cover page. Word/LibreOffice
+        # populate the page numbers + entry text on open ("update field").
+        include_toc = data.get("include_toc", False)
+        toc_paragraph = None
+        if include_toc:
+            toc_paragraph = doc.add_paragraph()
+            run = toc_paragraph.add_run()
+            # TOC field code: { TOC \o "1-3" \h \z \u } — levels 1-3, hyperlinks.
+            fldChar_begin = docx_oxml_parse_xml(
+                '<w:fldChar w:fldCharType="begin" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+            )
+            instrText = docx_oxml_parse_xml(
+                '<w:instrText xml:space="preserve" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"> TOC \\o "1-3" \\h \\z \\u </w:instrText>'
+            )
+            fldChar_sep = docx_oxml_parse_xml(
+                '<w:fldChar w:fldCharType="separate" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+            )
+            fldChar_end = docx_oxml_parse_xml(
+                '<w:fldChar w:fldCharType="end" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+            )
+            run._element.append(fldChar_begin)
+            run._element.append(instrText)
+            run._element.append(fldChar_sep)
+            run._element.append(fldChar_end)
+            # Placeholder text so the TOC isn't invisible before first refresh.
+            placeholder = doc.add_paragraph(
+                "Right-click and choose “Update Field” to build the table of contents."
+            )
+            try:
+                placeholder.runs[0].font.italic = True
+                placeholder.runs[0].font.size = docx_Pt(9)
+            except Exception:
+                pass
+
         # Now add new content sections
         for section in sections:
             heading = section.get("heading", "")

@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+import type { Pluggable } from "unified";
 import {
   Bot,
   Brain,
@@ -112,6 +114,10 @@ function formatContext(length?: number): string {
 
 // ── User message bubble (unchanged) ───────────────────────────────────────────
 
+// remarkBreaks preserves single newlines typed in the composer as <br> so
+// multi-line prompts aren't collapsed by CommonMark's soft-wrap rule.
+const REMARK_PLUGINS_USER: Pluggable[] = [remarkGfm, remarkBreaks];
+
 function UserBubble({
   message,
   onAttachmentPreview,
@@ -169,7 +175,7 @@ function UserBubble({
       {displayContent && (
         <div className="max-w-none text-slate-100">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={REMARK_PLUGINS_USER}
             components={{
               p: ({ children }) => <p className="mb-1.5 text-sm leading-relaxed last:mb-0">{children}</p>,
               ul: ({ children }) => <ul className="mb-1.5 ml-4 list-disc text-sm last:mb-0">{children}</ul>,
@@ -350,6 +356,12 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   const modelSearchRef = useRef<HTMLInputElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  // "Stick to bottom" — when true, new content auto-scrolls the view to the
+  // bottom. Flipped to false the moment the user scrolls up away from the
+  // bottom, and re-enabled once they scroll all the way back down. This stops
+  // the chat from fighting the user while they read history, but keeps
+  // streaming output pinned to the bottom the rest of the time.
+  const stickToBottomRef = useRef(true);
 
   // The transient "new chat" is not persisted until the first message is sent,
   // so it never appears in /api/chats output. We track whether we are currently
@@ -509,18 +521,65 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     [activeRunChats, activeChat?.id],
   );
 
-  // Auto-scroll
-  useEffect(() => {
-    if (stream.messages.length) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  // Auto-scroll: keep the view pinned to the bottom while streaming, but only
+  // while the user is "stuck" to the bottom. Manual scrolling up pauses
+  // auto-scroll; scrolling back to the very bottom re-enables it.
+  const isNearBottom = useCallback((threshold = 80) => {
+    const el = scrollContainerRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+  }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  // A signature that changes on every visible update: a new message, more
+  // streamed tokens, new reasoning, new tool calls, or new tool output. Using
+  // this (rather than just `messages.length`) is what makes the view track the
+  // stream token-by-token instead of catching up only when a message is added.
+  const streamProgressKey = useMemo(() => {
+    const last = stream.messages[stream.messages.length - 1];
+    const lastSig = last
+      ? `${last.content?.length ?? 0}|${last.reasoning?.length ?? 0}|${last.toolCalls?.length ?? 0}|${last.contentSegments?.length ?? 0}|${last.reasoningSegments?.length ?? 0}`
+      : "";
+    let toolOutLen = 0;
+    let toolOutChars = 0;
+    for (const list of Object.values(stream.toolOutputs)) {
+      toolOutLen += list.length;
+      for (const o of list) toolOutChars += o.output?.length ?? 0;
     }
-  }, [stream.messages.length]);
+    return `${stream.messages.length}|${toolOutLen}|${toolOutChars}|${lastSig}`;
+  }, [stream.messages, stream.toolOutputs]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    // rAF so layout from the new content has settled before we measure height.
+    const raf = requestAnimationFrame(() => scrollToBottom("auto"));
+    return () => cancelAnimationFrame(raf);
+  }, [streamProgressKey, scrollToBottom]);
 
   const handleScroll = useCallback(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
-    setShowScrollBtn(el.scrollTop + el.clientHeight < el.scrollHeight - 100);
-  }, []);
+    const nearBottom = isNearBottom();
+    stickToBottomRef.current = nearBottom;
+    setShowScrollBtn(!nearBottom);
+  }, [isNearBottom]);
+
+  // Jump to the bottom (instant) whenever a different chat is opened so the
+  // latest message is in view, then re-enable stick-to-bottom.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    const raf = requestAnimationFrame(() => {
+      setShowScrollBtn(false);
+      scrollToBottom("auto");
+    });
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChat?.id]);
 
   const activeModelInfo = useMemo(() => {
     if (!activeChat) return null;
@@ -1426,7 +1485,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
             {showScrollBtn && (
               <button
                 type="button"
-                onClick={() => bottomRef.current?.scrollIntoView({ behavior: "smooth" })}
+                onClick={() => { stickToBottomRef.current = true; setShowScrollBtn(false); scrollToBottom("smooth"); }}
                 className="absolute bottom-20 right-8 z-10 rounded-full border border-white/20 bg-slate-900/90 p-2 text-slate-300 shadow-lg transition hover:bg-slate-800 hover:text-white"
                 aria-label="Scroll to bottom"
               >
