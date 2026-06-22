@@ -432,7 +432,7 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "todo_create",
-      description: "Create a todo list in the workspace for tracking progress.",
+      description: "Create a NEW todo list in the workspace for tracking progress, replacing any existing list. Only use this for the first plan or to fully restart. To modify an existing list (check off items, add/remove), use todo_update instead.",
       parameters: {
         type: "object",
         properties: {
@@ -450,6 +450,38 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
       parameters: {
         type: "object",
         properties: {},
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "todo_update",
+      description: "Update the todo list incrementally without rewriting it from scratch. Check off items as you complete them, reopen items, append new items, or remove items — all by 1-based index as shown by todo_read. Indices refer to the CURRENT list order before this call is applied; operations are applied in the order: mark_done, mark_pending, add, remove. Use this instead of todo_create whenever a list already exists. Returns the full updated list.",
+      parameters: {
+        type: "object",
+        properties: {
+          mark_done: {
+            type: "array",
+            items: { type: "number" },
+            description: "1-based indices of items to mark complete ([x]).",
+          },
+          mark_pending: {
+            type: "array",
+            items: { type: "number" },
+            description: "1-based indices of items to reopen / mark incomplete ([ ]).",
+          },
+          add: {
+            type: "array",
+            items: { type: "string" },
+            description: "New item strings to append to the end of the list.",
+          },
+          remove: {
+            type: "array",
+            items: { type: "number" },
+            description: "1-based indices of items to delete from the list.",
+          },
+        },
       },
     },
   },
@@ -517,8 +549,9 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - image_analyze(paths, prompt?, detail?) — analyze images. Pass ALL relevant images in one call: with more than one image the model reasons ACROSS them (compare/contrast/differences/sequence) as well as describing each. The tool batches automatically.
 
 ### Project Management
-- todo_create(items) — create a todo list
+- todo_create(items) — create a NEW todo list (replaces any existing one). Use only for the initial plan or a full restart.
 - todo_read() — read current todo list
+- todo_update(mark_done?, mark_pending?, add?, remove?) — modify an existing list incrementally by 1-based index (as shown by todo_read). Check off items as you complete them, reopen, append, or remove items. Prefer this over todo_create whenever a list already exists.
 
 ## Skills
 Skills are mounted at /app/skills/ and provide domain expertise for document generation tasks. The relevant SKILL.md content for your task is automatically injected below when applicable.

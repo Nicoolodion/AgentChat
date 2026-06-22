@@ -221,6 +221,84 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+type TodoItem = { checked: boolean; text: string };
+
+/** Parse the `temp/todo.md` checklist format (`N. [ ] item` / `N. [x] item`).
+ *  Non-checklist lines are ignored as index targets. Tolerant of `[X]` and
+ *  leading whitespace so edits from other tools still parse. */
+export function parseTodoItems(content: string): TodoItem[] {
+  const items: TodoItem[] = [];
+  for (const line of content.split(/\r?\n/)) {
+    const m = line.match(/^\s*\d+\.\s+\[([ xX])\]\s+(.*)$/);
+    if (m) items.push({ checked: m[1] !== " ", text: m[2].trimEnd() });
+  }
+  return items;
+}
+
+/** Render items back to the canonical renumbered checklist. */
+export function renderTodoItems(items: TodoItem[]): string {
+  return items.map((it, i) => `${i + 1}. [${it.checked ? "x" : " "}] ${it.text}`).join("\n");
+}
+
+export type TodoUpdateOps = {
+  mark_done?: number[];
+  mark_pending?: number[];
+  add?: string[];
+  remove?: number[];
+};
+
+export type TodoUpdateResult = {
+  items: TodoItem[];
+  removed: number;
+  added: number;
+  ignored: number;
+};
+
+/** Apply todo_update operations to the existing item list. Pure/immutable:
+ *  returns the new list and counts without touching the filesystem. All index
+ *  ops reference the list as it existed BEFORE this call. */
+export function applyTodoUpdate(items: TodoItem[], ops: TodoUpdateOps): TodoUpdateResult {
+  const indexSet = (arr: unknown): Set<number> => {
+    const set = new Set<number>();
+    if (Array.isArray(arr)) {
+      for (const n of arr) {
+        if (typeof n === "number" && Number.isFinite(n)) {
+          const idx = Math.trunc(n);
+          if (idx >= 1) set.add(idx);
+        }
+      }
+    }
+    return set;
+  };
+  const doneSet = indexSet(ops.mark_done);
+  const pendingSet = indexSet(ops.mark_pending);
+  const removeSet = indexSet(ops.remove);
+  const addItems = (Array.isArray(ops.add) ? ops.add : [])
+    .map((s) => String(s))
+    .filter((s) => s.length > 0);
+
+  let ignored = 0;
+  for (const idx of new Set([...doneSet, ...pendingSet, ...removeSet])) {
+    if (idx > items.length) ignored++;
+  }
+
+  const flagged = items.map((it, i) => {
+    const idx = i + 1;
+    let checked = it.checked;
+    if (doneSet.has(idx)) checked = true;
+    else if (pendingSet.has(idx)) checked = false;
+    return { checked, text: it.text, remove: removeSet.has(idx) };
+  });
+  const removed = flagged.filter((it) => it.remove).length;
+
+  const finalItems: TodoItem[] = flagged
+    .filter((it) => !it.remove)
+    .map((it) => ({ checked: it.checked, text: it.text }));
+  for (const text of addItems) finalItems.push({ checked: false, text });
+
+  return { items: finalItems, removed, added: addItems.length, ignored };
+}
+
 /** Rough token estimate (~4 chars/token) used for context-budget checks. */
 function estimateTokens(messages: ChatCompletionMessageParam[]): number {
   let chars = 0;
@@ -406,7 +484,7 @@ export async function runAgentExecution(input: {
   // Provider finish_reason for the final assistant turn. Used to detect
   // truncation ("length") so the client can offer "Continue generating".
   let lastFinishReason: string | undefined;
-  const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "50");
+  const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "250");
   // Guards recovery when the provider rejects a streamed tool call's JSON
   // arguments mid-session. We let the model retry with file-path-based args
   // rather than aborting the whole task, but cap retries to avoid an infinite
@@ -439,7 +517,7 @@ export async function runAgentExecution(input: {
   // warmed the catalog cache via resolveModelContextLength).
   const effectiveReasoningEffort = await resolveReasoningEffort(model, reasoningEffort);
 
-  for (let iteration = 0; iteration < 50 && toolCallsCount < maxToolCalls; iteration++) {
+  for (let iteration = 0; iteration < 250 && toolCallsCount < maxToolCalls; iteration++) {
     if (signal?.aborted) break;
     const accumulatedToolCalls: Array<{
       id: string;
@@ -1803,6 +1881,37 @@ print(json.dumps(out))
       } catch {
         return { ok: true, result: { content: "" }, stdout: "No todo list found." };
       }
+    }
+    case "todo_update": {
+      let content = "";
+      try {
+        const res = await sandboxFileRead(sessionId, "temp/todo.md", "utf8");
+        content = res.content;
+      } catch {
+        // No list yet — start from empty. The model may still be adding items.
+      }
+      const updated = applyTodoUpdate(parseTodoItems(content), {
+        mark_done: args.mark_done as number[] | undefined,
+        mark_pending: args.mark_pending as number[] | undefined,
+        add: args.add as string[] | undefined,
+        remove: args.remove as number[] | undefined,
+      });
+      const newContent = renderTodoItems(updated.items);
+      await sandboxFileWrite(sessionId, "temp/todo.md", newContent, "utf8");
+
+      const doneCount = updated.items.filter((it) => it.checked).length;
+      const parts = [
+        `Updated todo list: ${updated.items.length} item(s), ${doneCount} done`,
+        `${updated.removed} removed`,
+        `${updated.added} added`,
+      ];
+      if (updated.ignored > 0) parts.push(`${updated.ignored} index(es) out of range ignored`);
+      const summary = `${parts.join(", ")}.`;
+      return {
+        ok: true,
+        result: { items: updated.items, removed: updated.removed, added: updated.added, ignored: updated.ignored },
+        stdout: `${summary}\n${newContent}`,
+      };
     }
     default:
       return { ok: false, error: `Unknown tool: ${toolName}` };
