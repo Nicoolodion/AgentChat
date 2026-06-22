@@ -1238,6 +1238,41 @@ def docx_build() -> Response:
 # back to a cached, chmod'd copy in /tmp otherwise.
 _KIMI_RUNTIME_CACHE = Path("/tmp/kimi_pptd_runtime")
 
+# Packages whose data files must exist on disk next to the binary even though
+# their code is bytecode-compiled into kimi_pptd. certifi ships cacert.pem
+# (the default TLS trust bundle that `requests` loads at import time); without
+# it, `import requests` raises FileNotFoundError in adapters.py and the whole
+# pptd->pptx convert path crashes.
+def _ensure_runtime_data_pkgs(target_dir: Path) -> None:
+    try:
+        import importlib
+        for pkg in ("certifi",):
+            mod = importlib.import_module(pkg)
+            mod_dir = Path(getattr(mod, "__file__", "")).parent
+            if not mod_dir.name == pkg or not mod_dir.is_dir():
+                continue
+            dst = target_dir / pkg
+            if dst.is_dir():
+                # Refresh only if cacert.pem is missing or stale.
+                ca_src = mod_dir / "cacert.pem"
+                ca_dst = dst / "cacert.pem"
+                if ca_dst.exists():
+                    continue
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(mod_dir, dst)
+        # cacert.pem sanity check — if still missing, copy it from certifi.
+        ca = target_dir / "certifi" / "cacert.pem"
+        if not ca.exists():
+            try:
+                import certifi
+                ca.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(certifi.where(), ca)
+            except Exception:
+                pass
+    except Exception as e:  # pragma: no cover
+        logger.warning("kimi_pptd runtime data-package sync failed: %s", e)
+
 
 def _resolve_kimi_pptd() -> tuple[Path, Path]:
     """Return (binary_path, runtime_dir) for the kimi_pptd executable,
@@ -1268,6 +1303,10 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
         # FileNotFoundError even though pptx/templates/*.xml are present.
         (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
         ready.touch()
+    # Always (re)ensure SSL trust data is present — cheap and idempotent. The
+    # embedded `requests` reads certifi.where() at import; if the on-disk
+    # certifi/cacert.pem is missing the convert path crashes hard.
+    _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
     return cache_binary, _KIMI_RUNTIME_CACHE
 
 
