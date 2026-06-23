@@ -87,12 +87,25 @@ services:
           memory: 2G
     security_opt:
       - no-new-privileges:true
+    # Read-only root filesystem: only /workspace (bind mount) and /tmp (tmpfs)
+    # are writable. Session code therefore cannot patch /app, write to /etc, or
+    # drop backdoors into the container image (audit finding 2.2).
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=536870912
+      - /run:rw,nosuid,nodev,size=67108864
     cap_drop:
       - ALL
     cap_add:
       - CHOWN
       - SETGID
       - SETUID
+      - FOWNER
+    # Bound process table → limits fork bombs from user code.
+    pids_limit: 512
+    # Prevent unprivileged users from binding low (<1024) ports (audit 2.4).
+    sysctls:
+      - net.ipv4.ip_unprivileged_port_start=1024
 
   # Deploy webhook receiver. Listens on 127.0.0.1:9000; expose it via your
   # reverse proxy (e.g. deploy.<your-domain> -> 127.0.0.1:9000). GitHub Actions

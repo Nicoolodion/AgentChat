@@ -44,12 +44,23 @@ services:
           memory: 2G
     security_opt:
       - no-new-privileges:true
+    # Read-only root filesystem: only the code bind mounts (already :ro), the
+    # session workspace, and /tmp (tmpfs) are writable. Session code cannot
+    # patch /app or drop backdoors into the container image (audit 2.2).
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=536870912
+      - /run:rw,nosuid,nodev,size=67108864
     cap_drop:
       - ALL
     cap_add:
       - CHOWN
       - SETGID
       - SETUID
+      - FOWNER
+    pids_limit: 512
+    sysctls:
+      - net.ipv4.ip_unprivileged_port_start=1024
     networks:
       - agent-network
     restart: unless-stopped

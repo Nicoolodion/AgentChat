@@ -36,6 +36,39 @@ MAX_EXECUTION_TIME = int(os.environ.get("SANDBOX_MAX_EXECUTION_TIME", "300"))
 # user output is never mistaken for the result record.
 _RESULT_TOKEN = "\x1e__SANDBOX_RESULT__\x1e"
 
+# Environment variables whose names look like secrets/credentials are stripped
+# from the environment inherited by user code so a compromised session cannot
+# exfiltrate provider keys or other secrets via /proc/self/environ or os.environ.
+_SECRET_ENV_RE = re.compile(
+    r"(PASS|SECRET|TOKEN|CREDENTIAL|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|"
+    r"SIGNING[_-]?KEY|CONNECTION|DSN|DATABASE|DB_(URL|DSN|NAME|USER|PASSWORD)|"
+    r"CERT|CLIENT[_-]?SECRET)",
+    re.IGNORECASE,
+)
+
+
+def build_sanitized_env(
+    base: Optional[dict] = None,
+    *,
+    session_workspace: Optional[Path] = None,
+    keep: tuple = (),
+) -> dict:
+    """Return a copy of the environment with secret-bearing variables removed.
+
+    Runtime/runtime-support variables (PATH, HOME, TMPDIR, locale, NUGET_*, the
+    matplotlib backend, WORKSPACE_DIR) are preserved; anything else matching a
+    secret-shaped name is dropped so it is not handed to user code.
+    """
+    env = dict(base if base is not None else os.environ)
+    for k in list(env):
+        if k in keep:
+            continue
+        if _SECRET_ENV_RE.search(k):
+            del env[k]
+    if session_workspace is not None:
+        env["WORKSPACE_DIR"] = str(session_workspace)
+    return env
+
 
 def ensure_session_dirs(session_id: str, workspace_root: Path) -> Path:
     session_workspace = workspace_root / session_id
@@ -224,15 +257,27 @@ def run_python(
     timeout: int,
     workspace_root: Path,
     on_chunk: Optional[Callable[[str, str], None]] = None,
+    jail_client: Any = None,
 ) -> dict[str, Any]:
     """Execute Python code with persistent session state.
 
     If ``on_chunk`` is provided, it is called in real time as
     ``on_chunk(stream, text)`` for every stdout/stderr line (stream is
     ``"stdout"`` or ``"stderr"``), enabling streaming output to the UI.
+
+    When ``jail_client`` is supplied (and reachable) the interpreter is launched
+    by the root privilege-separation jail under the session's dedicated uid, so
+    user code cannot touch other sessions' workspaces. The sentinel/streaming
+    protocol is identical either way.
     """
     session_workspace = ensure_session_dirs(session_id, workspace_root)
-    # Clear the per-call image dir so we only collect images this run produced.
+    using_jail = jail_client is not None and getattr(jail_client, "available", False)
+    if using_jail:
+        try:
+            jail_client.prepare(session_id)
+        except Exception:
+            pass
+
     image_dir = session_workspace / ".session_images"
     image_dir.mkdir(parents=True, exist_ok=True)
     for f in image_dir.iterdir():
@@ -242,67 +287,87 @@ def run_python(
             pass
 
     wrapper = _build_wrapper(code, session_workspace)
-    env = os.environ.copy()
-    # Headless matplotlib backend — avoids Tcl/Tk init errors in a container.
+    env = build_sanitized_env(os.environ.copy(), session_workspace=session_workspace)
     env["MPLBACKEND"] = env.get("MPLBACKEND") or "Agg"
     cmd = [sys.executable, "-u", "-c", wrapper]
 
     timeout = min(timeout, MAX_EXECUTION_TIME)
     deadline = time.time() + timeout
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=env,
-            start_new_session=True,  # own process group → killpg works
-        )
-    except Exception as e:
-        return {
-            "stdout": "",
-            "stderr": "",
-            "images": [],
-            "error": f"Failed to start python: {e}",
-            "execution_time_ms": 0,
-        }
-
     out_q: "queue.Queue[tuple[str, str]]" = queue.Queue()
-    # One reader per stream avoids the classic stdout/stderr pipe-buffer
-    # deadlock (reading one stream while the other fills its OS buffer).
-    t_out = threading.Thread(target=_stream_reader, args=(proc.stdout, "out", out_q), daemon=True)
-    t_err = threading.Thread(target=_stream_reader, args=(proc.stderr, "err", out_q), daemon=True)
-    t_out.start()
-    t_err.start()
-    eof_seen = {"out": False, "err": False}
+    proc: Optional[subprocess.Popen] = None
+    jail_holder: dict[str, Any] = {}
+    worker_thread: Optional[threading.Thread] = None
 
+    if using_jail:
+        def _jail_worker() -> None:
+            try:
+                jr = jail_client.exec(
+                    session_id, cmd, env, str(session_workspace), timeout,
+                    on_chunk=lambda stream, s: out_q.put(
+                        ("out" if stream == "stdout" else "err", s)),
+                )
+                jail_holder.update(jr)
+            except Exception as e:
+                jail_holder.update({"error": f"jail exec failed: {e}",
+                                    "exit_code": -1, "timed_out": False})
+            finally:
+                out_q.put(("out", ""))
+                out_q.put(("err", ""))
+        worker_thread = threading.Thread(target=_jail_worker, daemon=True)
+        worker_thread.start()
+    else:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+                start_new_session=True,  # own process group → killpg works
+            )
+        except Exception as e:
+            return {
+                "stdout": "",
+                "stderr": "",
+                "images": [],
+                "error": f"Failed to start python: {e}",
+                "execution_time_ms": 0,
+            }
+        t_out = threading.Thread(target=_stream_reader, args=(proc.stdout, "out", out_q), daemon=True)
+        t_err = threading.Thread(target=_stream_reader, args=(proc.stderr, "err", out_q), daemon=True)
+        t_out.start()
+        t_err.start()
+
+    eof_seen = {"out": False, "err": False}
     stdout_buf: list[str] = []
     stderr_buf: list[str] = []
     result: dict[str, Any] | None = None
     timed_out = False
 
     while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            timed_out = True
-            break
+        if using_jail:
+            get_timeout = timeout + 30
+        else:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            get_timeout = remaining
         try:
-            stream, line = out_q.get(timeout=remaining)
+            stream, line = out_q.get(timeout=get_timeout)
         except queue.Empty:
+            if using_jail:
+                break
             timed_out = True
             break
-        # Per-stream EOF sentinel (empty string). Break only when BOTH streams
-        # have closed and we still haven't seen a result record.
         if line == "":
             eof_seen[stream] = True
             if all(eof_seen.values()):
                 break
             continue
 
-        # The wrapper writes the result as:  TOKEN + json + TOKEN  on its own
-        # final line. Detect it here.
         if stream == "out" and _RESULT_TOKEN in line:
             inner = line[line.index(_RESULT_TOKEN) + len(_RESULT_TOKEN):]
             if _RESULT_TOKEN in inner:
@@ -311,7 +376,6 @@ def run_python(
                 result = json.loads(inner.strip())
             except Exception:
                 result = None
-            # Any text before the token on this line is normal stdout.
             before = line[: line.index(_RESULT_TOKEN)]
             if before:
                 stdout_buf.append(before)
@@ -328,10 +392,7 @@ def run_python(
             if on_chunk:
                 on_chunk("stderr", line)
 
-    if timed_out:
-        # Leak-proof kill: take down the entire process group so child
-        # processes the user's code spawned (multiprocessing workers,
-        # subprocesses, C threads) don't survive.
+    if timed_out and not using_jail:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
@@ -355,8 +416,13 @@ def run_python(
             "execution_time_ms": int(timeout * 1000),
         }
 
-    # Drain any remaining output quickly.
-    proc.wait(timeout=10)
+    if not using_jail:
+        # Drain any remaining output quickly.
+        proc.wait(timeout=10)
+    else:
+        if worker_thread:
+            worker_thread.join(timeout=timeout + 20)
+
     # Flush queue
     while True:
         try:
@@ -374,33 +440,34 @@ def run_python(
             stderr_buf.append(line)
             if on_chunk:
                 on_chunk("stderr", line)
-    t_out.join(timeout=2)
-    t_err.join(timeout=2)
+    if not using_jail:
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
 
     stdout_text = "".join(stdout_buf)
     stderr_text = "".join(stderr_buf)
 
     if result is None:
-        # No sentinel seen — likely a crash in the wrapper itself. Surface
-        # whatever we captured.
+        # No sentinel seen — crash in the wrapper, or a jail-level failure.
+        err = jail_holder.get("error") if using_jail else None
+        if using_jail and jail_holder.get("timed_out"):
+            err = f"Execution timed out after {timeout}s"
         return {
             "stdout": stdout_text[-MAX_OUTPUT_SIZE:],
             "stderr": stderr_text[-MAX_OUTPUT_SIZE:],
             "images": [],
-            "error": None,
+            "error": err,
             "execution_time_ms": 0,
         }
 
-    # Ensure stdout/stderr captured buffer is reflected (in case we missed
-    # chunked tail), but the wrapper's own result.stdout/stderr are the
-    # authoritative.
     if not result.get("stdout"):
         result["stdout"] = stdout_text
-    if proc.returncode and proc.returncode != 0 and not result.get("error"):
-        result["error"] = f"Subprocess exited with code {proc.returncode}"
+    exit_code = jail_holder.get("exit_code") if using_jail else proc.returncode
+    if exit_code and exit_code != 0 and not result.get("error"):
+        result["error"] = f"Subprocess exited with code {exit_code}"
     result["stdout"] = result.get("stdout", "")[-MAX_OUTPUT_SIZE:]
     result["stderr"] = (result.get("stderr", "") or stderr_text)[-MAX_OUTPUT_SIZE:]
     return result
 
 
-__all__ = ["run_python", "ensure_session_dirs", "MAX_OUTPUT_SIZE"]
+__all__ = ["run_python", "ensure_session_dirs", "build_sanitized_env", "MAX_OUTPUT_SIZE"]

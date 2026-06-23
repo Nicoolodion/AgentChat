@@ -14,9 +14,25 @@ echo "Chatinterface Agent Sandbox"
 echo "=========================================="
 echo ""
 
-# Fix ownership of bind-mounted /workspace (created by Docker as root:root)
+# ── Filesystem hardening ────────────────────────────────────────────────────
+# /workspace holds every session directory on a shared bind mount. Root owns
+# the volume root (mode 0750) — session subdirectories are created by the API
+# server with a restrictive umask so a session cannot list/clobber siblings
+# through write-permission overlap. /app is root-owned & read-only by design
+# (see Dockerfile) and must NOT be chowned to the runtime user here.
+umask 077
 mkdir -p /workspace
-chown -R sandbox:sandbox /workspace
+chown sandbox:sandbox /workspace
+chmod 0750 /workspace
+chown -R sandbox:sandbox /workspace/* 2>/dev/null || true
+find /workspace -maxdepth 1 -type d ! -path /workspace -exec chmod 0750 {} + 2>/dev/null || true
+
+# Verify the application image was not accidentally made writable by the runtime
+# user (defense-in-depth: abort early rather than run a possibly-backdoored app).
+if [ -w /app/lib ] 2>/dev/null; then
+  echo "ERROR: /app/lib is writable by the runtime user — refusing to start (security)."
+  exit 1
+fi
 
 # Verify dependencies
 echo "Checking dependencies..."
@@ -43,6 +59,30 @@ echo "  Port: $SANDBOX_PORT"
 echo "  Workers: $SANDBOX_WORKERS"
 echo "  Log Level: $SANDBOX_LOG_LEVEL"
 echo ""
+
+# ── Per-session UID isolation jail ──────────────────────────────────────────
+# A small root process maps each session to a dedicated uid and runs that
+# session's code under it, so one session cannot read/write another's files
+# (audit 2.1/2.3). The API server itself stays non-root. Fail closed: if the
+# jail cannot start (e.g. the host lacks ACL support), refuse to boot rather
+# than run unprotected.
+SANDBOX_JAIL_SOCKET="${SANDBOX_JAIL_SOCKET:-/run/session-jail.sock}"
+mkdir -p "$(dirname "$SANDBOX_JAIL_SOCKET")"
+python /app/lib/session_jail.py &
+JAIL_PID=$!
+for _ in $(seq 1 30); do
+  [ -S "$SANDBOX_JAIL_SOCKET" ] && break
+  if ! kill -0 "$JAIL_PID" 2>/dev/null; then
+    echo "ERROR: session isolation jail failed to start — refusing to boot unprotected."
+    exit 1
+  fi
+  sleep 0.5
+done
+if [ ! -S "$SANDBOX_JAIL_SOCKET" ]; then
+  echo "ERROR: session isolation jail did not become ready in time — refusing to boot."
+  exit 1
+fi
+echo "Session isolation jail ready (pid $JAIL_PID, socket $SANDBOX_JAIL_SOCKET)."
 
 cd /app/lib
 

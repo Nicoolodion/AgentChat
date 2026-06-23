@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
     git wget unzip pandoc \
     supervisor gosu \
+    acl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -39,10 +40,15 @@ RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin \
     && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet
 
 # ── Non-root user ─────────────────────────────────────────────────────────────
+# SECURITY: the application code under /app MUST stay root-owned and read-only
+# for the runtime user. If the sandbox user could write /app/lib, a compromised
+# session could patch sandbox_server.py / python_exec.py and backdoor every
+# subsequent request handled by the same worker. Only /workspace and the
+# Playwright browser cache are writable by the sandbox user.
 RUN groupadd -r sandbox -g 1001 \
     && useradd -r -g sandbox -u 1001 -m -s /bin/bash sandbox \
     && mkdir -p /workspace /app/skills /app/scripts /app/lib \
-    && chown -R sandbox:sandbox /workspace /app /ms-playwright 2>/dev/null || true
+    && chown -R sandbox:sandbox /workspace /ms-playwright 2>/dev/null || true
 
 # ── Python packages ───────────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
@@ -64,16 +70,23 @@ RUN npx playwright install chromium \
     && chown -R sandbox:sandbox /ms-playwright
 
 # ── Application code ──────────────────────────────────────────────────────────
+# SECURITY: copied as root:root and made non-writable (dirs 0755, files 0644,
+# entrypoint.sh executable). The sandbox runtime user can read/import these but
+# cannot modify them, so a session cannot backdoor the API server itself.
 WORKDIR /app
 
-COPY --chown=sandbox:sandbox app/lib/ /app/lib/
-COPY --chown=sandbox:sandbox app/scripts/ /app/scripts/
-COPY --chown=sandbox:sandbox entrypoint.sh /app/entrypoint.sh
-COPY --chown=sandbox:sandbox supervisord.conf /app/supervisord.conf
+COPY app/lib/ /app/lib/
+COPY app/scripts/ /app/scripts/
+COPY entrypoint.sh /app/entrypoint.sh
+COPY supervisord.conf /app/supervisord.conf
 
-RUN chmod +x /app/entrypoint.sh
+RUN chmod 0755 /app /app/lib /app/scripts \
+    && find /app/lib /app/scripts -type d -exec chmod 0755 {} + \
+    && find /app/lib /app/scripts -type f -exec chmod 0644 {} + \
+    && chmod 0755 /app/entrypoint.sh \
+    && chmod 0644 /app/supervisord.conf
 
-RUN mkdir -p /workspace && chown -R sandbox:sandbox /workspace
+RUN mkdir -p /workspace && chown -R sandbox:sandbox /workspace && chmod 0750 /workspace
 
 # ── Health check ──────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

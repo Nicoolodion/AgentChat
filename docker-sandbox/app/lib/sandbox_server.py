@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -19,13 +20,13 @@ import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from flask import Flask, request, jsonify, Response
 
 # Local helper module (same directory): persistent, streaming, leak-proof
 # Python execution. See python_exec.py for details.
-from python_exec import run_python
+from python_exec import run_python, build_sanitized_env
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +43,143 @@ WORKSPACE_ROOT = Path(os.environ.get("SANDBOX_WORKSPACE", "/workspace"))
 MAX_EXECUTION_TIME = int(os.environ.get("SANDBOX_MAX_EXECUTION_TIME", "300"))
 DEFAULT_TIMEOUT = int(os.environ.get("SANDBOX_DEFAULT_TIMEOUT", "60"))
 MAX_OUTPUT_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Per-session UID isolation jail (see session_jail.py). When the socket is
+# reachable, code-execution paths fork through it so each session runs under a
+# dedicated uid that cannot touch sibling workspaces (audit 2.1/2.3).
+JAIL_SOCKET = os.environ.get("SANDBOX_JAIL_SOCKET", "/run/session-jail.sock")
+
+
+class JailClient:
+    """Talk to the root privilege-separation jail over a unix socket."""
+
+    def __init__(self, socket_path: str = JAIL_SOCKET):
+        self.socket_path = socket_path
+        self._available: Optional[bool] = None
+
+    @property
+    def available(self) -> bool:
+        if self._available is None:
+            self._available = os.path.exists(self.socket_path)
+        return self._available
+
+    def _connect(self) -> socket.socket:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(self.socket_path)
+        return s
+
+    def prepare(self, session_id: str) -> None:
+        if not self.available:
+            return
+        conn = self._connect()
+        try:
+            conn.sendall((json.dumps({"op": "prepare", "session_id": session_id}) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            try:
+                resp = json.loads(buf.decode("utf-8", "replace").strip())
+            except json.JSONDecodeError:
+                resp = {}
+            if not resp.get("ok"):
+                logger.warning("[jail] prepare failed for %s: %s",
+                               session_id, resp.get("error"))
+        finally:
+            conn.close()
+
+    def exec(
+        self,
+        session_id: str,
+        argv: list[str],
+        env: dict,
+        cwd: str,
+        timeout: int,
+        on_chunk: Optional[Callable[[str, str], None]] = None,
+    ) -> dict:
+        """Run ``argv`` as the session's dedicated uid. Streams stdout/stderr.
+
+        Returns ``{stdout, stderr, exit_code, timed_out, error}``.
+        """
+        req = {"op": "exec", "session_id": session_id, "argv": argv,
+               "env": env, "cwd": cwd, "timeout": timeout}
+        conn = self._connect()
+        conn.settimeout(timeout + 30)
+        try:
+            conn.sendall((json.dumps(req) + "\n").encode())
+
+            stdout_buf: list[str] = []
+            stderr_buf: list[str] = []
+            exit_code = -1
+            timed_out = False
+            error: Optional[str] = None
+            buf = b""
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    if not line.strip():
+                        continue
+                    try:
+                        evt = json.loads(line.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    t = evt.get("t")
+                    if t in ("stdout", "stderr"):
+                        s = evt.get("s", "")
+                        if t == "stdout":
+                            stdout_buf.append(s)
+                        else:
+                            stderr_buf.append(s)
+                        if on_chunk:
+                            try:
+                                on_chunk(t, s)
+                            except Exception:
+                                pass
+                    elif t == "result":
+                        exit_code = int(evt.get("exit_code", -1))
+                        timed_out = bool(evt.get("timed_out"))
+                        error = evt.get("error")
+            return {
+                "stdout": "".join(stdout_buf)[-MAX_OUTPUT_SIZE:],
+                "stderr": "".join(stderr_buf)[-MAX_OUTPUT_SIZE:],
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "error": error,
+            }
+        finally:
+            conn.close()
+
+
+jail = JailClient()
+
+
+def run_jailed_or_local(
+    session_id: str,
+    cmd: list[str],
+    env: dict,
+    cwd: str,
+    timeout: int,
+    on_chunk: Optional[Callable[[str, str], None]] = None,
+) -> dict:
+    """Run ``cmd`` under the session's dedicated uid if the jail is up.
+
+    Returns ``{stdout, stderr, exit_code, timed_out, error}``. Falls back to a
+    direct local subprocess (same uid as the server) when the jail socket is
+    unavailable, so the API degrades rather than hard-failing.
+    """
+    if jail.available:
+        return jail.exec(session_id, cmd, env, cwd, timeout, on_chunk)
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=timeout, cwd=cwd, env=env)
+    return {"stdout": proc.stdout, "stderr": proc.stderr,
+            "exit_code": proc.returncode, "timed_out": False, "error": None}
 
 # Ensure workspace exists
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -73,11 +211,21 @@ def resolve_workspace_path(session_id: str, sub_path: str = "") -> Path:
 
 
 def ensure_session_dirs(session_id: str) -> Path:
-    """Create the standard session directory structure."""
+    """Create the standard session directory structure and jail-prepare it.
+
+    Jail preparation chowns the directory tree to the session's dedicated uid
+    and applies the ACLs that let the non-root server keep working. Once
+    prepared, code execution for this session runs under that uid and cannot
+    reach sibling workspaces.
+    """
     session_workspace = WORKSPACE_ROOT / session_id
     (session_workspace / "upload").mkdir(parents=True, exist_ok=True)
     (session_workspace / "output").mkdir(parents=True, exist_ok=True)
     (session_workspace / "temp").mkdir(parents=True, exist_ok=True)
+    try:
+        jail.prepare(session_id)
+    except Exception as e:
+        logger.warning("[jail] prepare error for %s: %s", session_id, e)
     return session_workspace
 
 
@@ -94,6 +242,7 @@ def health() -> Response:
         "playwright": False,
         "libreoffice": False,
         "dotnet": False,
+        "jail": jail.available,
     }
 
     try:
@@ -149,7 +298,7 @@ def exec_python() -> Response:
 
     logger.info(f"[python] session={session_id} timeout={timeout}")
 
-    result = run_python(code, session_id, timeout, WORKSPACE_ROOT)
+    result = run_python(code, session_id, timeout, WORKSPACE_ROOT, jail_client=jail)
     return jsonify(result)
 
 
@@ -184,7 +333,7 @@ def exec_python_stream():
             def cb(stream, text):
                 out_q.put({"t": stream, "s": text})
             try:
-                res = run_python(code, session_id, timeout, WORKSPACE_ROOT, on_chunk=cb)
+                res = run_python(code, session_id, timeout, WORKSPACE_ROOT, on_chunk=cb, jail_client=jail)
                 out_q.put({"t": "result", "data": res})
             except Exception as e:  # pragma: no cover
                 out_q.put({"t": "result", "data": {
@@ -226,7 +375,24 @@ BLACKLISTED_SHELL_PATTERNS = [
     re.compile(r"chown\s+.*root", re.IGNORECASE),
     re.compile(r"/etc/passwd", re.IGNORECASE),
     re.compile(r"/etc/shadow", re.IGNORECASE),
+    # Shell is the one path that bypasses the file-tool path validator (audit
+    # 2.3). Block obvious attempts to read/patch the API server, read other
+    # sessions' data, or introspect the host/processes. This is defense-in-depth,
+    # not airtight: a determined caller can evade string matching, which is why
+    # OS-level execution containment (separate container / bwrap / Landlock) is
+    # the real fix for findings 2.1 and 2.3.
+    re.compile(r"/app/(lib|scripts|skills)", re.IGNORECASE),
+    re.compile(r"/proc/(self|\d+)/(environ|fd|maps|mem)", re.IGNORECASE),
+    re.compile(r"/sys/(kernel|class|devices)", re.IGNORECASE),
+    re.compile(r"/\.dockerenv", re.IGNORECASE),
+    re.compile(r">+\s*/app\b", re.IGNORECASE),
 ]
+
+
+# A conservative PATH for session shell commands: user toolchain locations only.
+# No write access to /app, /etc, /usr/local/bin etc. is implied by PATH; this
+# just avoids leaking odd host binaries into the session env.
+RESTRICTED_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 def is_shell_blacklisted(command: str) -> bool:
@@ -261,7 +427,39 @@ def exec_shell() -> Response:
 
     logger.info(f"[shell] session={session_id} cmd={command[:80]}")
 
+    # Run the command with a secret-scrubbed environment so credentials that
+    # happen to be present in the container env are not handed to user code
+    # (audit 2.5). HOME points at the session workspace; a conservative PATH is
+    # used. umask 077 keeps any files the command creates private within the
+    # session's own uid (defense-in-depth for 2.1).
+    shell_env = build_sanitized_env(os.environ.copy(), session_workspace=session_workspace)
+    shell_env["PATH"] = RESTRICTED_PATH + os.pathsep + shell_env.get("PATH", "")
+    shell_env["HOME"] = str(session_workspace)
+
     start = time.time()
+
+    # Run under the session's dedicated uid via the privilege-separation jail.
+    # That uid cannot reach any other session's workspace (audit 2.1/2.3).
+    if jail.available:
+        try:
+            jr = jail.exec(
+                session_id,
+                ["/bin/sh", "-c", command],
+                shell_env,
+                str(cwd),
+                min(timeout, MAX_EXECUTION_TIME),
+            )
+            duration_ms = int((time.time() - start) * 1000)
+            return jsonify({
+                "stdout": jr["stdout"],
+                "stderr": jr["stderr"],
+                "exit_code": jr["exit_code"],
+                "error": jr.get("error"),
+                "duration_ms": duration_ms,
+            })
+        except Exception as e:
+            logger.warning("[jail] shell exec failed, falling back: %s", e)
+
     try:
         proc = subprocess.run(
             command,
@@ -270,6 +468,7 @@ def exec_shell() -> Response:
             capture_output=True,
             text=True,
             timeout=min(timeout, MAX_EXECUTION_TIME),
+            env=shell_env,
         )
         duration_ms = int((time.time() - start) * 1000)
 
@@ -1194,22 +1393,18 @@ def docx_build() -> Response:
     env["NUGET_HTTP_CACHE_PATH"] = "/tmp/nuget-http-cache"
     env["NUGET_SCRATCH"] = "/tmp/nuget-scratch"
     env["TMPDIR"] = "/tmp"
+    env = build_sanitized_env(env)
 
     start = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=str(work_dir),
-            env=env,
-        )
+        jr = run_jailed_or_local(session_id, cmd, env, str(work_dir), 300)
         duration_ms = int((time.time() - start) * 1000)
 
-        if proc.returncode != 0:
+        if jr.get("timed_out"):
+            return make_error("DOCX build timed out", 504)
+        if jr["exit_code"] != 0:
             return make_error(
-                f"DOCX build failed:\n{proc.stdout}\n{proc.stderr}", 500
+                f"DOCX build failed:\n{jr['stdout']}\n{jr['stderr']}", 500
             )
 
         if not out_file.exists():
@@ -1219,7 +1414,7 @@ def docx_build() -> Response:
             "output_path": str(out_file),
             "size": out_file.stat().st_size,
             "duration_ms": duration_ms,
-            "stdout": proc.stdout[-MAX_OUTPUT_SIZE:] if len(proc.stdout) > MAX_OUTPUT_SIZE else proc.stdout,
+            "stdout": jr["stdout"][-MAX_OUTPUT_SIZE:] if len(jr["stdout"]) > MAX_OUTPUT_SIZE else jr["stdout"],
         })
     except subprocess.TimeoutExpired:
         return make_error("DOCX build timed out", 504)
@@ -1359,7 +1554,7 @@ def pptx_run() -> Response:
     if action == "screenshot" and pages:
         argv += ["-p", str(pages)]
 
-    env = os.environ.copy()
+    env = build_sanitized_env(os.environ.copy())
     # Match scripts/*.sh locale handling so UTF-8 paths work under POSIX/C.
     env["PYTHONUTF8"] = "1"
     env.setdefault("LC_ALL", "C.UTF-8")
@@ -1373,21 +1568,14 @@ def pptx_run() -> Response:
     # references resolve against the .pptd's own location.
     start = time.time()
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=str(in_file.parent),
-            env=env,
-        )
+        jr = run_jailed_or_local(session_id, argv, env, str(in_file.parent), 300)
         duration_ms = int((time.time() - start) * 1000)
 
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
+        stdout = jr.get("stdout", "") or ""
+        stderr = jr.get("stderr", "") or ""
         result: dict[str, Any] = {
             "action": action,
-            "exit_code": proc.returncode,
+            "exit_code": jr["exit_code"],
             "stdout": stdout[-MAX_OUTPUT_SIZE:] if len(stdout) > MAX_OUTPUT_SIZE else stdout,
             "stderr": stderr[-MAX_OUTPUT_SIZE:] if len(stderr) > MAX_OUTPUT_SIZE else stderr,
             "duration_ms": duration_ms,
@@ -1398,8 +1586,6 @@ def pptx_run() -> Response:
                 result["output_path"] = str(out_file)
                 result["size"] = out_file.stat().st_size
             elif action == "screenshot":
-                # screenshot directory: list generated images (relative to
-                # workspace) so the orchestrator can surface them.
                 session_workspace = (WORKSPACE_ROOT / session_id).resolve()
                 rel_files: list[str] = []
                 for child in sorted(out_file.iterdir()):
@@ -1411,12 +1597,13 @@ def pptx_run() -> Response:
                 result["output_dir"] = str(out_file)
                 result["images"] = rel_files
             else:
-                # reverse convert (pptx -> pptd) produced a project directory.
                 result["output_dir"] = str(out_file)
 
-        if proc.returncode != 0:
+        if jr.get("timed_out"):
+            return make_error(f"kimi_pptd {action} timed out", 504)
+        if jr["exit_code"] != 0:
             return make_error(
-                f"kimi_pptd {action} failed (exit {proc.returncode}):\n{stdout}\n{stderr}",
+                f"kimi_pptd {action} failed (exit {jr['exit_code']}):\n{stdout}\n{stderr}",
                 500,
             )
         return make_success(result)
@@ -1466,11 +1653,13 @@ def convert_html_to_pdf() -> Response:
 
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        jr = run_jailed_or_local(session_id, cmd, build_sanitized_env(), str(in_file.parent), 120)
         duration_ms = int((time.time() - start) * 1000)
 
-        if proc.returncode != 0:
-            return make_error(f"PDF conversion failed: {proc.stderr}", 500)
+        if jr.get("timed_out"):
+            return make_error("PDF conversion timed out", 504)
+        if jr["exit_code"] != 0:
+            return make_error(f"PDF conversion failed: {jr['stderr']}", 500)
 
         if not out_file.exists():
             return make_error("PDF was not generated", 500)
@@ -1517,12 +1706,12 @@ def convert_docx_to_pdf() -> Response:
         "--outdir", str(out_dir),
         str(in_file),
     ]
-    env = os.environ.copy()
+    env = build_sanitized_env()
     env["HOME"] = "/tmp"
 
     start = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        jr = run_jailed_or_local(session_id, cmd, env, str(in_file.parent), 120)
         duration_ms = int((time.time() - start) * 1000)
 
         # LibreOffice names output based on input filename
@@ -1530,8 +1719,10 @@ def convert_docx_to_pdf() -> Response:
         if expected_output.exists() and expected_output != out_file:
             expected_output.rename(out_file)
 
+        if jr.get("timed_out"):
+            return make_error("DOCX to PDF conversion timed out", 504)
         if not out_file.exists():
-            return make_error(f"LibreOffice conversion failed: {proc.stderr}", 500)
+            return make_error(f"LibreOffice conversion failed: {jr['stderr']}", 500)
 
         return make_success({
             "output_path": str(out_file),
