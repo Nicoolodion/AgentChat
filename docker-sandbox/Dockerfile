@@ -64,8 +64,12 @@ RUN pip install --no-cache-dir \
     playwright
 
 # ── Playwright browsers & deps ────────────────────────────────────────────────
-RUN npx playwright install chromium \
-    && npx playwright install-deps chromium \
+# Drive browser install through the pip-installed `playwright` package itself,
+# NOT `npx playwright`: npx fetches the npm `latest` tag, which can resolve to a
+# version that does not exist on the registry (e.g. dist-tag glitch 1.61.1) and
+# breaks the build. Using the pip package's CLI guarantees the browser build
+# matches the installed driver version.
+RUN python -m playwright install --with-deps chromium \
     && chown -R sandbox:sandbox /ms-playwright
 
 # ── Application code ──────────────────────────────────────────────────────────
