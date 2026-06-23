@@ -385,6 +385,11 @@ type CompletionResult = {
   providerModel?: string;
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
+  usageTotalTokens?: number;
+  usageCachedTokens?: number;
+  energyJoules?: number;
+  energyKwh?: number;
+  energyDurationSeconds?: number;
   /**
    * The provider's finish_reason (e.g. "stop", "length", "tool_calls").
    * "length" means the output was truncated by max_output_tokens — surfaced
@@ -464,10 +469,33 @@ export async function streamCompletionWithCallbacks(
   let providerModel: string | undefined;
   let ttftMs: number | undefined;
   let ttftEmitted = false;
-  let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  let lastUsage: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+  } | undefined;
+  let lastEnergy: {
+    energy_joules?: number;
+    energy_kwh?: number;
+    duration_seconds?: number;
+    measurement_available?: boolean;
+  } | undefined;
 
   type StreamChunk = {
-    usage?: { prompt_tokens?: number; completion_tokens?: number };
+    model?: string;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      prompt_tokens_details?: { cached_tokens?: number };
+    };
+    energy?: {
+      energy_joules?: number;
+      energy_kwh?: number;
+      duration_seconds?: number;
+      measurement_available?: boolean;
+    };
     choices?: Array<{ delta?: { content?: string; reasoning?: string; tool_calls?: unknown[] }; finish_reason?: string | null }>;
   };
 
@@ -477,6 +505,9 @@ export async function streamCompletionWithCallbacks(
     for await (const chunk of response) {
       const usage = chunk.usage ?? undefined;
       if (usage) lastUsage = usage;
+      const energy = chunk.energy ?? undefined;
+      if (energy) lastEnergy = energy;
+      if (!providerModel && typeof chunk.model === "string") providerModel = chunk.model;
       const choice = chunk.choices?.[0];
       const delta = choice?.delta;
       // The provider reports finish_reason on the final chunk (often with an
@@ -532,6 +563,11 @@ export async function streamCompletionWithCallbacks(
 
   const usagePromptTokens = lastUsage?.prompt_tokens;
   const usageCompletionTokens = lastUsage?.completion_tokens;
+  const usageTotalTokens = lastUsage?.total_tokens;
+  const usageCachedTokens = lastUsage?.prompt_tokens_details?.cached_tokens;
+  const energyJoules = lastEnergy?.energy_joules;
+  const energyKwh = lastEnergy?.energy_kwh;
+  const energyDurationSeconds = lastEnergy?.duration_seconds;
 
   return {
     content: finalContent,
@@ -539,6 +575,11 @@ export async function streamCompletionWithCallbacks(
     providerModel,
     usagePromptTokens,
     usageCompletionTokens,
+    usageTotalTokens,
+    usageCachedTokens,
+    energyJoules,
+    energyKwh,
+    energyDurationSeconds,
     finishReason: lastFinishReason,
     ttftMs: ttftMs ?? Date.now() - startTime,
   };

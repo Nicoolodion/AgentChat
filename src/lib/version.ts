@@ -9,4 +9,4 @@
  * (see src/app/layout.tsx) and nowhere else, so you can always tell which
  * build is live.
  */
-export const APP_VERSION = "v0.4.4";
+export const APP_VERSION = "v0.5.0";

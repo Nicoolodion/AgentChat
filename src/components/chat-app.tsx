@@ -272,19 +272,35 @@ function AssistantBubble({
         <MessageTimeline message={message} toolOutputs={toolOutputs} toolArguments={toolArguments} isStreaming={isStreaming} />
       )}
 
-      {(message.usagePromptTokens || message.usageCompletionTokens) && (
-        <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
-          <span>
-            prompt {message.usagePromptTokens ?? 0} / completion {message.usageCompletionTokens ?? 0}
-          </span>
-          {isNewest && activeModelContextLength && (
-            <span className="font-mono">
-              {(message.usagePromptTokens ?? 0) + (message.usageCompletionTokens ?? 0)} /{" "}
-              {Math.round(activeModelContextLength / 1000)}k context
+      {(() => {
+        const p = message.usagePromptTokens ?? 0;
+        const c = message.usageCompletionTokens ?? 0;
+        const total = message.usageTotalTokens ?? p + c;
+        const cached = message.usageCachedTokens;
+        const energy = message.energyJoules;
+        const dur = message.energyDurationSeconds;
+        if (!p && !c && !energy) return null;
+        return (
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
+            <span>
+              prompt {p} / completion {c}
+              {cached ? ` / cached ${cached}` : ""}
             </span>
-          )}
-        </div>
-      )}
+            {total > 0 && <span className="font-mono">{total} total</span>}
+            {isNewest && activeModelContextLength && (
+              <span className="font-mono">
+                {total} / {Math.round(activeModelContextLength / 1000)}k context
+              </span>
+            )}
+            {energy != null && (
+              <span title="Provider-reported energy for this response">
+                {energy >= 1 ? `${energy.toFixed(1)} J` : `${(energy * 1000).toFixed(1)} mJ`}
+                {dur != null ? ` · ${(dur * 1000).toFixed(0)} ms` : ""}
+              </span>
+            )}
+          </div>
+        );
+      })()}
 
       {!isStreaming && (onReroll || (message._truncated && onContinue)) && (
         <div className="mt-2 flex items-center justify-end gap-2">

@@ -79,6 +79,11 @@ function decryptMessage(row: Message, userKey: Buffer): ChatMessage {
     toolCalls: rawToolCalls ? normalizeToolCalls(safeJson(rawToolCalls)) : undefined,
     usagePromptTokens: row.usagePromptTokens ?? undefined,
     usageCompletionTokens: row.usageCompletionTokens ?? undefined,
+    usageTotalTokens: row.usageTotalTokens ?? undefined,
+    usageCachedTokens: row.usageCachedTokens ?? undefined,
+    energyJoules: row.energyJoules ?? undefined,
+    energyKwh: row.energyKwh ?? undefined,
+    energyDurationSeconds: row.energyDurationSeconds ?? undefined,
     providerModel: row.providerModel ?? undefined,
     ttftMs: row.ttftMs ?? undefined,
     avgTokensPerSecond: row.avgTokensPerSecond ?? undefined,
@@ -299,6 +304,11 @@ export async function appendMessageToChat(input: {
   toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
+  usageTotalTokens?: number;
+  usageCachedTokens?: number;
+  energyJoules?: number;
+  energyKwh?: number;
+  energyDurationSeconds?: number;
   providerModel?: string;
   ttftMs?: number;
   avgTokensPerSecond?: number;
@@ -325,6 +335,11 @@ export async function appendMessageToChat(input: {
         : null,
       usagePromptTokens: input.usagePromptTokens,
       usageCompletionTokens: input.usageCompletionTokens,
+      usageTotalTokens: input.usageTotalTokens,
+      usageCachedTokens: input.usageCachedTokens,
+      energyJoules: input.energyJoules,
+      energyKwh: input.energyKwh,
+      energyDurationSeconds: input.energyDurationSeconds,
       providerModel: input.providerModel,
       ttftMs: input.ttftMs,
       avgTokensPerSecond: input.avgTokensPerSecond,

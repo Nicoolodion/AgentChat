@@ -223,6 +223,11 @@ export async function POST(
             userKey: auth.userKey,
             usagePromptTokens: completion.usagePromptTokens,
             usageCompletionTokens: completion.usageCompletionTokens,
+            usageTotalTokens: completion.usageTotalTokens,
+            usageCachedTokens: completion.usageCachedTokens,
+            energyJoules: completion.energyJoules,
+            energyKwh: completion.energyKwh,
+            energyDurationSeconds: completion.energyDurationSeconds,
             providerModel: completion.providerModel,
             ttftMs: completion.ttftMs,
             avgTokensPerSecond,
@@ -261,6 +266,11 @@ export async function POST(
             providerModel: completion.providerModel,
             usagePromptTokens: completion.usagePromptTokens,
             usageCompletionTokens: completion.usageCompletionTokens,
+            usageTotalTokens: completion.usageTotalTokens,
+            usageCachedTokens: completion.usageCachedTokens,
+            energyJoules: completion.energyJoules,
+            energyKwh: completion.energyKwh,
+            energyDurationSeconds: completion.energyDurationSeconds,
             ttftMs: completion.ttftMs,
             avgTokensPerSecond,
             finishReason: completion.finishReason,
@@ -397,6 +407,16 @@ async function handleAgentMessage(input: {
         contentSegments?: { text: string; beforeToolIndex: number }[];
         toolCallsCount: number;
         finishReason?: string;
+        usagePromptTokens?: number;
+        usageCompletionTokens?: number;
+        usageTotalTokens?: number;
+        usageCachedTokens?: number;
+        energyJoules?: number;
+        energyKwh?: number;
+        energyDurationSeconds?: number;
+        providerModel?: string;
+        ttftMs?: number;
+        avgTokensPerSecond?: number;
       } | null = null;
 
       // wrap sendEvent to intercept tool_start / tool_output / tool_done and
@@ -509,6 +529,16 @@ async function handleAgentMessage(input: {
           contentSegments: completionResult.contentSegments,
           toolCalls: finalToolCalls.length ? finalToolCalls : undefined,
           userKey: auth.userKey,
+          usagePromptTokens: completionResult.usagePromptTokens,
+          usageCompletionTokens: completionResult.usageCompletionTokens,
+          usageTotalTokens: completionResult.usageTotalTokens,
+          usageCachedTokens: completionResult.usageCachedTokens,
+          energyJoules: completionResult.energyJoules,
+          energyKwh: completionResult.energyKwh,
+          energyDurationSeconds: completionResult.energyDurationSeconds,
+          providerModel: completionResult.providerModel,
+          ttftMs: completionResult.ttftMs,
+          avgTokensPerSecond: completionResult.avgTokensPerSecond,
         });
       } catch (dbError) {
         console.error("[DB Write Error]", dbError);
@@ -540,6 +570,16 @@ async function handleAgentMessage(input: {
           totalToolCalls: completionResult.toolCallsCount,
           totalDurationMs: 0,
           finishReason: completionResult.finishReason,
+          providerModel: completionResult.providerModel,
+          usagePromptTokens: completionResult.usagePromptTokens,
+          usageCompletionTokens: completionResult.usageCompletionTokens,
+          usageTotalTokens: completionResult.usageTotalTokens,
+          usageCachedTokens: completionResult.usageCachedTokens,
+          energyJoules: completionResult.energyJoules,
+          energyKwh: completionResult.energyKwh,
+          energyDurationSeconds: completionResult.energyDurationSeconds,
+          ttftMs: completionResult.ttftMs,
+          avgTokensPerSecond: completionResult.avgTokensPerSecond,
         },
         assistantMessage: assistantMessage ?? undefined,
         userMessage,

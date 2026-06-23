@@ -15,6 +15,7 @@ import type { MessageSegment, ReasoningEffort } from "@/lib/chat-types";
 import { env } from "@/lib/env";
 import {
   getOpenAIClientForModel,
+  isNeuralwattModel,
   resolveApiModelId,
   resolveReasoningEffort,
 } from "@/lib/nanogpt";
@@ -196,6 +197,162 @@ class ThinkingSplitter {
   }
 }
 
+/**
+ * Streaming splitter that handles models (e.g. Neuralwatt's Kimi reasoning
+ * variants) which wrap their private reasoning in *invisible sentinel*
+ * characters rather than readable XML tags. Such sentinels are control,
+ * format, private-use, tag, or "special" code points that never appear in
+ * normal prose. A run of them acts as a toggle boundary between reasoning and
+ * visible content.
+ *
+ * It is conservative: it only "arms" when the turn *leads* with a sentinel
+ * (within the first few characters), which is exactly the leak signature. A
+ * clean answer that merely contains a stray invisible character somewhere in
+ * the middle never arms, so it is passed through untouched. Variation
+ * selectors, zero-width joiners and whitespace are excluded so ordinary text
+ * and emoji are never mistaken for sentinels.
+ *
+ * Streaming-safe: a trailing lone high surrogate (the first half of an astral
+ * sentinel split across deltas) is held back. A pathological run without a
+ * closing sentinel trips a desync guard so the rest is flushed as content
+ * rather than swallowing the entire answer into reasoning.
+ */
+class SentinelThinkingSplitter {
+  private buf = "";
+  private inThinking = false;
+  private armed = false;
+  private decided = false;
+  private desynced = false;
+  private blockLen = 0;
+  private static readonly HEAD = 4;
+  private static readonly MAX_BLOCK = 8000;
+
+  constructor(
+    private onContent: (text: string) => void,
+    private onReasoning: (text: string) => void,
+  ) {}
+
+  push(text: string): void {
+    if (this.buf.length === 0 && this.decided && !this.armed) {
+      this.onContent(text);
+      return;
+    }
+    this.buf += text;
+    this.drain();
+  }
+
+  flush(): void {
+    if (!this.buf) return;
+    if (this.decided && !this.armed) {
+      this.onContent(this.buf);
+    } else if (this.inThinking && this.armed && !this.desynced) {
+      this.onReasoning(this.buf);
+    } else {
+      this.onContent(this.buf);
+    }
+    this.buf = "";
+  }
+
+  private drain(): void {
+    while (this.buf) {
+      if (!this.decided) {
+        const idx = SentinelThinkingSplitter.nextSentinelIndex(this.buf);
+        if (idx === -1) {
+          if (this.buf.length <= SentinelThinkingSplitter.HEAD) return; // wait
+          this.decided = true;
+          this.armed = false;
+          this.onContent(this.buf);
+          this.buf = "";
+          return;
+        }
+        if (idx > SentinelThinkingSplitter.HEAD) {
+          this.decided = true;
+          this.armed = false;
+          this.onContent(this.buf);
+          this.buf = "";
+          return;
+        }
+        if (idx > 0) {
+          this.onContent(this.buf.slice(0, idx));
+          this.buf = this.buf.slice(idx);
+        }
+        this.decided = true;
+        this.armed = true;
+      }
+
+      const idx = SentinelThinkingSplitter.nextSentinelIndex(this.buf);
+      if (idx === -1) {
+        this.emitHold();
+        return;
+      }
+      if (idx > 0) {
+        this.emit(this.buf.slice(0, idx));
+        this.buf = this.buf.slice(idx);
+      }
+      const consumed = SentinelThinkingSplitter.consumeSentinelRun(this.buf);
+      this.buf = this.buf.slice(consumed);
+      if (!this.desynced && this.armed) {
+        this.inThinking = !this.inThinking;
+        this.blockLen = 0;
+      }
+    }
+  }
+
+  private emitHold(): void {
+    let safe = this.buf.length;
+    const last = this.buf.charCodeAt(safe - 1);
+    if (last >= 0xd800 && last <= 0xdbff) safe -= 1;
+    if (safe > 0) this.emit(this.buf.slice(0, safe));
+    this.buf = this.buf.slice(safe);
+  }
+
+  private emit(text: string): void {
+    if (!text) return;
+    if (this.inThinking && this.armed && !this.desynced) {
+      this.onReasoning(text);
+      this.blockLen += text.length;
+      if (this.blockLen > SentinelThinkingSplitter.MAX_BLOCK) this.desynced = true;
+    } else {
+      this.onContent(text);
+    }
+  }
+
+  private static nextSentinelIndex(s: string): number {
+    for (let i = 0; i < s.length; ) {
+      const cp = s.codePointAt(i)!;
+      if (SentinelThinkingSplitter.isSentinel(cp)) return i;
+      i += cp > 0xffff ? 2 : 1;
+    }
+    return -1;
+  }
+
+  private static consumeSentinelRun(s: string): number {
+    let i = 0;
+    while (i < s.length) {
+      const cp = s.codePointAt(i)!;
+      if (!SentinelThinkingSplitter.isSentinel(cp)) break;
+      i += cp > 0xffff ? 2 : 1;
+    }
+    return i;
+  }
+
+  private static isSentinel(cp: number): boolean {
+    if (cp === 0x09 || cp === 0x0a || cp === 0x0d || cp === 0x20) return false;
+    if (cp === 0x200c || cp === 0x200d) return false;
+    if (cp >= 0xfe00 && cp <= 0xfe0f) return false;
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) return true;
+    if (cp >= 0x200b && cp <= 0x200f) return true;
+    if (cp >= 0x2060 && cp <= 0x2069) return true;
+    if (cp === 0xfeff) return true;
+    if (cp >= 0xe000 && cp <= 0xf8ff) return true;
+    if (cp >= 0xf0000 && cp <= 0xffffd) return true;
+    if (cp >= 0x100000 && cp <= 0x10fffd) return true;
+    if (cp === 0xe0001 || (cp >= 0xe0020 && cp <= 0xe007f)) return true;
+    if (cp >= 0xfff9 && cp <= 0xfffb) return true;
+    return false;
+  }
+}
+
 /** Format a human-readable status line for a file-producing tool call,
  *  surfaced as the tool's output so the UI/operator always sees a clear
  *  success or failure message (never an empty result). */
@@ -219,6 +376,11 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+/** Coerce a possibly-undefined/messy numeric usage field, defaulting to 0. */
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
 type TodoItem = { checked: boolean; text: string };
@@ -385,6 +547,16 @@ export async function runAgentExecution(input: {
   toolCallsCount: number;
   /** Provider finish_reason for the final assistant turn (e.g. "length" = truncated). */
   finishReason?: string;
+  usagePromptTokens?: number;
+  usageCompletionTokens?: number;
+  usageTotalTokens?: number;
+  usageCachedTokens?: number;
+  energyJoules?: number;
+  energyKwh?: number;
+  energyDurationSeconds?: number;
+  providerModel?: string;
+  ttftMs?: number;
+  avgTokensPerSecond?: number;
 }> {
   const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort, modelContextLength } = input;
 
@@ -485,6 +657,23 @@ export async function runAgentExecution(input: {
   // truncation ("length") so the client can offer "Continue generating".
   let lastFinishReason: string | undefined;
   const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "250");
+
+  // Real usage + energy totals from the provider (Neuralwatt reports them on
+  // the final chunk of each streamed turn). Summed across every LLM turn in
+  // the agent loop so the persisted message reflects the true cost of the
+  // whole run — never guessed.
+  let usagePromptTokens = 0;
+  let usageCompletionTokens = 0;
+  let usageTotalTokens = 0;
+  let usageCachedTokens = 0;
+  let energyJoules = 0;
+  let energyKwh = 0;
+  let energyDurationSeconds = 0;
+  let providerModel: string | undefined;
+  const runStartMs = Date.now();
+  let ttftMs: number | undefined;
+  let ttftEmitted = false;
+
   // Guards recovery when the provider rejects a streamed tool call's JSON
   // arguments mid-session. We let the model retry with file-path-based args
   // rather than aborting the whole task, but cap retries to avoid an infinite
@@ -511,6 +700,29 @@ export async function runAgentExecution(input: {
     }
     currentReasoningSeg = "";
     currentContentSeg = "";
+  };
+
+  /** Assemble the real provider usage/energy metadata for the persisted
+   *  message and SSE `done` event. Numbers come straight from the provider's
+   *  `usage`/`energy` blocks — never estimated. */
+  const usageMeta = () => {
+    const elapsedSec = (Date.now() - runStartMs) / 1000;
+    const avgTokensPerSecond =
+      usageCompletionTokens > 0 && elapsedSec > 0
+        ? usageCompletionTokens / elapsedSec
+        : undefined;
+    return {
+      usagePromptTokens: usagePromptTokens || undefined,
+      usageCompletionTokens: usageCompletionTokens || undefined,
+      usageTotalTokens: usageTotalTokens || undefined,
+      usageCachedTokens: usageCachedTokens || undefined,
+      energyJoules: energyJoules || undefined,
+      energyKwh: energyKwh || undefined,
+      energyDurationSeconds: energyDurationSeconds || undefined,
+      providerModel,
+      ttftMs,
+      avgTokensPerSecond,
+    };
   };
 
   // Resolve the reasoning_effort capability once (the route may have already
@@ -546,19 +758,27 @@ export async function runAgentExecution(input: {
     // Detects thinking-tag-wrapped reasoning (`<thinking>…</thinking>` etc.)
     // in the streamed content and reroutes it to the reasoning channel so it
     // doesn't appear as visible answer text.
-    const thinker = new ThinkingSplitter(
-      (text) => {
-        contentBuffer += text;
-        finalContent += text;
-        currentContentSeg += text;
-        sendEvent({ type: "content", data: { text } });
-      },
-      (text) => {
-        finalReasoning += text;
-        currentReasoningSeg += text;
-        sendEvent({ type: "reasoning", data: { text } });
-      },
+    const onContent = (text: string) => {
+      contentBuffer += text;
+      finalContent += text;
+      currentContentSeg += text;
+      sendEvent({ type: "content", data: { text } });
+    };
+    const onReasoning = (text: string) => {
+      finalReasoning += text;
+      currentReasoningSeg += text;
+      sendEvent({ type: "reasoning", data: { text } });
+    };
+    const thinker = new ThinkingSplitter(onContent, onReasoning);
+    // Neuralwatt reasoning models (e.g. Kimi flex variants) sometimes wrap
+    // their thinking in invisible sentinel characters that leak into the
+    // content stream. When present, route the sentinel-delimited reasoning to
+    // the reasoning channel before the XML-tag splitter sees it.
+    const sentinel = new SentinelThinkingSplitter(
+      (text) => thinker.push(text),
+      onReasoning,
     );
+    const useSentinelSplitter = isNeuralwattModel(model);
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       response = await client.chat.completions.create(
@@ -583,6 +803,38 @@ export async function runAgentExecution(input: {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       for await (const chunk of response as AsyncIterable<any>) {
+        // Capture real usage + energy reported by the provider (Neuralwatt
+        // emits them on the final chunk of each turn). Accumulate across
+        // turns so totals reflect the whole run.
+        const usage = chunk?.usage as
+          | {
+              prompt_tokens?: number;
+              completion_tokens?: number;
+              total_tokens?: number;
+              prompt_tokens_details?: { cached_tokens?: number };
+            }
+          | undefined;
+        if (usage) {
+          usagePromptTokens += num(usage.prompt_tokens);
+          usageCompletionTokens += num(usage.completion_tokens);
+          usageTotalTokens += num(usage.total_tokens);
+          usageCachedTokens += num(usage.prompt_tokens_details?.cached_tokens);
+        }
+        const energy = chunk?.energy as
+          | {
+              energy_joules?: number;
+              energy_kwh?: number;
+              duration_seconds?: number;
+              measurement_available?: boolean;
+            }
+          | undefined;
+        if (energy) {
+          if (typeof energy.energy_joules === "number") energyJoules += energy.energy_joules;
+          if (typeof energy.energy_kwh === "number") energyKwh += energy.energy_kwh;
+          if (typeof energy.duration_seconds === "number") energyDurationSeconds += energy.duration_seconds;
+        }
+        if (!providerModel && typeof chunk?.model === "string") providerModel = chunk.model;
+
         const choice = chunk.choices?.[0];
         const delta = choice?.delta;
         if (choice?.finish_reason) lastFinishReason = choice.finish_reason;
@@ -590,15 +842,17 @@ export async function runAgentExecution(input: {
 
         const reasoningDelta = (delta as { reasoning?: string })?.reasoning;
         if (reasoningDelta) {
+          if (!ttftEmitted) { ttftMs = Date.now() - runStartMs; ttftEmitted = true; }
           finalReasoning += reasoningDelta;
           currentReasoningSeg += reasoningDelta;
           sendEvent({ type: "reasoning", data: { text: reasoningDelta } });
         }
 
         if (delta.content) {
-          // Route through the thinking-tag splitter so wrapped reasoning is
+          // Route through the thinking splitter(s) so wrapped reasoning is
           // moved to the reasoning channel instead of leaking into content.
-          thinker.push(delta.content);
+          if (useSentinelSplitter) sentinel.push(delta.content);
+          else thinker.push(delta.content);
         }
 
         const toolCalls = delta.tool_calls ?? [];
@@ -624,6 +878,7 @@ export async function runAgentExecution(input: {
       }
       // Stream for this turn finished — flush any buffered/partial thinking
       // tag content so it is attributed to the correct segment.
+      if (useSentinelSplitter) sentinel.flush();
       thinker.flush();
     } catch (streamErr) {
       if ((streamErr as Error).name === "AbortError") throw streamErr;
@@ -658,6 +913,7 @@ export async function runAgentExecution(input: {
           contentSegments: contentSegments.length ? contentSegments : undefined,
           toolCallsCount,
           finishReason: lastFinishReason,
+          ...usageMeta(),
         };
       }
       await updateSessionStatus(sessionId, "executing");
@@ -703,6 +959,7 @@ export async function runAgentExecution(input: {
         contentSegments: contentSegments.length ? contentSegments : undefined,
         toolCallsCount,
         finishReason: lastFinishReason,
+        ...usageMeta(),
       };
     }
 
@@ -810,6 +1067,7 @@ export async function runAgentExecution(input: {
     contentSegments: contentSegments.length ? contentSegments : undefined,
     toolCallsCount,
     finishReason: lastFinishReason,
+    ...usageMeta(),
   };
 }
 

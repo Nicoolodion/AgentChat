@@ -53,6 +53,11 @@ export type ChatMessage = {
   toolCalls?: ChatToolCall[];
   usagePromptTokens?: number;
   usageCompletionTokens?: number;
+  usageTotalTokens?: number;
+  usageCachedTokens?: number;
+  energyJoules?: number;
+  energyKwh?: number;
+  energyDurationSeconds?: number;
   providerModel?: string;
   ttftMs?: number;
   avgTokensPerSecond?: number;

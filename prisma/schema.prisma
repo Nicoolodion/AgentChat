@@ -62,6 +62,11 @@ model Message {
   encryptedToolCalls    String?  // JSON array of ChatToolCall[]
   usagePromptTokens     Int?
   usageCompletionTokens Int?
+  usageTotalTokens      Int?
+  usageCachedTokens     Int?
+  energyJoules          Float?
+  energyKwh             Float?
+  energyDurationSeconds Float?
   providerModel         String?
   ttftMs                Int?
   avgTokensPerSecond    Float?
