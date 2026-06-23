@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-impress \
     fonts-liberation fonts-noto fonts-noto-cjk \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+    # WeasyPrint native deps: it loads libpango via ctypes. Without these the
+    # pip-installed weasyprint fails to import ("cannot load library
+    # 'libpangoft2-1.0-0'"), so the HTML->PDF fallback path was unusable.
+    libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 libcairo2 libffi8 \
     git wget unzip pandoc \
     supervisor gosu \
     && rm -rf /var/lib/apt/lists/* \
@@ -61,6 +66,11 @@ RUN pip install --no-cache-dir \
     plotly seaborn altair \
     kaleido==0.2.1 vl-convert-python \
     flask gunicorn dill \
+    # reportlab: pure-Python PDF generation, kept as a reliable last-resort
+    # fallback when LibreOffice/Playwright are unavailable. pypdf: read/inspect
+    # the generated PDFs. Pre-installed so the agent doesn't waste a turn on
+    # pip_install on every session.
+    reportlab pypdf \
     playwright
 
 # ── Playwright browsers & deps ────────────────────────────────────────────────

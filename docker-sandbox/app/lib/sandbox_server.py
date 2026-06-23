@@ -1669,26 +1669,30 @@ def convert_html_to_pdf() -> Response:
             return make_error("Input HTML file not found", 404)
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use Node.js Playwright script for conversion
-    script_path = Path("/app/scripts/html_to_pdf.js")
+    # Use the Python Playwright-based converter. The image ships only the
+    # Python `playwright` package (pip) + its browsers at
+    # $PLAYWRIGHT_BROWSERS_PATH; the Node `playwright` npm module is not
+    # installed, so the old node html_to_pdf.js failed with MODULE_NOT_FOUND.
+    script_path = Path("/app/scripts/html_to_pdf.py")
     if not script_path.exists():
-        return make_error("html_to_pdf.js script not found", 500)
+        return make_error("html_to_pdf.py script not found", 500)
 
     cmd = [
-        "node", str(script_path),
+        sys.executable, str(script_path),
         str(in_file), str(out_file),
         json.dumps(options),
     ]
 
     start = time.time()
     try:
-        jr = _run_as_alloc(session_id, cmd, _alloc_run_env(session_id), str(in_file.parent), 120)
+        env = _alloc_run_env(session_id)
+        jr = _run_as_alloc(session_id, cmd, env, str(in_file.parent), 120)
         duration_ms = int((time.time() - start) * 1000)
 
         if jr.get("timed_out"):
             return make_error("PDF conversion timed out", 504)
         if jr["exit_code"] != 0:
-            return make_error(f"PDF conversion failed: {jr['stderr']}", 500)
+            return make_error(f"PDF conversion failed: {jr['stderr'] or jr['stdout']}", 500)
 
         with as_session_uid(session_id):
             if not out_file.exists():
@@ -1730,11 +1734,16 @@ def convert_docx_to_pdf() -> Response:
     # Use LibreOffice headless conversion. HOME points at a per-session
     # alloc-owned .home so LibreOffice/dconf can write their profile caches
     # (shared /tmp was the cause of the dconf "Permission denied" fatal error).
+    # -env:UserInstallation forces LO's own user profile into that home too, so
+    # "User installation could not be completed" cannot recur even if some
+    # downstream tool resets HOME.
     out_dir = out_file.parent
+    home_uri = "file://" + str(_session_home(session_id))
     cmd = [
         "libreoffice",
         "--headless",
         "--nologo",
+        "-env:UserInstallation=" + home_uri,
         "--convert-to", "pdf",
         "--outdir", str(out_dir),
         str(in_file),

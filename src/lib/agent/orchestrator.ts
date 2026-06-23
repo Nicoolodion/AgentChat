@@ -1399,7 +1399,13 @@ async function executeSandboxTool(
       const outputPath = String(args.output_path ?? "") || `output/${inputPath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "converted"}.${outputFormat}`;
       const outDir = outputPath.includes("/") ? outputPath.substring(0, outputPath.lastIndexOf("/")) : "output";
       await sandboxExecPython(sessionId, `import os; os.makedirs(${JSON.stringify(outDir)}, exist_ok=True)`, 10);
-      const cmd = `HOME=/tmp libreoffice --headless --nologo --convert-to ${outputFormat} --outdir "${outDir.replace(/"/g, '\\"')}" "${inputPath.replace(/"/g, '\\"')}"`;
+      // The shell route already sets a per-session alloc-owned HOME so
+      // LibreOffice/dconf can write their profile caches. Do NOT override it
+      // with HOME=/tmp here — that points at the shared tmpfs where root-side
+      // probes created root-owned /tmp/.cache (mode 0700), which is exactly
+      // what made LibreOffice fail with "User installation could not be
+      // completed" / dconf "Permission denied".
+      const cmd = `libreoffice --headless --nologo --convert-to ${outputFormat} --outdir "${outDir.replace(/"/g, '\\"')}" "${inputPath.replace(/"/g, '\\"')}"`;
       const res = await sandboxExecShell(sessionId, cmd, "/", 120);
       let sizeBytes: number | undefined;
       try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist */ }
