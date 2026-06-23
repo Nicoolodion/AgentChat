@@ -92,8 +92,8 @@ services:
     # drop backdoors into the container image (audit finding 2.2).
     read_only: true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,size=536870912
-      - /run:rw,nosuid,nodev,size=67108864
+      - /tmp:rw,nosuid,nodev,size=536870912,mode=1777
+      - /run:rw,nosuid,nodev,size=67108864,mode=0755
     cap_drop:
       - ALL
     cap_add:

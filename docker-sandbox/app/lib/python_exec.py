@@ -269,7 +269,7 @@ def run_python(
     workspaces (audit 2.1/2.3). The parent (server) stays root and only reads
     the child's pipes.
     """
-    from isolation import drop_to_session, alloc_ids  # local import to avoid cycle
+    from isolation import drop_to_session, alloc_ids, session_home  # local import to avoid cycle
 
     session_workspace = ensure_session_dirs(session_id, workspace_root)
     image_dir = session_workspace / ".session_images"
@@ -291,6 +291,7 @@ def run_python(
 
     wrapper = _build_wrapper(code, session_workspace)
     env = build_sanitized_env(os.environ.copy(), session_workspace=session_workspace)
+    env["HOME"] = str(session_home(session_id))
     env["MPLBACKEND"] = env.get("MPLBACKEND") or "Agg"
     cmd = [sys.executable, "-u", "-c", wrapper]
 

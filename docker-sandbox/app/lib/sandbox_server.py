@@ -34,6 +34,7 @@ from isolation import (
     as_session_uid,
     drop_to_session,
     prepare_session_with_migration,
+    session_home,
 )
 
 # Configure logging
@@ -222,6 +223,33 @@ def _chown_alloc(path: Path, session_id: str) -> None:
         os.chown(path, auid, agid)
     except OSError:
         pass
+
+
+def _session_home(session_id: str) -> Path:
+    """Per-session alloc-owned HOME (see :func:`isolation.session_home`)."""
+    return session_home(session_id)
+
+
+def _alloc_run_env(session_id: str, *, base: Optional[dict] = None) -> dict:
+    """Sanitized env for a subprocess that will drop to the session's alloc uid.
+
+    HOME and all XDG/NUGET profile/cache vars point at the per-session .home so
+    the dropped process never reads or writes the shared /tmp cache (which would
+    either collide with or be blocked by root-owned entries). TMPDIR stays
+    /tmp (world-writable tmpfs, mode 1777) for scratch files.
+    """
+    home = _session_home(session_id)
+    env = build_sanitized_env(base)
+    env["HOME"] = str(home)
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    env["DOTNET_CLI_HOME"] = str(home)
+    env["NUGET_PACKAGES"] = str(home / "nuget" / "packages")
+    env["NUGET_HTTP_CACHE_PATH"] = str(home / "nuget" / "http-cache")
+    env["NUGET_SCRATCH"] = str(home / "nuget" / "scratch")
+    env["TMPDIR"] = "/tmp"
+    return env
 
 
 def ensure_session_dirs(session_id: str) -> Path:
@@ -443,12 +471,13 @@ def exec_shell() -> Response:
 
     # Run the command with a secret-scrubbed environment so credentials that
     # happen to be present in the container env are not handed to user code
-    # (audit 2.5). HOME points at the session workspace; a conservative PATH is
-    # used. umask 077 keeps any files the command creates private within the
-    # session's own uid (defense-in-depth for 2.1).
-    shell_env = build_sanitized_env(os.environ.copy(), session_workspace=session_workspace)
+    # (audit 2.5). HOME points at a per-session alloc-owned .home so tools the
+    # agent shells out to (libreoffice, etc.) can write caches without polluting
+    # or being blocked by root-owned /tmp entries. umask 077 keeps any files the
+    # command creates private within the session's own uid (defense-in-depth for 2.1).
+    shell_env = _alloc_run_env(session_id, base=os.environ.copy())
+    shell_env["WORKSPACE_DIR"] = str(session_workspace)
     shell_env["PATH"] = RESTRICTED_PATH + os.pathsep + shell_env.get("PATH", "")
-    shell_env["HOME"] = str(session_workspace)
 
     start = time.time()
 
@@ -1369,15 +1398,8 @@ def docx_build() -> Response:
 
     cmd = ["bash", str(docx_script), "build", abs_output]
 
-    env = os.environ.copy()
+    env = _alloc_run_env(session_id)
     env["DOCX_WORK_DIR"] = str(work_dir)
-    env["HOME"] = "/tmp"
-    env["DOTNET_CLI_HOME"] = "/tmp"
-    env["NUGET_PACKAGES"] = "/tmp/nuget"
-    env["NUGET_HTTP_CACHE_PATH"] = "/tmp/nuget-http-cache"
-    env["NUGET_SCRATCH"] = "/tmp/nuget-scratch"
-    env["TMPDIR"] = "/tmp"
-    env = build_sanitized_env(env)
 
     start = time.time()
     try:
@@ -1549,7 +1571,7 @@ def pptx_run() -> Response:
     if action == "screenshot" and pages:
         argv += ["-p", str(pages)]
 
-    env = build_sanitized_env(os.environ.copy())
+    env = _alloc_run_env(session_id, base=os.environ.copy())
     # Match scripts/*.sh locale handling so UTF-8 paths work under POSIX/C.
     env["PYTHONUTF8"] = "1"
     env.setdefault("LC_ALL", "C.UTF-8")
@@ -1660,7 +1682,7 @@ def convert_html_to_pdf() -> Response:
 
     start = time.time()
     try:
-        jr = _run_as_alloc(session_id, cmd, build_sanitized_env(), str(in_file.parent), 120)
+        jr = _run_as_alloc(session_id, cmd, _alloc_run_env(session_id), str(in_file.parent), 120)
         duration_ms = int((time.time() - start) * 1000)
 
         if jr.get("timed_out"):
@@ -1705,7 +1727,9 @@ def convert_docx_to_pdf() -> Response:
             return make_error("Input DOCX file not found", 404)
         out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use LibreOffice headless conversion (writable HOME avoids dconf errors)
+    # Use LibreOffice headless conversion. HOME points at a per-session
+    # alloc-owned .home so LibreOffice/dconf can write their profile caches
+    # (shared /tmp was the cause of the dconf "Permission denied" fatal error).
     out_dir = out_file.parent
     cmd = [
         "libreoffice",
@@ -1715,8 +1739,7 @@ def convert_docx_to_pdf() -> Response:
         "--outdir", str(out_dir),
         str(in_file),
     ]
-    env = build_sanitized_env()
-    env["HOME"] = "/tmp"
+    env = _alloc_run_env(session_id)
 
     start = time.time()
     try:

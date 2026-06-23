@@ -30,11 +30,6 @@ services:
       - SANDBOX_LOG_LEVEL=info
       - SANDBOX_MAX_EXECUTION_TIME=300
       - SANDBOX_DEFAULT_TIMEOUT=60
-      - HOME=/tmp
-      - DOTNET_CLI_HOME=/tmp
-      - NUGET_PACKAGES=/tmp/nuget
-      - NUGET_HTTP_CACHE_PATH=/tmp/nuget-http-cache
-      - NUGET_SCRATCH=/tmp/nuget-scratch
       - TMPDIR=/tmp
     # Resource limits (mirror production constraints)
     deploy:
@@ -49,8 +44,8 @@ services:
     # patch /app or drop backdoors into the container image (audit 2.2).
     read_only: true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,size=536870912
-      - /run:rw,nosuid,nodev,size=67108864
+      - /tmp:rw,nosuid,nodev,size=536870912,mode=1777
+      - /run:rw,nosuid,nodev,size=67108864,mode=0755
     cap_drop:
       - ALL
     cap_add:

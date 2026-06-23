@@ -35,6 +35,28 @@ def _session_dir(session_id: str) -> Path:
     return WORKSPACE_ROOT / session_id
 
 
+def session_home(session_id: str) -> Path:
+    """A per-session private HOME for external-binary subprocesses.
+
+    Owned by the session's alloc uid (mode 0700) so dropped child processes
+    (LibreOffice/dotnet/node/python) can write their caches/profiles without
+    touching the shared /tmp. The shared /tmp is a single tmpfs: if the root
+    server or a probe ever created /tmp/.cache (root-owned, umask 077 -> mode
+    0700), every alloc uid was blocked from it, which caused LibreOffice/dconf
+    fatal errors ("unable to create directory '/tmp/.cache/dconf'"). A
+    per-session HOME sidesteps that and keeps each session's caches isolated.
+    """
+    home = _session_dir(session_id) / ".home"
+    auid, agid = alloc_ids(session_id)
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chown(home, auid, agid)
+        home.chmod(0o700)
+    except OSError:
+        pass
+    return home
+
+
 def prepare_session(session_id: str) -> Path:
     """Create a session's dir tree owned by its alloc uid, mode 0700.
 

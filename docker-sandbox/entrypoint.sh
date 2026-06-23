@@ -10,12 +10,16 @@ SANDBOX_HOST="${SANDBOX_HOST:-0.0.0.0}"
 SANDBOX_LOG_LEVEL="${SANDBOX_LOG_LEVEL:-info}"
 SANDBOX_WORKERS="${SANDBOX_WORKERS:-2}"
 
-export HOME=/tmp
-export DOTNET_CLI_HOME=/tmp
-export NUGET_PACKAGES=/tmp/nuget
-export NUGET_HTTP_CACHE_PATH=/tmp/nuget-http-cache
-export NUGET_SCRATCH=/tmp/nuget-scratch
+# Per-session subprocesses get their own alloc-owned HOME (see
+# isolation.session_home). The root server's own HOME must NOT be /tmp: under
+# umask 077, root-side tools (e.g. the `libreoffice --version` probe below)
+# would create /tmp/.cache owned by root (mode 0700) and every alloc uid would
+# then be blocked from it — the cause of LibreOffice/dconf fatal errors. So the
+# root process gets a private root-owned HOME, and /tmp stays clean (mode 1777)
+# for per-session scratch (TMPDIR only).
+export HOME=/tmp/.root-home
 export TMPDIR=/tmp
+install -d -m 0700 "$HOME"
 
 echo "=========================================="
 echo "Chatinterface Agent Sandbox"
