@@ -58,7 +58,7 @@ services:
       - SETGID
       - SETUID
       - FOWNER
-    pids_limit: 512
+      - DAC_OVERRIDE
     sysctls:
       - net.ipv4.ip_unprivileged_port_start=1024
     networks:

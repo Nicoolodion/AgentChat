@@ -2,12 +2,20 @@
 set -euo pipefail
 
 # Chatinterface Agent Sandbox Entrypoint
-# Starts as root to fix bind-mount permissions, then drops to sandbox user
+# Runs as root: the server performs per-session seteuid isolation. The
+# application image is read-only (read_only rootfs) so even root cannot patch it.
 
 SANDBOX_PORT="${SANDBOX_PORT:-8080}"
 SANDBOX_HOST="${SANDBOX_HOST:-0.0.0.0}"
 SANDBOX_LOG_LEVEL="${SANDBOX_LOG_LEVEL:-info}"
 SANDBOX_WORKERS="${SANDBOX_WORKERS:-2}"
+
+export HOME=/tmp
+export DOTNET_CLI_HOME=/tmp
+export NUGET_PACKAGES=/tmp/nuget
+export NUGET_HTTP_CACHE_PATH=/tmp/nuget-http-cache
+export NUGET_SCRATCH=/tmp/nuget-scratch
+export TMPDIR=/tmp
 
 echo "=========================================="
 echo "Chatinterface Agent Sandbox"
@@ -15,41 +23,30 @@ echo "=========================================="
 echo ""
 
 # ── Filesystem hardening ────────────────────────────────────────────────────
-# /workspace holds every session directory on a shared bind mount. Root owns
-# the volume root (mode 0750) — session subdirectories are created by the API
-# server with a restrictive umask so a session cannot list/clobber siblings
-# through write-permission overlap. /app is root-owned & read-only by design
-# (see Dockerfile) and must NOT be chowned to the runtime user here.
+# /workspace is shared by every session. Root owns it (0711): sessions' alloc
+# uids can traverse to their own /workspace/<sid> (other gets --x) but cannot
+# list or create sibling entries. Each <sid> is created/owned by the server
+# (isolation.prepare_session) under a dedicated uid with mode 0700.
 umask 077
 mkdir -p /workspace
-chown sandbox:sandbox /workspace
-chmod 0750 /workspace
-chown -R sandbox:sandbox /workspace/* 2>/dev/null || true
-find /workspace -maxdepth 1 -type d ! -path /workspace -exec chmod 0750 {} + 2>/dev/null || true
+chown root:root /workspace
+chmod 0711 /workspace
 
-# Verify the application image was not accidentally made writable by the runtime
-# user (defense-in-depth: abort early rather than run a possibly-backdoored app).
-if [ -w /app/lib ] 2>/dev/null; then
-  echo "ERROR: /app/lib is writable by the runtime user — refusing to start (security)."
+# The application code must be read-only even to root: the read-only rootfs is
+# the real guard. Abort if it happens to be writable (e.g. forgot read_only).
+if touch /app/lib/..__w_test__ 2>/dev/null; then
+  rm -f /app/lib/..__w_test__
+  echo "ERROR: /app/lib is writable — refusing to start (security). Enable read_only rootfs."
   exit 1
 fi
 
 # Verify dependencies
 echo "Checking dependencies..."
 
-# Python
 python --version || { echo "ERROR: Python not found"; exit 1; }
-
-# Node.js
 node --version || { echo "ERROR: Node.js not found"; exit 1; }
-
-# Playwright
 python -c "import playwright; print(f'Playwright: OK')" || { echo "WARNING: Playwright not available"; }
-
-# LibreOffice
 libreoffice --version || { echo "WARNING: LibreOffice not available"; }
-
-# .NET
 dotnet --version || { echo "WARNING: .NET not available"; }
 
 echo ""
@@ -60,34 +57,13 @@ echo "  Workers: $SANDBOX_WORKERS"
 echo "  Log Level: $SANDBOX_LOG_LEVEL"
 echo ""
 
-# ── Per-session UID isolation jail ──────────────────────────────────────────
-# A small root process maps each session to a dedicated uid and runs that
-# session's code under it, so one session cannot read/write another's files
-# (audit 2.1/2.3). The API server itself stays non-root. Fail closed: if the
-# jail cannot start (e.g. the host lacks ACL support), refuse to boot rather
-# than run unprotected.
-SANDBOX_JAIL_SOCKET="${SANDBOX_JAIL_SOCKET:-/run/session-jail.sock}"
-mkdir -p "$(dirname "$SANDBOX_JAIL_SOCKET")"
-python /app/lib/session_jail.py &
-JAIL_PID=$!
-for _ in $(seq 1 30); do
-  [ -S "$SANDBOX_JAIL_SOCKET" ] && break
-  if ! kill -0 "$JAIL_PID" 2>/dev/null; then
-    echo "ERROR: session isolation jail failed to start — refusing to boot unprotected."
-    exit 1
-  fi
-  sleep 0.5
-done
-if [ ! -S "$SANDBOX_JAIL_SOCKET" ]; then
-  echo "ERROR: session isolation jail did not become ready in time — refusing to boot."
-  exit 1
-fi
-echo "Session isolation jail ready (pid $JAIL_PID, socket $SANDBOX_JAIL_SOCKET)."
-
 cd /app/lib
 
 if [ "$SANDBOX_WORKERS" -gt 1 ]; then
-    exec gosu sandbox gunicorn \
+    # sync worker class: one request per worker at a time, which is required
+    # for safe per-session seteuid bracketing (no concurrent uid switches in a
+    # single process).
+    exec gunicorn \
         -w "$SANDBOX_WORKERS" \
         -b "$SANDBOX_HOST:$SANDBOX_PORT" \
         --timeout 300 \
@@ -98,7 +74,7 @@ if [ "$SANDBOX_WORKERS" -gt 1 ]; then
         --log-level "$SANDBOX_LOG_LEVEL" \
         "sandbox_server:app"
 else
-    exec gosu sandbox python sandbox_server.py \
+    exec python sandbox_server.py \
         --port "$SANDBOX_PORT" \
         --host "$SANDBOX_HOST"
 fi

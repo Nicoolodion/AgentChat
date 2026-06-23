@@ -101,8 +101,7 @@ services:
       - SETGID
       - SETUID
       - FOWNER
-    # Bound process table → limits fork bombs from user code.
-    pids_limit: 512
+      - DAC_OVERRIDE
     # Prevent unprivileged users from binding low (<1024) ports (audit 2.4).
     sysctls:
       - net.ipv4.ip_unprivileged_port_start=1024
