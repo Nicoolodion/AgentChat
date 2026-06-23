@@ -1,9 +1,20 @@
 /**
  * GET /api/agent/sessions/:sessionId/files/download?path=...
  * Download a file or a zipped folder from the workspace.
+ *
+ * The session workspace is owned by a per-session uid (mode 0700), so the host
+ * process cannot read it directly. We proxy through the sandbox server (root +
+ * as_session_uid): /file/info to detect file vs directory, /file/read (base64)
+ * for file bytes, and recursive /file/list + /file/read for folder zips. A
+ * host-filesystem fallback is kept for when the sandbox is offline.
  */
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import {
+  sandboxFileRead,
+  sandboxFileInfo,
+  sandboxFileList,
+} from "@/lib/agent/sandbox";
 import { resolveHostWorkspaceFile } from "@/lib/agent/workspace";
 import { readFile, stat, rm } from "node:fs/promises";
 import path from "node:path";
@@ -38,46 +49,126 @@ export async function GET(
       return jsonError("Invalid path", 400);
     }
 
-    const resolvedPath = resolveHostWorkspaceFile(sessionId, filePath);
-    const pathStat = await stat(resolvedPath).catch(() => null);
-    if (!pathStat) {
-      return jsonError("File not found", 404);
+    try {
+      return await downloadViaSandbox(sessionId, filePath, isPreview, searchParams);
+    } catch {
+      // Sandbox unreachable (network) or returned an error — fall back to a
+      // direct host read (works for legacy/pre-isolation sessions offline).
+      return await downloadViaHost(sessionId, filePath, isPreview, searchParams);
     }
-
-    // Directory → zip it (cross-platform)
-    if (pathStat.isDirectory()) {
-      const folderName = filePath.replace(/\/$/, "").split("/").pop() ?? "download";
-      const { tmpdir } = await import("node:os");
-      const tmpZip = path.join(tmpdir(), `agent-${sessionId}-${Date.now()}.zip`);
-
-      await zipDirectory(resolvedPath, tmpZip);
-      const binary = await readFile(tmpZip);
-      await rm(tmpZip, { force: true }).catch(() => undefined);
-
-      return new Response(binary, {
-        headers: {
-          "Content-Type": "application/zip",
-          "Content-Disposition": `attachment; filename="${folderName}.zip"`,
-          "Content-Length": String(binary.length),
-        },
-      });
-    }
-
-    const binary = await readFile(resolvedPath);
-    const fileName = filePath.split("/").pop() ?? "download";
-    const mimeType = searchParams.get("mimeType") ?? getMimeType(fileName);
-
-    return new Response(binary, {
-      headers: {
-        "Content-Type": mimeType,
-        "Content-Disposition": `${isPreview ? "inline" : "attachment"}; filename="${fileName}"`,
-        "Content-Length": String(binary.length),
-      },
-    });
   } catch (error) {
     console.error("[Agent Files Download Error]", error);
     return jsonError("Internal server error", 500);
   }
+}
+
+// ── Sandbox path ────────────────────────────────────────────────────────────
+
+async function downloadViaSandbox(
+  sessionId: string,
+  filePath: string,
+  isPreview: boolean,
+  searchParams: URLSearchParams
+) {
+  const info = await sandboxFileInfo(sessionId, filePath);
+
+  if (info.is_directory) {
+    const folderName = filePath.replace(/\/$/, "").split("/").pop() ?? "download";
+    const items = await collectFolder(sessionId, filePath);
+    const JSZip = (await import("jszip")).default;
+    const zip = new JSZip();
+    for (const item of items) {
+      zip.file(item.name, item.data);
+    }
+    const binary = await zip.generateAsync({ type: "nodebuffer" });
+    return new Response(new Uint8Array(binary), {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${folderName}.zip"`,
+        "Content-Length": String(binary.length),
+      },
+    });
+  }
+
+  const read = await sandboxFileRead(sessionId, filePath, "base64");
+  const binary = Buffer.from(read.content, "base64");
+  const fileName = filePath.split("/").pop() ?? "download";
+  const mimeType = searchParams.get("mimeType") ?? getMimeType(fileName);
+
+  return new Response(binary, {
+    headers: {
+      "Content-Type": mimeType,
+      "Content-Disposition": `${isPreview ? "inline" : "attachment"}; filename="${fileName}"`,
+      "Content-Length": String(binary.length),
+    },
+  });
+}
+
+async function collectFolder(
+  sessionId: string,
+  folderRel: string
+): Promise<Array<{ name: string; data: Buffer }>> {
+  const out: Array<{ name: string; data: Buffer }> = [];
+
+  async function walk(relToSession: string, relToFolder: string) {
+    const dirPath = relToSession === "" ? "/" : relToSession;
+    const entries = await sandboxFileList(sessionId, dirPath);
+    for (const entry of entries) {
+      const childRelToSession = relToSession ? `${relToSession}/${entry.name}` : entry.name;
+      const childRelToFolder = relToFolder ? `${relToFolder}/${entry.name}` : entry.name;
+      if (entry.is_directory) {
+        await walk(childRelToSession, childRelToFolder);
+      } else {
+        const r = await sandboxFileRead(sessionId, childRelToSession, "base64");
+        out.push({ name: childRelToFolder, data: Buffer.from(r.content, "base64") });
+      }
+    }
+  }
+
+  await walk(folderRel.replace(/^\/+/, ""), "");
+  return out;
+}
+
+// ── Host fallback (sandbox offline) ─────────────────────────────────────────
+
+async function downloadViaHost(
+  sessionId: string,
+  filePath: string,
+  isPreview: boolean,
+  searchParams: URLSearchParams
+) {
+  const resolvedPath = resolveHostWorkspaceFile(sessionId, filePath);
+  const pathStat = await stat(resolvedPath).catch(() => null);
+  if (!pathStat) {
+    return jsonError("File not found", 404);
+  }
+
+  if (pathStat.isDirectory()) {
+    const folderName = filePath.replace(/\/$/, "").split("/").pop() ?? "download";
+    const { tmpdir } = await import("node:os");
+    const tmpZip = path.join(tmpdir(), `agent-${sessionId}-${Date.now()}.zip`);
+    await zipDirectory(resolvedPath, tmpZip);
+    const binary = await readFile(tmpZip);
+    await rm(tmpZip, { force: true }).catch(() => undefined);
+    return new Response(binary, {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename="${folderName}.zip"`,
+        "Content-Length": String(binary.length),
+      },
+    });
+  }
+
+  const binary = await readFile(resolvedPath);
+  const fileName = filePath.split("/").pop() ?? "download";
+  const mimeType = searchParams.get("mimeType") ?? getMimeType(fileName);
+  return new Response(binary, {
+    headers: {
+      "Content-Type": mimeType,
+      "Content-Disposition": `${isPreview ? "inline" : "attachment"}; filename="${fileName}"`,
+      "Content-Length": String(binary.length),
+    },
+  });
 }
 
 async function zipDirectory(srcDir: string, outZip: string): Promise<void> {
@@ -122,7 +213,7 @@ type JSZipInstance = {
 };
 
 async function addDirToZip(zip: JSZipInstance, dir: string, prefix: string): Promise<void> {
-  const { readdir, readFile } = await import("node:fs/promises");
+  const { readdir } = await import("node:fs/promises");
   const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     const full = path.join(dir, entry.name);

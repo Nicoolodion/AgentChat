@@ -269,11 +269,20 @@ def run_python(
     workspaces (audit 2.1/2.3). The parent (server) stays root and only reads
     the child's pipes.
     """
-    from isolation import drop_to_session  # local import to avoid cycle
+    from isolation import drop_to_session, alloc_ids  # local import to avoid cycle
 
     session_workspace = ensure_session_dirs(session_id, workspace_root)
     image_dir = session_workspace / ".session_images"
     image_dir.mkdir(parents=True, exist_ok=True)
+    # The parent (root) creates this dir; hand it to the session uid so the
+    # dropped child can write matplotlib figures into it (audit: .session_images
+    # was previously left root-owned and unreadable by the session uid).
+    _auid, _agid = alloc_ids(session_id)
+    try:
+        os.chown(image_dir, _auid, _agid)
+        image_dir.chmod(0o700)
+    except OSError:
+        pass
     for f in image_dir.iterdir():
         try:
             f.unlink()

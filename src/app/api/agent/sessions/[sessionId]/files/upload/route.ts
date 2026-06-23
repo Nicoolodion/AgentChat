@@ -1,5 +1,6 @@
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { sandboxFileWrite, SandboxError } from "@/lib/agent/sandbox";
 import { resolveHostWorkspaceFile, createHostWorkspace } from "@/lib/agent/workspace";
 import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -15,9 +16,11 @@ function jsonError(message: string, status: number) {
  * POST /api/agent/sessions/:sessionId/files/upload
  * Upload files into the workspace via multipart/form-data.
  *
- * Files are written directly to the host filesystem under
- * data/agent-workspaces/{sessionId}/upload/ so the sandbox
- * can see them immediately via the bind-mounted volume.
+ * The session workspace is owned by a per-session uid (mode 0700), so the host
+ * process cannot write into it directly. We proxy through the sandbox server
+ * (/file/write, base64), which drops to the session uid. A host-filesystem
+ * fallback is kept for legacy/pre-isolation sessions while the sandbox is
+ * offline.
  */
 export async function POST(
   request: Request,
@@ -45,9 +48,6 @@ export async function POST(
       return jsonError("Max 40 files per upload", 413);
     }
 
-    // Ensure workspace exists
-    await createHostWorkspace(session.chatId).catch(() => undefined);
-
     const uploaded: Array<{ name: string; path: string; size: number }> = [];
 
     for (const file of files) {
@@ -57,14 +57,31 @@ export async function POST(
         return jsonError(`File ${file.name} exceeds 25MB limit`, 413);
       }
 
+      const destRel = `upload/${file.name}`;
       const buffer = Buffer.from(await file.arrayBuffer());
-      const destPath = resolveHostWorkspaceFile(sessionId, `upload/${file.name}`);
-      await mkdir(path.dirname(destPath), { recursive: true });
-      await writeFile(destPath, buffer);
+
+      try {
+        await sandboxFileWrite(
+          sessionId,
+          destRel,
+          buffer.toString("base64"),
+          "base64"
+        );
+      } catch (err) {
+        // Sandbox unreachable — fall back to a direct host write (works only
+        // for legacy sessions whose dirs are still host-accessible).
+        if (!(err instanceof SandboxError) && !(err instanceof TypeError)) {
+          throw err;
+        }
+        await createHostWorkspace(sessionId).catch(() => undefined);
+        const destPath = resolveHostWorkspaceFile(sessionId, destRel);
+        await mkdir(path.dirname(destPath), { recursive: true });
+        await writeFile(destPath, buffer);
+      }
 
       uploaded.push({
         name: file.name,
-        path: `upload/${file.name}`,
+        path: destRel,
         size: file.size,
       });
     }

@@ -6,7 +6,8 @@ import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
 import { getAttachmentForUser } from "@/lib/attachments";
-import { copyFileToWorkspaceUpload, createHostWorkspace } from "@/lib/agent/workspace";
+import { createHostWorkspace } from "@/lib/agent/workspace";
+import { sandboxFileWrite } from "@/lib/agent/sandbox";
 
 const executeSchema = z.object({
   message: z.string().min(1).max(20_000),
@@ -88,9 +89,12 @@ export async function POST(
     }
 
     // ── Ensure host workspace exists ────────────────────────────────────────
-    await createHostWorkspace(session.chatId).catch(() => undefined);
+    await createHostWorkspace(sessionId).catch(() => undefined);
 
     // ── Copy decrypted attachments into workspace upload/ ───────────────────
+    // The session workspace is owned by a per-session uid (mode 0700), so the
+    // host process cannot write into it directly. Proxy through the sandbox
+    // server, which drops to the session uid.
     if (attachments && attachments.length > 0) {
       for (const attachmentId of attachments) {
         try {
@@ -100,18 +104,12 @@ export async function POST(
             attachmentId,
           });
 
-          // Write to a temporary file on the host, then copy into workspace
-          const { writeFile, rm } = await import("node:fs/promises");
-          const { tmpdir } = await import("node:os");
-          const path = await import("node:path");
-          const tmpPath = path.join(tmpdir(), `agent-${session.chatId}-${attachmentId}`);
-          await writeFile(tmpPath, bytes);
-
-          try {
-            await copyFileToWorkspaceUpload(session.chatId, tmpPath, meta.fileName);
-          } finally {
-            await rm(tmpPath, { force: true });
-          }
+          await sandboxFileWrite(
+            sessionId,
+            `upload/${meta.fileName}`,
+            bytes.toString("base64"),
+            "base64"
+          );
         } catch (attachErr) {
           console.error("[Agent Attachment Copy Error]", attachErr);
           // Continue execution — the agent may still work without this file
