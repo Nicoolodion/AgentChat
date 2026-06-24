@@ -36,6 +36,7 @@ from isolation import (
     prepare_session_with_migration,
     session_home,
 )
+import ocr as ocr_engine
 
 # Configure logging
 logging.basicConfig(
@@ -1776,6 +1777,69 @@ def convert_docx_to_pdf() -> Response:
         return make_error("DOCX to PDF conversion timed out", 504)
     except Exception as e:
         return make_error(f"Conversion error: {e}", 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OCR (PaddleOCR-VL via llama.cpp)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/ocr/status", methods=["GET"])
+def ocr_status() -> Response:
+    """Report OCR engine readiness (active = models downloaded + server live).
+
+    The app queries this to decide whether to expose the OCR tool to the agent,
+    so it must be cheap and never crash even if the engine was never set up.
+    """
+    try:
+        return jsonify(ocr_engine.get_status())
+    except Exception as e:  # pragma: no cover
+        logger.exception("ocr_status error")
+        return jsonify({
+            "active": False, "ready": False, "state": "unknown",
+            "message": f"status check failed: {e}", "errors": [str(e)],
+        })
+
+
+@app.route("/ocr", methods=["POST"])
+def ocr_run() -> Response:
+    """Run an OCR task on a workspace image or PDF.
+
+    Body: { session_id, input_path, task } where task is one of
+    ocr | table | chart | formula | spotting | seal. Runs as root (it must read
+    session files and talk to the shared root-owned llama-server); the extracted
+    text is returned to the agent.
+    """
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id", "default")
+    input_path = (data.get("input_path") or "").strip()
+    task = (data.get("task") or "ocr").strip()
+
+    if task not in ocr_engine.VALID_TASKS:
+        return make_error(
+            f"Invalid 'task'; must be one of {', '.join(ocr_engine.VALID_TASKS)}", 400
+        )
+    if not input_path:
+        return make_error("Missing 'input_path'", 400)
+
+    ensure_session_dirs(session_id)
+    try:
+        in_file = resolve_workspace_path(session_id, input_path)
+    except ValueError:
+        return make_error("Invalid input_path", 400)
+    if not in_file.exists():
+        return make_error(f"Input file not found: {input_path}", 404)
+
+    start = time.time()
+    try:
+        res = ocr_engine.handle_ocr(str(in_file), task)
+        res["duration_ms"] = int((time.time() - start) * 1000)
+        return make_success(res)
+    except ocr_engine.OcrUnavailable as e:
+        # 503 so the app can surface "OCR not ready" distinctly from a bad request.
+        return make_error(str(e), 503)
+    except Exception as e:  # pragma: no cover
+        logger.exception("ocr_run error")
+        return make_error(f"OCR error: {e}", 500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -27,7 +27,8 @@ import {
   AgentToolCallStatus,
 } from "./types";
 import { safeParseArgs } from "./parse-args";
-import { AGENT_TOOL_SCHEMAS, SKILL_EXTENSIONS, buildSystemPrompt } from "./tool-schemas";
+import { SKILL_EXTENSIONS, buildSystemPrompt, getAgentToolSchemas, OCR_TASKS } from "./tool-schemas";
+import { getOcrStatus, sandboxOcr, type OcrTask } from "./sandbox";
 import {
   buildBrowserHeaders,
   classifyContentType,
@@ -729,6 +730,12 @@ export async function runAgentExecution(input: {
   // warmed the catalog cache via resolveModelContextLength).
   const effectiveReasoningEffort = await resolveReasoningEffort(model, reasoningEffort);
 
+  // Probe the local OCR engine once for the whole run so the tool list (and the
+  // ocr_file description's activation banner) reflects current readiness.
+  const ocrStatus = await getOcrStatus();
+  const ocrActive = ocrStatus.active === true;
+  const toolSchemas = getAgentToolSchemas(ocrActive);
+
   for (let iteration = 0; iteration < 250 && toolCallsCount < maxToolCalls; iteration++) {
     if (signal?.aborted) break;
     const accumulatedToolCalls: Array<{
@@ -745,7 +752,7 @@ export async function runAgentExecution(input: {
     const createOptions: Record<string, unknown> = {
       model: apiModel,
       messages: trimmedMessages,
-      tools: AGENT_TOOL_SCHEMAS,
+      tools: toolSchemas,
       tool_choice: "auto",
       parallel_tool_calls: true,
       stream: true,
@@ -2130,6 +2137,41 @@ print(json.dumps(out))
       const combined = results.map((r) => `--- ${r.path} ---\n${r.ok ? r.content : `Error: ${r.error}`}`).join("\n\n");
       const allOk = results.every((r) => r.ok);
       return { ok: allOk, result: { descriptions: results, combined }, stdout: combined };
+    }
+    // ── OCR Tool ───────────────────────────────────────────────────────────
+    case "ocr_file": {
+      const inputPath = String(args.input_path ?? "").trim();
+      const taskRaw = String(args.task ?? "ocr").trim().toLowerCase();
+      if (!inputPath) {
+        return { ok: false, error: "ocr_file: input_path is required." };
+      }
+      if (!OCR_TASKS.includes(taskRaw as OcrTask)) {
+        return { ok: false, error: `ocr_file: invalid task '${taskRaw}'. Must be one of ${OCR_TASKS.join(", ")}.` };
+      }
+      // Re-probe: the run-level status may be stale if this turn ran long.
+      const status = await getOcrStatus(true);
+      if (!status.active) {
+        const why = status.message || status.errors?.join("; ") || "OCR engine offline or deactivated.";
+        return {
+          ok: false,
+          error: `ocr_file is currently deactivated: ${why} Use image_analyze as a fallback.`,
+          stdout: `OCR deactivated — ${why}`,
+        };
+      }
+      const task = taskRaw as OcrTask;
+      try {
+        const res = await sandboxOcr(sessionId, inputPath, task);
+        const stdout = `ocr_file (${task}) → ${inputPath}: ${res.page_count} page(s), truncated ${res.combined.length} chars`;
+        return { ok: true, result: res, stdout };
+      } catch (err) {
+        if ((err as Error).name === "AbortError") throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          ok: false,
+          error: `ocr_file failed: ${msg}. Try image_analyze as a fallback.`,
+          stdout: `OCR failed — ${msg}`,
+        };
+      }
     }
     // ── Todo Tools ──────────────────────────────────────────────────────────
     case "todo_create": {

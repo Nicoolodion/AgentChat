@@ -72,9 +72,19 @@ services:
     volumes:
       - ./skills:/app/skills:ro
       - ./data/agent-workspaces:/workspace
+      # OCR engine: llama.cpp binary + PaddleOCR-VL-1.6 GGUF models. Persisted so
+      # the multi-GB models download only once (on first start). Must be writable
+      # (the rootfs is read-only).
+      - ./data/agent-models:/models
     environment:
       - SANDBOX_LOG_LEVEL=info
       - SANDBOX_MAX_EXECUTION_TIME=300
+      # OCR / llama.cpp tuning (CPU-only; the host is an i5-9500T, no GPU).
+      - LLAMA_THREADS=4
+      - LLAMA_CTX=8192
+      - LLAMA_PORT=8181
+      - OCR_PDF_DPI=200
+      - OCR_MAX_PAGES=15
     logging:
       driver: json-file
       options:
@@ -84,12 +94,13 @@ services:
       resources:
         limits:
           cpus: '2.0'
-          memory: 2G
+          memory: 4G
     security_opt:
       - no-new-privileges:true
-    # Read-only root filesystem: only /workspace (bind mount) and /tmp (tmpfs)
-    # are writable. Session code therefore cannot patch /app, write to /etc, or
-    # drop backdoors into the container image (audit finding 2.2).
+    # Read-only root filesystem: only /workspace (bind mount), /models (bind
+    # mount for OCR models), and /tmp (tmpfs) are writable. Session code
+    # therefore cannot patch /app, write to /etc, or drop backdoors into the
+    # container image (audit finding 2.2).
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=536870912,mode=1777

@@ -496,6 +496,65 @@ export const SKILL_EXTENSIONS: Record<string, string> = {
   ".pptd": "pptx",
 };
 
+// ── OCR tool (PaddleOCR-VL-1.6 via llama.cpp) ─────────────────────────────────
+// This tool is advertised to the agent conditionally: only when the sandbox OCR
+// engine reports ready. When the engine is NOT ready (models missing / download
+// failed / llama-server down), the tool is still emitted but its description is
+// rewritten to a clear "DEACTIVATED" banner so the agent knows it cannot call it
+// and can tell the user OCR is unavailable. The banner is appended ONLY in the
+// deactivated state — never when the tool is live (per operator requirement).
+
+export const OCR_TASKS = ["ocr", "table", "chart", "formula", "spotting", "seal"] as const;
+export type OcrTaskType = (typeof OCR_TASKS)[number];
+
+const OCR_TOOL_DESCRIPTION_ACTIVE = `Run high-accuracy OCR on a workspace image or PDF using the PaddleOCR-VL-1.6 vision model (local llama.cpp CPU engine). Supports 6 task types, chosen via the 'task' argument:
+- "ocr" — full-text transcription (reading order preserved).
+- "table" — extract tables as Markdown.
+- "chart" — analyze charts/graphs and dump their data as a Markdown table.
+- "formula" — extract math equations as LaTeX ($...$).
+- "spotting" — list every text region with pixel bounding boxes [x1,y1,x2,y2].
+- "seal" — transcribe seal/stamp text (curved, degraded).
+PDFs are rasterized to page images automatically (up to ~15 pages). Returns the combined extracted text, plus a per-page breakdown. Prefer this over image_analyze when you need faithful text extraction from documents, screenshots, scans, receipts, math, or tables. The engine runs on the sandbox; if it is not ready the tool will return an error — use image_analyze as a fallback.`;
+
+const OCR_TOOL_DESCRIPTION_DEACTIVATED = `ocr_file — LOCAL OCR ENGINE IS CURRENTLY DEACTIVATED. The PaddleOCR-VL-1.6 model + llama.cpp engine could not be prepared in the sandbox (models not downloaded / download failed / engine offline). DO NOT call this tool — it will only error. If the user needs text extraction, fall back to image_analyze (remote vision model) instead, and let them know local OCR is unavailable. (This deactivation notice only appears while the engine is down.)`;
+
+export function buildOcrToolSchema(active: boolean): ChatCompletionTool {
+  return {
+    type: "function",
+    function: {
+      name: "ocr_file",
+      description: active
+        ? OCR_TOOL_DESCRIPTION_ACTIVE
+        : OCR_TOOL_DESCRIPTION_DEACTIVATED,
+      parameters: {
+        type: "object",
+        properties: {
+          input_path: {
+            type: "string",
+            description: "Relative path to an image or PDF in the workspace (e.g. 'upload/scan.jpg', 'temp/report.pdf').",
+          },
+          task: {
+            type: "string",
+            enum: [...OCR_TASKS],
+            description: "What to extract: 'ocr' (full text), 'table', 'chart', 'formula', 'spotting' (text+bboxes), 'seal'. Default 'ocr'.",
+            default: "ocr",
+          },
+        },
+        required: ["input_path"],
+      },
+    },
+  };
+}
+
+/**
+ * The full tool list passed to the model. The OCR tool is appended; its
+ * description reflects whether the local OCR engine is live (active) or
+ * deactivated (banner shown only then).
+ */
+export function getAgentToolSchemas(ocrActive: boolean): ChatCompletionTool[] {
+  return [...AGENT_TOOL_SCHEMAS, buildOcrToolSchema(ocrActive)];
+}
+
 const AGENT_SYSTEM_PROMPT_BASE = `You are the Chatinterface Agent — an autonomous reasoning engine that helps users create documents, analyze files, write code, search the web, and perform multi-step tasks.
 
 ## Operating Mode
@@ -547,6 +606,7 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 ### Charts & Images
 - chart_create(python_code, output_path) — create a chart. Backends: matplotlib (default), seaborn, plotly (fig.write_image), or altair (chart.save .png/.svg). Use a built-in theme for document-ready styling (e.g. plt.style.use('seaborn-v0_8-whitegrid'), or plotly template='plotly_white').
 - image_analyze(paths, prompt?, detail?) — analyze images. Pass ALL relevant images in one call: with more than one image the model reasons ACROSS them (compare/contrast/differences/sequence) as well as describing each. The tool batches automatically.
+- ocr_file(input_path, task?) — high-accuracy OCR via the local PaddleOCR-VL-1.6 engine (llama.cpp, CPU). task ∈ ocr|table|chart|formula|spotting|seal. Accepts images and PDFs (rasterized to pages). Prefer this over image_analyze for faithful text/table/formula extraction from documents, scans, receipts, screenshots, and stamps. If the engine is not ready the tool description will show a DEACTIVATED banner (and the call errors) — then fall back to image_analyze.
 
 ### Project Management
 - todo_create(items) — create a NEW todo list (replaces any existing one). Use only for the initial plan or a full restart.

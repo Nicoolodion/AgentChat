@@ -26,22 +26,31 @@ services:
       # One session cannot read another's data because the backend only
       # ever resolves paths inside the specific session directory.
       - ../data/agent-workspaces:/workspace
+      # OCR engine: llama.cpp binary + PaddleOCR-VL-1.6 GGUF models (persistent,
+      # writable; downloads only once on first start).
+      - ../data/agent-models:/models
     environment:
       - SANDBOX_LOG_LEVEL=info
       - SANDBOX_MAX_EXECUTION_TIME=300
       - SANDBOX_DEFAULT_TIMEOUT=60
       - TMPDIR=/tmp
+      # OCR / llama.cpp tuning (CPU-only).
+      - LLAMA_THREADS=4
+      - LLAMA_CTX=8192
+      - LLAMA_PORT=8181
+      - OCR_PDF_DPI=200
+      - OCR_MAX_PAGES=15
     # Resource limits (mirror production constraints)
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 2G
+          memory: 4G
     security_opt:
       - no-new-privileges:true
     # Read-only root filesystem: only the code bind mounts (already :ro), the
-    # session workspace, and /tmp (tmpfs) are writable. Session code cannot
-    # patch /app or drop backdoors into the container image (audit 2.2).
+    # session workspace, /models (OCR models), and /tmp (tmpfs) are writable.
+    # Session code cannot patch /app or drop backdoors into the container image.
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=536870912,mode=1777

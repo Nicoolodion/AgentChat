@@ -572,3 +572,91 @@ export async function sandboxPptxRun(
   })) as SandboxPptxRunResult;
   return res;
 }
+
+// ── OCR (PaddleOCR-VL via llama.cpp) ─────────────────────────────────────────
+
+export type OcrTask = "ocr" | "table" | "chart" | "formula" | "spotting" | "seal";
+
+/**
+ * OCR engine status as reported by the sandbox `/ocr/status` route.
+ * - `active`/`ready`: models are downloaded AND the llama-server is live.
+ * - `state`: preparing | ready | deactivated | unknown.
+ * - `message`/`errors`: human-readable reason (used to build the deactivated
+ *   banner the agent sees in the tool description).
+ */
+export type OcrStatus = {
+  active?: boolean;
+  ready?: boolean;
+  state?: "preparing" | "ready" | "deactivated" | "unknown" | string;
+  message?: string;
+  errors?: string[];
+  models?: { main?: boolean; mmproj?: boolean; template?: boolean };
+  binary?: boolean;
+  port?: number;
+};
+
+export type SandboxOcrResult = {
+  task: string;
+  page_count: number;
+  pages: Array<{ page: number; text: string; ok: boolean; error?: string }>;
+  combined: string;
+  duration_ms: number;
+};
+
+/**
+ * Probe the sandbox OCR engine. Cheap (reads a status file + one localhost
+ * health check). Used to decide whether the OCR tool is advertised to the
+ * agent at all, so it must never throw — a missing/unreachable sandbox simply
+ * reports deactivated.
+ */
+export async function sandboxOcrStatus(): Promise<OcrStatus> {
+  try {
+    return (await sandboxFetch<OcrStatus>("/ocr/status", { method: "GET", timeout: 6_000 })) as OcrStatus;
+  } catch {
+    return { active: false, ready: false, state: "unknown", message: "Sandbox /ocr/status unreachable." };
+  }
+}
+
+/**
+ * Run an OCR task on a workspace image or PDF. The sandbox rasterizes PDFs to
+ * PNG (via pdftoppm) and forwards each page to the local llama-server. Throws
+ * `SandboxError` (503) when the engine is not ready.
+ */
+export async function sandboxOcr(
+  sessionId: string,
+  inputPath: string,
+  task: OcrTask,
+): Promise<SandboxOcrResult> {
+  const res = (await sandboxFetch("/ocr", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId, input_path: inputPath, task }),
+    timeout: 330_000,
+  })) as SandboxOcrResult;
+  return res;
+}
+
+// OCR status is queried before every orchestrator run to build the tool list.
+// Cache it briefly so a single user turn doesn't hammer the sandbox with one
+// HTTP probe per model iteration.
+const OCR_STATUS_TTL_MS = 15_000;
+let _ocrStatusCache: OcrStatus | null = null;
+let _ocrStatusTs = 0;
+
+/**
+ * Cached, fault-tolerant OCR status. Honors `env.AGENT_OCR_ENABLED` (when the
+ * feature is globally disabled, returns deactivated immediately without a
+ * network probe).
+ */
+export async function getOcrStatus(force = false): Promise<OcrStatus> {
+  if (!env.AGENT_OCR_ENABLED) {
+    return { active: false, ready: false, state: "deactivated", message: "OCR is disabled (AGENT_OCR_ENABLED=false)." };
+  }
+  const now = Date.now();
+  if (!force && _ocrStatusCache && now - _ocrStatusTs < OCR_STATUS_TTL_MS) {
+    return _ocrStatusCache;
+  }
+  const status = await sandboxOcrStatus();
+  _ocrStatusCache = status;
+  _ocrStatusTs = now;
+  return status;
+}

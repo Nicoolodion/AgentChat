@@ -27,6 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
     libgdk-pixbuf-2.0-0 libcairo2 libffi8 \
     git wget unzip pandoc \
+    # poppler-utils: provides pdftoppm for rasterizing PDFs in the OCR tool.
+    poppler-utils \
     supervisor gosu \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -71,6 +73,9 @@ RUN pip install --no-cache-dir \
     # the generated PDFs. Pre-installed so the agent doesn't waste a turn on
     # pip_install on every session.
     reportlab pypdf \
+    # gguf: used by the OCR bootstrap to patch clip.vision.image_max_pixels on the
+    # PaddleOCR-VL mmproj (required by the 'spotting' task).
+    gguf \
     playwright
 
 # ── Playwright browsers & deps ────────────────────────────────────────────────
