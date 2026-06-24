@@ -18,15 +18,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg \
     libc6 libgcc-s1 libicu72 liblttng-ust1 libssl3 libstdc++6 libunwind8 zlib1g \
+    # Shared libs for the prebuilt llama.cpp ubuntu binary (CPU build). The
+    # server links libcurl (remote model fetch) + libssl/libcrypto; libgomp is
+    # OpenMP for CPU multi-threading. tar/gzip extract the release archive.
+    libcurl4 libnghttp2-14 libssh2-1 libpsl5 librtmp1 libldap-common libbrotli1 libidn2-0 \
+    libgomp1 \
     libreoffice-writer libreoffice-impress \
     fonts-liberation fonts-noto fonts-noto-cjk \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
     # WeasyPrint native deps: it loads libpango via ctypes. Without these the
     # pip-installed weasyprint fails to import ("cannot load library
     # 'libpangoft2-1.0-0'"), so the HTML->PDF fallback path was unusable.
     libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
     libgdk-pixbuf-2.0-0 libcairo2 libffi8 \
-    git wget unzip pandoc \
+    git wget unzip tar gzip pandoc \
     # poppler-utils: provides pdftoppm for rasterizing PDFs in the OCR tool.
     poppler-utils \
     supervisor gosu \

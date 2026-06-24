@@ -63,6 +63,13 @@ LLAMA_RELEASE_URL = os.environ.get("LLAMA_RELEASE_URL", "").strip()
 
 LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
 
+# Resolved at bootstrap: the directory that must be on LD_LIBRARY_PATH for the
+# prebuilt llama-server to find its bundled shared libs (libllama-server-impl.so
+# and friends ship next to the binary inside the release archive). The binary
+# is run IN PLACE — never hoisted to BIN_DIR — so its sibling .so files stay
+# reachable.
+_RESOLVED_LIB_PATHS: list[str] = []
+
 STATUS_FILE = MODELS_DIR / ".ocr-status.json"
 SERVER_LOG = MODELS_DIR / "llama-server.log"
 BOOTSTRAP_LOG = MODELS_DIR / "ocr-bootstrap.log"
@@ -324,11 +331,99 @@ def _resolve_llama_release() -> Optional[tuple[str, str]]:
     return None
 
 
+def _resolve_binary() -> tuple[Optional[Path], list[str]]:
+    """Locate the extracted llama-server binary and the dirs it needs on its
+    library search path.
+
+    The ubuntu prebuilt is NOT a single static binary: it links a bundled
+    ``libllama-server-impl.so`` (plus possibly others) that ships alongside the
+    executable inside the release archive (e.g. ``.../bin/llama-server`` +
+    ``.../lib/*.so``). The binary MUST be run in place with LD_LIBRARY_PATH
+    pointing at its sibling lib dirs — hoisting just the executable strands the
+    libs and the loader dies with ``cannot open shared object file``.
+
+    Returns (binary_path, [lib_dirs]). Returns (None, []) if not found.
+    """
+    # 1) Explicitly-marked sentinel for a previously-resolved binary.
+    marker = BIN_DIR / ".resolved-binary"
+    if marker.exists():
+        try:
+            data = json.loads(marker.read_text("utf-8"))
+            bin_path = Path(data["bin"])
+            lib_dirs = [Path(p) for p in data.get("lib_dirs", [])]
+            if bin_path.exists() and os.access(bin_path, os.X_OK):
+                return bin_path, [str(p) for p in lib_dirs if p.exists()]
+        except Exception:
+            pass
+
+    # 2) Search the extracted tree for the bare 'llama-server' executable.
+    cands = [p for p in BIN_DIR.rglob("llama-server") if p.is_file()]
+    if not cands:
+        return None, []
+
+    # Drop any stale top-level hoisted copy left by an older (broken) bootstrap
+    # that copied the executable to BIN_DIR/llama-server without its libs.
+    for c in list(cands):
+        if c.parent == BIN_DIR:
+            try:
+                c.unlink()
+            except Exception:
+                pass
+    cands = [p for p in cands if p.parent != BIN_DIR]
+    if not cands:
+        return None, []
+
+    # Prefer a binary whose directory (or a sibling lib/) actually contains the
+    # bundled .so files — this is the correct in-place executable, not a stray.
+    def _lib_score(p: Path) -> int:
+        score = 0
+        for d in (p.parent, p.parent.parent / "lib", p.parent / "lib"):
+            if d.is_dir() and any(d.glob("*.so*")):
+                score += 1
+        return -score  # higher libs first under min()
+
+    cands.sort(key=_lib_score)
+    bin_path = cands[0]
+    os.chmod(bin_path, 0o755)
+    bin_dir = bin_path.parent
+
+    # Collect candidate lib dirs: a sibling `lib/`, the binary's own dir, and
+    # any dir under the extract root that actually contains .so files.
+    lib_dirs: list[Path] = []
+    for d in [bin_dir, bin_dir.parent / "lib", bin_dir / "lib"]:
+        if d.is_dir() and d not in lib_dirs:
+            lib_dirs.append(d)
+    so_dirs = {p.parent for p in BIN_DIR.rglob("*.so*") if p.is_file()}
+    for d in so_dirs:
+        if d not in lib_dirs:
+            lib_dirs.append(d)
+
+    resolved_libs = [str(d) for d in lib_dirs if d.exists()]
+    try:
+        marker.write_text(
+            json.dumps({"bin": str(bin_path), "lib_dirs": resolved_libs}), "utf-8"
+        )
+    except Exception:
+        pass
+    return bin_path, resolved_libs
+
+
 def ensure_binary(status: dict[str, Any]) -> dict[str, Any]:
-    """Download + extract the prebuilt llama.cpp binary if missing."""
-    if LLAMA_SERVER_BIN.exists() and os.access(LLAMA_SERVER_BIN, os.X_OK):
+    """Download + extract the prebuilt llama.cpp release if missing.
+
+    The binary is run IN PLACE (in its extracted dir) so its bundled shared
+    libraries (libllama-server-impl.so etc.) remain reachable; the lib dirs are
+    recorded so launch_server can set LD_LIBRARY_PATH.
+    """
+    global _RESOLVED_LIB_PATHS
+    bin_path, lib_paths = _resolve_binary()
+    if bin_path is not None:
+        _RESOLVED_LIB_PATHS = lib_paths
         status["binary"] = True
-        log(f"llama-server binary already present at {LLAMA_SERVER_BIN}", level="ok")
+        log(f"llama-server binary present at {bin_path}", level="ok")
+        if lib_paths:
+            log(f"library search path: {os.pathsep.join(lib_paths)}", level="ok")
+        globals()["_RESOLVED_BIN"] = bin_path
         return status
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -367,30 +462,18 @@ def ensure_binary(status: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
 
-    if not LLAMA_SERVER_BIN.exists():
-        # The archive may nest binaries under a subdir; search for it.
-        for p in BIN_DIR.rglob("llama-server"):
-            try:
-                os.chmod(p, 0o755)
-                # If found in a subdir, hoist it to BIN_DIR.
-                if p != LLAMA_SERVER_BIN:
-                    shutil.copy2(p, LLAMA_SERVER_BIN)
-                    os.chmod(LLAMA_SERVER_BIN, 0o755)
-                break
-            except Exception:
-                pass
-
-    if not LLAMA_SERVER_BIN.exists():
+    bin_path, lib_paths = _resolve_binary()
+    if bin_path is None:
         status["errors"].append("llama-server not found after extract")
         log("llama-server binary not found after extraction", level="error")
         return status
 
-    try:
-        os.chmod(LLAMA_SERVER_BIN, 0o755)
-    except Exception:
-        pass
+    _RESOLVED_LIB_PATHS = lib_paths
+    globals()["_RESOLVED_BIN"] = bin_path
     status["binary"] = True
-    log(f"llama-server ready at {LLAMA_SERVER_BIN}", level="ok")
+    log(f"llama-server ready at {bin_path}", level="ok")
+    if lib_paths:
+        log(f"library search path: {os.pathsep.join(lib_paths)}", level="ok")
     return status
 
 
@@ -462,6 +545,15 @@ def _probe_server(timeout: float = 2.0) -> bool:
         return False
 
 
+def _resolved_bin() -> Path:
+    """The actual llama-server executable path (set by ensure_binary).
+    Falls back to the legacy BIN_DIR/llama-server path if unset."""
+    p = globals().get("_RESOLVED_BIN")
+    if p and Path(p).exists():
+        return Path(p)
+    return LLAMA_SERVER_BIN
+
+
 def _build_server_argv() -> list[str]:
     # Launch flags mirror the official PaddleOCR-VL llama-server usage:
     #   llama-server -m <model> --mmproj <mmproj> --temp 0
@@ -470,7 +562,7 @@ def _build_server_argv() -> list[str]:
     # issues / mismatches with the embedded one). The chat_template.jinja we
     # downloaded is kept as a reference artifact but is not needed at runtime.
     argv = [
-        str(LLAMA_SERVER_BIN),
+        str(_resolved_bin()),
         "-m", str(MODELS_DIR / MODEL_FILE),
         "--mmproj", str(MODELS_DIR / MMPROJ_FILE),
         "--host", LLAMA_HOST,
@@ -506,11 +598,38 @@ def launch_server(status: dict[str, Any]) -> dict[str, Any]:
     env = dict(os.environ)
     env["HOME"] = str(MODELS_DIR)
     env["OMP_NUM_THREADS"] = str(LLAMA_THREADS)
+    # CRITICAL: the prebuilt llama-server is NOT static — it dlopens bundled
+    # libs (libllama-server-impl.so) that ship in its sibling lib dirs inside
+    # the release archive. Point the loader there so it doesn't die with
+    # "cannot open shared object file".
+    bin_obj = _resolved_bin()
+    if _RESOLVED_LIB_PATHS:
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [p for p in (*_RESOLVED_LIB_PATHS, existing) if p]
+        )
 
+    log_fd: Optional[Any] = None
+    proc: Optional["subprocess.Popen[bytes]"] = None
     try:
         log_fd = open(SERVER_LOG, "ab", buffering=0)
         log_fd.write(f"\n=== llama-server start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-        subprocess.Popen(
+        # Dump ldd once so a missing-shared-library crash is self-explanatory in
+        # the log (the dynamic-loader error otherwise vanishes with the child).
+        try:
+            ldd = subprocess.run(["ldd", str(bin_obj)],
+                                 capture_output=True, text=True, timeout=15,
+                                 env=env)
+            log_fd.write(b"--- ldd llama-server ---\n")
+            log_fd.write(ldd.stdout.encode("utf-8", "ignore"))
+            if ldd.stderr.strip():
+                log_fd.write(b"\n--- ldd stderr ---\n")
+                log_fd.write(ldd.stderr.encode("utf-8", "ignore"))
+            log_fd.write(b"\n--- argv ---\n")
+            log_fd.write((" ".join(argv) + "\n").encode("utf-8", "ignore"))
+        except Exception as e:
+            log_fd.write(f"(ldd dump failed: {e})\n".encode("utf-8", "ignore"))
+        proc = subprocess.Popen(
             argv,
             stdout=log_fd,
             stderr=subprocess.STDOUT,
@@ -528,10 +647,30 @@ def launch_server(status: dict[str, Any]) -> dict[str, Any]:
         log(f"failed to launch llama-server: {e}", level="error")
         return status
 
-    # Wait for the model to load and the server to become healthy.
+    # Wait for the model to load and the server to become healthy. Crucially,
+    # poll() the child: if it exited (exit 127 = missing shared libs / arch
+    # mismatch / bad flags), fail FAST with the actual log tail instead of
+    # burning the full 360s readiness budget against a dead process.
     log(f"waiting for llama-server readiness (up to {SERVER_READY_TIMEOUT}s)…", level="info")
+    killed_msg: Optional[str] = None
     deadline = time.time() + SERVER_READY_TIMEOUT
     while time.time() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            tail = _tail_log(SERVER_LOG, 1500)
+            suggestion = _suggest_binary_failure(rc, _resolve_lib_ldd(_resolved_bin()), bin_obj=bin_obj)
+            killed_msg = (
+                f"llama-server exited immediately (code {rc}). "
+                f"Likely a missing shared library or libc/arch mismatch. "
+                f"Server log tail:\n{tail}"
+            )
+            status["errors"].append(killed_msg)
+            if suggestion:
+                status["errors"].append(suggestion)
+            log(killed_msg, level="error")
+            if suggestion:
+                log(suggestion, level="warn")
+            break
         if _probe_server(timeout=3):
             status["ready"] = True
             status["active"] = True
@@ -544,13 +683,72 @@ def launch_server(status: dict[str, Any]) -> dict[str, Any]:
     status["ready"] = False
     status["active"] = False
     status["state"] = "deactivated"
-    status["message"] = (
-        f"llama-server did not become healthy within {SERVER_READY_TIMEOUT}s "
-        f"(see {SERVER_LOG})"
-    )
+    if killed_msg:
+        status["message"] = killed_msg
+    else:
+        status["message"] = (
+            f"llama-server did not become healthy within {SERVER_READY_TIMEOUT}s "
+            f"(see {SERVER_LOG})"
+        )
     status["errors"].append(status["message"])
     log("llama-server failed to become healthy", level="error")
     return status
+
+
+def _tail_log(path: Path, max_bytes: int = 1500) -> str:
+    """Return the last ~max_bytes of a log file (best-effort, never raises)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", "ignore").strip()
+    except Exception:
+        return "(log not readable)"
+
+
+def _resolve_lib_ldd(binary: Path) -> str:
+    """Return the raw `ldd` output for the llama-server binary (best-effort).
+
+    Runs with LD_LIBRARY_PATH set to the bundled-lib dirs so ldd can resolve the
+    private libs (libllama-server-impl.so) that ship next to the binary.
+    """
+    env = dict(os.environ)
+    if _RESOLVED_LIB_PATHS:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            [p for p in (*_RESOLVED_LIB_PATHS, env.get("LD_LIBRARY_PATH", "")) if p]
+        )
+    try:
+        r = subprocess.run(["ldd", str(binary)],
+                           capture_output=True, text=True, timeout=15, env=env)
+        return (r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")).strip()
+    except Exception as e:
+        return f"(ldd failed: {e})"
+
+
+def _suggest_binary_failure(exit_code: Optional[int], ldd_output: str, bin_obj: Path) -> str:
+    """Inspect ldd output for the classic 'not found' shared-library lines and
+    return the list of missing libs so the operator can install them. Empty
+    string when nothing actionable is found."""
+    if exit_code == 127:
+        # 127 with a present + executable ELF almost always means a missing .so.
+        missing: list[str] = []
+        for line in ldd_output.splitlines():
+            low = line.strip().lower()
+            if "not found" in low and "=>" in line:
+                lib = line.split("=>")[0].strip()
+                if lib:
+                    missing.append(lib)
+        hint = (
+            f"llama-server ({bin_obj}, exit 127) is present but cannot run — most "
+            "likely a missing shared library. If the missing lib is a bundled "
+            "one (libllama-server-impl.so etc.), ensure LD_LIBRARY_PATH includes "
+            "its sibling lib dir; otherwise install the debian package providing "
+            "each missing lib in docker-sandbox/Dockerfile. Missing libs detected:"
+        )
+        if missing:
+            return f"{hint}\n  " + "\n  ".join(missing) + f"\n\nFull ldd:\n{ldd_output}"
+        return f"{hint} (none parsed from ldd; run `ldd` manually).\nFull ldd:\n{ldd_output}"
+    return ""
 
 
 def bootstrap() -> None:
