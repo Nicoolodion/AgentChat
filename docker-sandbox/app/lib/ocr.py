@@ -290,10 +290,16 @@ def ensure_models(status: dict[str, Any]) -> dict[str, Any]:
     return status
 
 
-def _resolve_llama_release() -> Optional[str]:
-    """Find the latest llama.cpp ubuntu-x64 prebuilt zip asset URL."""
+def _resolve_llama_release() -> Optional[tuple[str, str]]:
+    """Find the latest llama.cpp ubuntu-x64 prebuilt asset URL + archive type.
+
+    Returns (url, "tar.gz"|"zip") or None. llama.cpp ships these as
+    ``llama-bNNNN-bin-ubuntu-x64.tar.gz`` (current) and historically as
+    ``llama-...-bin-ubuntu-x64.zip``; accept both.
+    """
     if LLAMA_RELEASE_URL:
-        return LLAMA_RELEASE_URL
+        ext = "tar.gz" if LLAMA_RELEASE_URL.endswith(".tar.gz") else "zip"
+        return LLAMA_RELEASE_URL, ext
     try:
         req = urllib.request.Request(
             "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
@@ -302,14 +308,17 @@ def _resolve_llama_release() -> Optional[str]:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
         assets = data.get("assets", []) or []
-        # Asset naming: llama-bXXXX-bin-ubuntu-x64.zip
-        cands = [a for a in assets if a.get("name", "").endswith("-bin-ubuntu-x64.zip")]
-        if not cands:
-            # Newer naming sometimes: llama-XXXX-bin-ubuntu-x64.zip
-            cands = [a for a in assets if "ubuntu-x64" in a.get("name", "") and a["name"].endswith(".zip")]
-        if cands:
-            return cands[0]["browser_download_url"]
-        log(f"no ubuntu-x64 asset found in release {data.get('tag_name','?')}", level="warn")
+        for ext in (".tar.gz", ".zip"):
+            cands = [
+                a for a in assets
+                if "ubuntu-x64" in a.get("name", "")
+                and a.get("name", "").endswith(ext)
+            ]
+            if cands:
+                url = cands[0]["browser_download_url"]
+                return url, ("tar.gz" if ext == ".tar.gz" else "zip")
+        log(f"no ubuntu-x64 asset found in release {data.get('tag_name','?')} "
+            f"(assets: {[a.get('name') for a in assets][:8]})", level="warn")
     except Exception as e:
         log(f"github releases API failed: {e}", level="warn")
     return None
@@ -323,38 +332,43 @@ def ensure_binary(status: dict[str, Any]) -> dict[str, Any]:
         return status
 
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    if not shutil.which("unzip"):
-        status["errors"].append("unzip not available to extract llama.cpp release")
-        log("unzip is missing — cannot extract llama.cpp", level="error")
-        return status
-
-    url = _resolve_llama_release()
-    if not url:
+    resolved = _resolve_llama_release()
+    if not resolved:
         status["errors"].append("could not resolve a llama.cpp release URL")
         log("no llama.cpp release URL resolved — OCR will be deactivated", level="error")
         return status
+    url, arch_ext = resolved
+    extractor = "tar" if arch_ext == "tar.gz" else "unzip"
+    if not shutil.which(extractor):
+        status["errors"].append(f"{extractor} not available to extract llama.cpp release")
+        log(f"{extractor} is missing — cannot extract llama.cpp", level="error")
+        return status
 
-    zip_path = BIN_DIR / "llama.zip"
-    log(f"downloading llama.cpp release: {url}", level="step")
-    if not _download(url, zip_path, "llama.cpp release"):
+    archive_path = BIN_DIR / ("llama.tar.gz" if arch_ext == "tar.gz" else "llama.zip")
+    log(f"downloading llama.cpp release ({arch_ext}): {url}", level="step")
+    if not _download(url, archive_path, f"llama.cpp release ({arch_ext})"):
         status["errors"].append("llama.cpp release download failed")
         return status
 
     try:
-        subprocess.run(["unzip", "-o", "-q", str(zip_path), "-d", str(BIN_DIR)],
-                       check=True, timeout=120)
+        if arch_ext == "tar.gz":
+            subprocess.run(["tar", "xzf", str(archive_path), "-C", str(BIN_DIR)],
+                           check=True, timeout=180)
+        else:
+            subprocess.run(["unzip", "-o", "-q", str(archive_path), "-d", str(BIN_DIR)],
+                           check=True, timeout=180)
     except Exception as e:
-        status["errors"].append(f"unzip failed: {e}")
-        log(f"unzip failed: {e}", level="error")
+        status["errors"].append(f"extract failed: {e}")
+        log(f"extract failed: {e}", level="error")
         return status
     finally:
         try:
-            zip_path.unlink(missing_ok=True)
+            archive_path.unlink(missing_ok=True)
         except Exception:
             pass
 
     if not LLAMA_SERVER_BIN.exists():
-        # The zip may nest binaries under a subdir; search for it.
+        # The archive may nest binaries under a subdir; search for it.
         for p in BIN_DIR.rglob("llama-server"):
             try:
                 os.chmod(p, 0o755)
