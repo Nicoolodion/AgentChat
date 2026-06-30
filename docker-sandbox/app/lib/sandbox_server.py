@@ -1603,16 +1603,65 @@ def _ensure_runtime_data_pkgs(target_dir: Path) -> None:
         logger.warning("kimi_pptd runtime data-package sync failed: %s", e)
 
 
+def _fix_kimi_cache_perms(cache_root: Path, cache_binary: Path) -> None:
+    """Idempotently force the kimi_pptd cache tree to be traversable/executable
+    by the non-root alloc child.
+
+    Directories -> 0o755 (o+x traversal is required for the alloc uid to reach
+    the binary), the binary and shared libs (.so / .so.*) -> 0o755 (o+r/o+x so
+    the kernel can exec the binary and mmap its libs), everything else ->
+    0o644. Runs as root. This is called on EVERY resolve (not only on a fresh
+    rebuild) so a stale cache — where the binary kept its exec bit (passing the
+    old binary-only readiness check) but a parent dir or a .so lost its
+    other-bits — is healed instead of causing ``[Errno 13] Permission denied``
+    when the dropped alloc child tries to execve/load it."""
+    try:
+        for root, dirs, files in os.walk(cache_root):
+            try:
+                os.chmod(root, 0o755)
+            except OSError:
+                pass
+            for name in dirs:
+                try:
+                    os.chmod(os.path.join(root, name), 0o755)
+                except OSError:
+                    pass
+            for name in files:
+                fp = os.path.join(root, name)
+                try:
+                    if name == "kimi_pptd" or name.endswith(".so") or ".so." in name:
+                        os.chmod(fp, 0o755)
+                    else:
+                        os.chmod(fp, 0o644)
+                except OSError:
+                    pass
+        try:
+            os.chmod(cache_root, 0o755)
+        except OSError:
+            pass
+        try:
+            os.chmod(cache_binary, 0o755)
+        except OSError:
+            pass
+    except OSError as e:
+        logger.warning("kimi_pptd cache perm fix failed: %s", e)
+
+
 def _kimi_cache_ready(cache_binary: Path) -> bool:
-    """True only when the cached binary exists AND is executable by the
-    non-root alloc child (S_IXOTH). Verifying the actual exec bit — instead of a
-    `.ready` sentinel — is what makes the cache self-healing: a partially
-    prepared or wrong-permission cache is detected and rebuilt rather than
-    silently causing ``[Errno 13] Permission denied`` in the dropped child."""
+    """True only when the cached binary exists, is executable by the non-root
+    alloc child (S_IXOTH), AND its parent cache dir is traversable (o+x). The
+    parent check is essential: a binary can keep its exec bit while the
+    containing dir loses other-x, which still makes the exec fail with EACCES
+    — exactly the stale-cache failure we must detect and heal."""
     try:
         if not cache_binary.exists():
             return False
-        return bool(cache_binary.stat().st_mode & 0o001)  # S_IXOTH
+        if not (cache_binary.stat().st_mode & 0o001):  # S_IXOTH on binary
+            return False
+        cache_root = cache_binary.parent  # _KIMI_RUNTIME_CACHE
+        if not (cache_root.stat().st_mode & 0o001):  # parent must be traversable
+            return False
+        return True
     except OSError:
         return False
 
@@ -1622,7 +1671,12 @@ def _prepare_kimi_cache(runtime_dir: Path) -> Path:
     under ``/tmp/kimi_pptd_runtime``, returning the cached binary path. Safe
     across gunicorn sync workers: preparation is serialized with a file lock so
     two workers never race on ``shutil.copytree`` of the same destination (the
-    cause of intermittent permission/corruption errors)."""
+    cause of intermittent permission/corruption errors).
+
+    Permissions are (re)asserted on EVERY call, not only on a fresh rebuild, so
+    a partially-prepared or bit-rotted cache (binary executable but a .so / a
+    parent dir not traversable by the alloc uid) is healed rather than making
+    the dropped child fail with ``[Errno 13] Permission denied``."""
     _KIMI_RUNTIME_CACHE.parent.mkdir(parents=True, exist_ok=True)
     cache_binary = _KIMI_RUNTIME_CACHE / "kimi_pptd"
 
@@ -1643,41 +1697,29 @@ def _prepare_kimi_cache(runtime_dir: Path) -> Path:
         pass
     try:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        # Re-check under the lock: another worker may have prepared it while we
-        # waited.
-        if _kimi_cache_ready(cache_binary):
-            _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
-            return cache_binary
 
-        # (Re)build from scratch. rmtree is safe here because we hold the lock.
-        if _KIMI_RUNTIME_CACHE.exists():
-            shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
-        shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
+        # Rebuild from scratch only when the cached binary is missing. We do NOT
+        # gate on a readiness check here: even a "ready"-looking binary can sit
+        # in a tree whose .so / parent perms have rotted, so we always re-apply
+        # the permission walk below.
+        if not cache_binary.exists():
+            # rmtree is safe here because we hold the lock.
+            if _KIMI_RUNTIME_CACHE.exists():
+                shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
+            shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
+            # kimi_pptd writes oxml template fragments next to itself at runtime;
+            # ensure the dir exists and is traversable.
+            (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
 
-        # kimi_pptd writes oxml template fragments next to itself at runtime;
-        # ensure the dir exists and is traversable.
-        (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
-
-        # Force the whole cache tree to be traversable+readable by the non-root
-        # alloc child. Directories get 0o755 (o+x is required for traversal);
-        # the binary and the shared libraries (.so / .so.*) get 0o755 so the
-        # kernel can exec / mmap them; everything else stays 0o644. The global
-        # ``umask 077`` would otherwise leave these at 0700/0600 and the child
-        # would get EACCES — exactly the intermittent failure this fixes.
-        for root, dirs, files in os.walk(_KIMI_RUNTIME_CACHE):
-            os.chmod(root, 0o755)
-            for name in dirs:
-                os.chmod(os.path.join(root, name), 0o755)
-            for name in files:
-                fp = os.path.join(root, name)
-                if name == "kimi_pptd" or name.endswith(".so") or ".so." in name:
-                    os.chmod(fp, 0o755)
-                else:
-                    os.chmod(fp, 0o644)
-        os.chmod(_KIMI_RUNTIME_CACHE, 0o755)
-        os.chmod(cache_binary, 0o755)
-
+        # ALWAYS (re)assert permissions on the whole tree. This heals stale
+        # caches where the binary kept its exec bit (so a binary-only readiness
+        # check would pass) but a parent dir or a .so lost the other-bits the
+        # alloc child needs to traverse/exec/mmap.
+        _fix_kimi_cache_perms(_KIMI_RUNTIME_CACHE, cache_binary)
         _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
+        # certifi copy runs under the umask-077 process and may have introduced
+        # 0700 dirs; re-assert once more so nothing it touched blocks the child.
+        _fix_kimi_cache_perms(_KIMI_RUNTIME_CACHE, cache_binary)
 
         if not _kimi_cache_ready(cache_binary):
             raise RuntimeError(
