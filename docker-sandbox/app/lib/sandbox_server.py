@@ -1553,11 +1553,96 @@ def docx_build() -> Response:
 
 # The kimi_pptd runtime ships as a Nuitka-compiled ELF plus sibling .so libs
 # under skills/pptx/scripts/runtime/. The skills mount is read-only, and the
-# host may not preserve the executable bit (Windows copies, some CI checkouts).
-# We therefore use the in-place binary when it is already executable, and fall
-# back to a cached, chmod'd copy in /tmp otherwise.
-_KIMI_RUNTIME_CACHE = Path("/tmp/kimi_pptd_runtime")
+# host may not preserve the executable bit (Windows copies, some CI checkouts),
+# so we copy the binary + libs into a writable, exec-permitted cache and chmod
+# them 0755.
+#
+# WHERE the cache lives matters: placing it on /tmp (a tmpfs, often mounted
+# noexec on Unraid-style hosts even though the bit says executable) makes
+# execve fail with EACCES — the chmod walk cannot help because the kernel
+# rejects execution at the filesystem layer, not the inode layer. So we probe
+# each candidate by actually execve'ing a tiny binary on it (execve respects
+# noexec even for root) and use the first writable + exec-capable one. Bind
+# mounts (host FS) are exec by default, so /models and /workspace win over
+# /tmp when /tmp is noexec.
+_KIMI_CACHE_CANDIDATES = [
+    Path("/models/kimi_pptd_runtime"),
+    Path("/workspace/.kimi_pptd_runtime"),
+    Path("/tmp/kimi_pptd_runtime"),
+]
+# The flock lock stays in /tmp (1777, always creatable by every worker). It is
+# only used for mutual exclusion; it is never exec'd, so /tmp's noexec is fine.
 _KIMI_RUNTIME_LOCK = Path("/tmp/kimi_pptd_runtime.lock")
+_KIMI_CACHE_ROOT_OVERRIDE: Optional[Path] = None
+
+
+def _executable_mount(path: Path) -> bool:
+    """True if a binary on `path`'s filesystem can actually be execve'd.
+
+    `os.access(..., X_OK)` only checks the inode's exec bit; it cannot detect a
+    noexec mount. execve does — even for root — so we copy /bin/true (a real
+    ELF) into the dir, chmod +x, and run it. A non-zero/errored result means
+    the mount is noexec (or otherwise unusable), and we move to the next
+    candidate."""
+    probe = path / ".exec_probe"
+    try:
+        shutil.copyfile("/bin/true", str(probe))
+        probe.chmod(0o755)
+        r = subprocess.run(
+            [str(probe)],
+            timeout=8,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _kimi_cache_root() -> Path:
+    """Return the cache base dir: the first candidate that is writable AND on an
+    exec-capable mount (probed). Falls back to the first writable candidate
+    (so the real exec error is surfaced later with full context) and finally to
+    the last candidate. The choice is memoized so the probe runs once per
+    process."""
+    global _KIMI_CACHE_ROOT_OVERRIDE
+    if _KIMI_CACHE_ROOT_OVERRIDE is not None:
+        return _KIMI_CACHE_ROOT_OVERRIDE
+
+    chosen: Optional[Path] = None
+    for cand in _KIMI_CACHE_CANDIDATES:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if not os.access(cand, os.W_OK):
+            continue
+        if _executable_mount(cand):
+            chosen = cand
+            break
+    if chosen is None:
+        for cand in _KIMI_CACHE_CANDIDATES:
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            if os.access(cand, os.W_OK):
+                chosen = cand
+                break
+    if chosen is None:
+        chosen = _KIMI_CACHE_CANDIDATES[-1]
+        try:
+            chosen.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    _KIMI_CACHE_ROOT_OVERRIDE = chosen
+    logger.info("kimi_pptd runtime cache base: %s", chosen)
+    return chosen
 
 # Packages whose data files must exist on disk next to the binary even though
 # their code is bytecode-compiled into kimi_pptd. certifi ships cacert.pem
@@ -1658,7 +1743,7 @@ def _kimi_cache_ready(cache_binary: Path) -> bool:
             return False
         if not (cache_binary.stat().st_mode & 0o001):  # S_IXOTH on binary
             return False
-        cache_root = cache_binary.parent  # _KIMI_RUNTIME_CACHE
+        cache_root = cache_binary.parent
         if not (cache_root.stat().st_mode & 0o001):  # parent must be traversable
             return False
         return True
@@ -1666,19 +1751,41 @@ def _kimi_cache_ready(cache_binary: Path) -> bool:
         return False
 
 
-def _prepare_kimi_cache(runtime_dir: Path) -> Path:
-    """Copy the read-only kimi_pptd runtime into a writable, exec-permitted cache
-    under ``/tmp/kimi_pptd_runtime``, returning the cached binary path. Safe
+def _prepare_kimi_cache(runtime_dir: Path) -> tuple[Path, Path]:
+    """Copy the read-only kimi_pptd runtime into a writable, exec-permitted
+    cache and return ``(cache_binary, cache_root)``.
+
+    The cache base is chosen by :func:`_kimi_cache_root`, which probes each
+    candidate by actually execve'ing a binary on it — so a noexec /tmp tmpfs
+    is skipped automatically in favour of a bind mount (host FS, exec). Safe
     across gunicorn sync workers: preparation is serialized with a file lock so
-    two workers never race on ``shutil.copytree`` of the same destination (the
-    cause of intermittent permission/corruption errors).
+    two workers never race on ``shutil.copytree`` of the same destination.
 
     Permissions are (re)asserted on EVERY call, not only on a fresh rebuild, so
     a partially-prepared or bit-rotted cache (binary executable but a .so / a
     parent dir not traversable by the alloc uid) is healed rather than making
     the dropped child fail with ``[Errno 13] Permission denied``."""
-    _KIMI_RUNTIME_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    cache_binary = _KIMI_RUNTIME_CACHE / "kimi_pptd"
+    cache_root = _kimi_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_binary = cache_root / "kimi_pptd"
+
+    # Ensure the dropped alloc uid can traverse from / down to cache_root: every
+    # ancestor of the cache dir must have o+x. Add it idempotently WITHOUT
+    # widening read perms (e.g. /workspace stays 0711 — alloc can traverse but
+    # not list sibling sessions). /models (used by OCR as root) may otherwise be
+    # 0750 and block alloc traversal to the cache -> EACCES at exec time.
+    try:
+        cur = cache_root.parent
+        while cur and cur != cur.parent:
+            try:
+                st = cur.stat().st_mode
+                if not (st & 0o001):  # S_IXOTH missing
+                    os.chmod(cur, st | 0o011)  # add other-x (execute); keep rest
+            except OSError:
+                pass
+            cur = cur.parent
+    except Exception:
+        pass
 
     # The lock file lives as a sibling in /tmp (mode 1777), so every worker can
     # create/open it; holding LOCK_EX serializes all preparation. The file is
@@ -1704,29 +1811,30 @@ def _prepare_kimi_cache(runtime_dir: Path) -> Path:
         # the permission walk below.
         if not cache_binary.exists():
             # rmtree is safe here because we hold the lock.
-            if _KIMI_RUNTIME_CACHE.exists():
-                shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
-            shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
+            if cache_root.exists():
+                shutil.rmtree(cache_root, ignore_errors=True)
+            cache_root.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(runtime_dir, cache_root)
             # kimi_pptd writes oxml template fragments next to itself at runtime;
             # ensure the dir exists and is traversable.
-            (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
+            (cache_root / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
 
         # ALWAYS (re)assert permissions on the whole tree. This heals stale
         # caches where the binary kept its exec bit (so a binary-only readiness
         # check would pass) but a parent dir or a .so lost the other-bits the
         # alloc child needs to traverse/exec/mmap.
-        _fix_kimi_cache_perms(_KIMI_RUNTIME_CACHE, cache_binary)
-        _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
+        _fix_kimi_cache_perms(cache_root, cache_binary)
+        _ensure_runtime_data_pkgs(cache_root)
         # certifi copy runs under the umask-077 process and may have introduced
         # 0700 dirs; re-assert once more so nothing it touched blocks the child.
-        _fix_kimi_cache_perms(_KIMI_RUNTIME_CACHE, cache_binary)
+        _fix_kimi_cache_perms(cache_root, cache_binary)
 
         if not _kimi_cache_ready(cache_binary):
             raise RuntimeError(
                 "kimi_pptd cache binary is not executable after setup "
                 f"(mode {oct(cache_binary.stat().st_mode)})"
             )
-        return cache_binary
+        return cache_binary, cache_root
     finally:
         try:
             fcntl.flock(lf, fcntl.LOCK_UN)
@@ -1738,8 +1846,9 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
     """Return (binary_path, runtime_dir) for the kimi_pptd executable.
 
     Prefers the mounted binary when it is already executable by others (fast
-    path, no copy). Otherwise prepares (and validates) the writable cache copy.
-    The runtime_dir returned is the directory whose libs/templates the binary
+    path, no copy) AND the skills mount allows execution. Otherwise prepares
+    (and validates) the writable cache copy on an exec-capable mount. The
+    runtime_dir returned is the directory whose libs/templates the binary
     expects to find next to itself (used for LD_LIBRARY_PATH)."""
     runtime_dir = SKILLS_ROOT / "pptx" / "scripts" / "runtime"
     binary = runtime_dir / "kimi_pptd"
@@ -1749,14 +1858,19 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
         )
 
     # Fast path: mounted binary is executable BY OTHERS (the alloc child runs as
-    # a non-root uid, so it needs the other-x bit).
+    # a non-root uid, so it needs the other-x bit). The skills mount is read-only
+    # (we cannot write an exec probe into it) but is a bind from the host FS,
+    # which is exec by default — so an exec-bit-present binary here can be run in
+    # place with no copy. If the host checkout lost the exec bit (Windows/CI),
+    # this check fails and we fall through to the prepared cache.
     try:
         if binary.stat().st_mode & 0o001:  # S_IXOTH
             return binary, runtime_dir
     except OSError:
         pass
 
-    return _prepare_kimi_cache(runtime_dir), _KIMI_RUNTIME_CACHE
+    cache_binary, cache_root = _prepare_kimi_cache(runtime_dir)
+    return cache_binary, cache_root
 
 
 def _build_pptx_result(
