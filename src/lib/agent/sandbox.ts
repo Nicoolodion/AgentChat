@@ -196,20 +196,30 @@ export async function sandboxExecPythonStream(
           streamErr = undefined;
         }
       }
-      // Fall back to non-streaming execution on any error.
+      // Fall back to non-streaming execution on any error. The non-stream
+      // route returns a structured {error} body, so its message carries the
+      // REAL traceback — far more useful than the stream route's generic
+      // HTML 500 page. Prefer that and annotate with the stream status.
       try {
         const r = await sandboxExecPython(sessionId, code, timeout);
         if (r.stdout) onChunk("stdout", r.stdout);
         if (r.stderr) onChunk("stderr", r.stderr);
         return r;
       } catch (fbErr) {
-        if (streamErr) {
+        const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+        const isHtml = /<html|<!doctype|internal server error/i.test(streamErr ?? "");
+        if (fbMsg) {
           throw new SandboxError(
-            `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+            isHtml
+              ? `python exec failed (stream ${res.status} HTML error): ${fbMsg}`
+              : `python exec failed: ${fbMsg}${streamErr ? ` (stream ${res.status}: ${streamErr})` : ""}`,
             res.status,
           );
         }
-        throw fbErr;
+        throw new SandboxError(
+          `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+          res.status,
+        );
       }
     }
     const reader = res.body.getReader();
@@ -650,20 +660,31 @@ export async function sandboxPptxRunStream(
         }
       }
       // Fall back to the non-streaming endpoint on any error, forwarding its
-      // captured output as a single chunk so nothing is lost.
+      // captured output as a single chunk so nothing is lost. The non-stream
+      // route catches its own exceptions and returns a structured {error} body,
+      // so its error message carries the REAL kimi_pptd traceback — which is
+      // far more useful than the stream route's generic HTML 500 page. Prefer
+      // that message and annotate it with the stream status when both failed.
       try {
         const r = await sandboxPptxRun(sessionId, action, params);
         if (r.stdout) onChunk("stdout", r.stdout);
         if (r.stderr) onChunk("stderr", r.stderr);
         return r;
       } catch (fbErr) {
-        if (streamErr) {
+        const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+        const isHtml = /<html|<!doctype|internal server error/i.test(streamErr ?? "");
+        if (fbMsg) {
           throw new SandboxError(
-            `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+            isHtml
+              ? `pptx ${action} failed (stream ${res.status} HTML error): ${fbMsg}`
+              : `pptx ${action} failed: ${fbMsg}${streamErr ? ` (stream ${res.status}: ${streamErr})` : ""}`,
             res.status,
           );
         }
-        throw fbErr;
+        throw new SandboxError(
+          `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+          res.status,
+        );
       }
     }
     const reader = res.body.getReader();

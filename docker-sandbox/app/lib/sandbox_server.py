@@ -273,6 +273,70 @@ def _chown_alloc(path: Path, session_id: str) -> None:
         pass
 
 
+def _fix_alloc_ownership(session_id: str, sub_path: str) -> None:
+    """Re-assert alloc ownership of a workspace path so the dropped alloc uid
+    can traverse to and access it.
+
+    The workspace is a host bind-mount shared with the Node app, which creates
+    upload/ (and sometimes deeper) entries as its own uid; the sandbox's
+    one-shot migration (gated by ``.iso_migrated``) never re-fixes them.
+    ``mkdir(parents=True, exist_ok=True)`` in file_write is a no-op when the
+    dir already exists host-owned, so the alloc uid ends up unable to
+    traverse/stat the path — surfacing as ``PermissionError`` -> HTML 500 ->
+    ``sandbox 500 (non-JSON response)`` for pptx_check/pptx_render and any
+    file tool touching a host-created/​uploaded path.
+
+    Runs as root (called before the ``as_session_uid`` block), so ownership is
+    fixed regardless of who created the entries. Only the owner is changed —
+    existing modes are preserved (an alloc-owned 0700 dir is still traversable
+    by its owner, and the 0700 ``<sid>`` root keeps sibling isolation). No-op
+    when the path does not (yet) exist or lies outside the session workspace.
+    """
+    if not sub_path:
+        return
+    auid, agid = alloc_ids(session_id)
+    try:
+        session_workspace = (WORKSPACE_ROOT / session_id).resolve()
+        target = (session_workspace / sub_path.lstrip("/")).resolve(strict=False)
+    except Exception:
+        return
+    # Security/containment: never chown outside the session workspace. This
+    # mirrors resolve_workspace_path's relative_to guard, so a ``..`` in the
+    # raw sub_path cannot trick us into chowning host files.
+    try:
+        target.relative_to(session_workspace)
+    except ValueError:
+        return
+    if target == session_workspace:
+        return
+    # Climb parent dirs until we reach the session workspace. relative_to
+    # guarantees we terminate there (no infinite climb past filesystem root).
+    chain: list[Path] = []
+    cur = target
+    while cur != session_workspace:
+        chain.append(cur)
+        if cur.parent == cur:
+            return
+        cur = cur.parent
+    # Top-down so traversable ownership is established from the root downwards.
+    for p in reversed(chain):
+        try:
+            os.chown(p, auid, agid)
+        except OSError:
+            pass
+    # If the target is a directory, also fix its immediate children so
+    # listing/reading them (file_list, docx images, pptd project files) works.
+    if target.is_dir():
+        try:
+            for child in target.iterdir():
+                try:
+                    os.chown(child, auid, agid)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
 def _session_home(session_id: str) -> Path:
     """Per-session alloc-owned HOME (see :func:`isolation.session_home`)."""
     return session_home(session_id)
@@ -600,6 +664,7 @@ def file_read() -> Response:
             return make_error(f"Read failed: {e}", 500)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, file_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, file_path)
@@ -637,6 +702,7 @@ def file_write() -> Response:
         return make_error("Missing 'path' field", 400)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, file_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, file_path)
@@ -691,6 +757,7 @@ def file_list() -> Response:
             return make_error(f"List failed: {e}", 500)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, dir_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, dir_path)
@@ -730,6 +797,7 @@ def file_delete() -> Response:
         return make_error("Missing 'path' field", 400)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, file_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, file_path)
@@ -758,6 +826,8 @@ def file_move() -> Response:
         return make_error("Missing 'source' or 'destination' field", 400)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, source)
+    _fix_alloc_ownership(session_id, destination)
     try:
         with as_session_uid(session_id):
             src = resolve_workspace_path(session_id, source)
@@ -784,6 +854,7 @@ def file_info() -> Response:
         return make_error("Missing 'path' field", 400)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, file_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, file_path)
@@ -943,6 +1014,7 @@ def docx_read() -> Response:
         return make_error("Missing 'path' field", 400)
 
     ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, file_path)
     try:
         with as_session_uid(session_id):
             target = resolve_workspace_path(session_id, file_path)
@@ -1725,6 +1797,13 @@ def _prepare_pptx_run(
 
     ensure_session_dirs(session_id)
     in_file = resolve_workspace_path(session_id, input_path)
+    # Re-assert alloc ownership of the input (+ its parents) and the output
+    # path BEFORE the alloc-uid block. Host-created / uploaded entries on the
+    # shared bind-mount would otherwise be untraversable by the dropped uid
+    # (PermissionError -> HTML 500). Runs as root, idempotent, no-op if absent.
+    _fix_alloc_ownership(session_id, input_path)
+    if output_path:
+        _fix_alloc_ownership(session_id, output_path)
 
     out_file: Optional[Path] = None
     with as_session_uid(session_id):
@@ -1926,6 +2005,8 @@ def convert_html_to_pdf() -> Response:
     if not input_path or not output_path:
         return make_error("Missing input_path or output_path", 400)
 
+    ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, input_path)
     try:
         in_file = resolve_workspace_path(session_id, input_path)
         out_file = resolve_workspace_path(session_id, output_path)
@@ -1988,6 +2069,8 @@ def convert_docx_to_pdf() -> Response:
     if not input_path or not output_path:
         return make_error("Missing input_path or output_path", 400)
 
+    ensure_session_dirs(session_id)
+    _fix_alloc_ownership(session_id, input_path)
     try:
         in_file = resolve_workspace_path(session_id, input_path)
         out_file = resolve_workspace_path(session_id, output_path)
