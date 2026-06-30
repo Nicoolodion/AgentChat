@@ -218,7 +218,6 @@ def get_status() -> dict[str, Any]:
         data["message"] = "OCR engine is online."
     else:
         # Keep whatever the bootstrap determined (preparing / deactivated).
-        data["active"] = bool(data.get("ready") is True and live)
         if data.get("state") not in ("deactivated", "preparing"):
             if not data.get("ready"):
                 data["state"] = "preparing" if data.get("state") != "deactivated" else "deactivated"
@@ -532,6 +531,23 @@ def ensure_mmproj_max_pixels(status: dict[str, Any]) -> dict[str, Any]:
 
 # ── llama-server lifecycle ──────────────────────────────────────────────────
 
+# Environment variables allowed through to the (long-lived, detached)
+# llama-server child. Provider keys, webhook secrets, etc. must NOT leak to it.
+_SANITIZED_ENV_PREFIXES = ("LC_",)
+_SANITIZED_ENV_NAMES = {
+    "PATH", "HOME", "LD_LIBRARY_PATH", "OMP_NUM_THREADS",
+    "LLAMA_HOST", "LLAMA_PORT", "LANG", "LC_ALL", "LC_CTYPE",
+}
+
+
+def _build_sanitized_env() -> dict[str, str]:
+    sanitized: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _SANITIZED_ENV_NAMES or any(key.startswith(p) for p in _SANITIZED_ENV_PREFIXES):
+            sanitized[key] = value
+    return sanitized
+
+
 def _server_url(path: str) -> str:
     return f"http://{LLAMA_HOST}:{LLAMA_PORT}{path}"
 
@@ -539,8 +555,16 @@ def _server_url(path: str) -> str:
 def _probe_server(timeout: float = 2.0) -> bool:
     try:
         with urllib.request.urlopen(_server_url("/health"), timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", "ignore")
-            return "ok" in body.lower() or resp.status == 200
+            if resp.status != 200:
+                return False
+            body = resp.read().decode("utf-8", "ignore").strip()
+            # llama-server /health returns {"status":"ok"}; anchor to that field
+            # instead of matching "ok" anywhere in the body (e.g. "not ok").
+            try:
+                parsed = json.loads(body)
+                return isinstance(parsed, dict) and parsed.get("status") == "ok"
+            except (ValueError, TypeError):
+                return body == "ok"
     except Exception:
         return False
 
@@ -595,7 +619,7 @@ def launch_server(status: dict[str, Any]) -> dict[str, Any]:
     log(f"launching llama-server on {LLAMA_HOST}:{LLAMA_PORT} "
         f"(threads={LLAMA_THREADS}, ctx={LLAMA_CTX}, ngl=0)", level="step")
 
-    env = dict(os.environ)
+    env = _build_sanitized_env()
     env["HOME"] = str(MODELS_DIR)
     env["OMP_NUM_THREADS"] = str(LLAMA_THREADS)
     # CRITICAL: the prebuilt llama-server is NOT static — it dlopens bundled
@@ -712,7 +736,7 @@ def _resolve_lib_ldd(binary: Path) -> str:
     Runs with LD_LIBRARY_PATH set to the bundled-lib dirs so ldd can resolve the
     private libs (libllama-server-impl.so) that ship next to the binary.
     """
-    env = dict(os.environ)
+    env = _build_sanitized_env()
     if _RESOLVED_LIB_PATHS:
         env["LD_LIBRARY_PATH"] = os.pathsep.join(
             [p for p in (*_RESOLVED_LIB_PATHS, env.get("LD_LIBRARY_PATH", "")) if p]

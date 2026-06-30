@@ -8,6 +8,7 @@ import type { AgentSseEvent } from "@/lib/agent/types";
 import { getAttachmentForUser } from "@/lib/attachments";
 import { createHostWorkspace } from "@/lib/agent/workspace";
 import { sandboxFileWrite } from "@/lib/agent/sandbox";
+import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
 
 const executeSchema = z.object({
   message: z.string().min(1).max(20_000),
@@ -21,7 +22,24 @@ function sendSseEvent(
   event: string,
   data: unknown
 ) {
-  controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  // Backpressure-safe enqueue: when the client is slow (or the controller is
+  // errored/closed) a synchronous enqueue throws, which would otherwise abort
+  // a long-running agent turn mid-execution. Schedule the write on a microtask
+  // when the queue is full, and swallow errors from a closed stream so the
+  // orchestrator keeps making progress (its results are still persisted to the
+  // DB and surfaced on refresh via the stream route).
+  try {
+    const encoded = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+      void Promise.resolve().then(() => {
+        try { controller.enqueue(encoded); } catch { /* stream closed */ }
+      });
+    } else {
+      controller.enqueue(encoded);
+    }
+  } catch {
+    /* controller closed — ignore */
+  }
 }
 
 /**
@@ -134,7 +152,13 @@ export async function POST(
 
     const stream = new ReadableStream({
       async start(controller) {
-        let completionResult: { content: string; reasoning?: string; toolCallsCount: number } | null = null;
+        let completionResult: { content: string; reasoning?: string; toolCallsCount: number; runDurationMs?: number } | null = null;
+
+        const ac = new AbortController();
+        activeAgents.set(sessionId, ac);
+        agentSignals.set(sessionId, ac);
+        const onClientAbort = () => ac.abort();
+        request.signal.addEventListener("abort", onClientAbort, { once: true });
 
         try {
           completionResult = await runAgentExecution({
@@ -145,64 +169,87 @@ export async function POST(
             sendEvent: (event: AgentSseEvent) => {
               sendSseEvent(controller, event.type, event.data);
             },
+            signal: ac.signal,
           });
-        } catch (error) {
-          console.error("[Agent Execution Error]", error);
-          const errMsg = error instanceof Error ? error.message : "Agent execution failed";
-          sendSseEvent(controller, "error", { message: errMsg });
+
+          // Persist assistant message
+          let assistantMessage;
+          try {
+            assistantMessage = await appendMessageToChat({
+              chatId: chat.id,
+              role: "assistant",
+              content: completionResult.content,
+              reasoning: completionResult.reasoning,
+              userKey: auth.userKey,
+            });
+          } catch (dbError) {
+            console.error("[DB Write Error]", dbError);
+            sendSseEvent(controller, "error", { message: "Failed to save response." });
+          }
+
+          const artifacts = await prisma.agentArtifact.findMany({
+            where: { sessionId },
+          });
+
+          const updatedSession = await prisma.agentSession.findUnique({
+            where: { id: sessionId },
+          });
+
           sendSseEvent(controller, "done", {
-            session: { ...session, status: "error" },
-            artifacts: [],
-            meta: { totalToolCalls: 0, totalDurationMs: 0 },
+            session: updatedSession,
+            artifacts: artifacts.map((a) => ({
+              id: a.id,
+              sessionId: a.sessionId,
+              fileName: a.fileName,
+              mimeType: a.mimeType,
+              size: a.size,
+              kind: a.kind,
+              storagePath: a.storagePath,
+              description: a.description ?? undefined,
+              createdAt: a.createdAt.toISOString(),
+            })),
+            meta: {
+              totalToolCalls: completionResult.toolCallsCount,
+              // Real wall-clock duration of the whole agent run, measured by the
+              // orchestrator (runStartMs..return). Previously hardcoded to 0.
+              totalDurationMs: completionResult.runDurationMs ?? 0,
+            },
+            assistantMessage: assistantMessage ?? undefined,
           });
+
           controller.close();
-          return;
+        } catch (error) {
+          if ((error as Error).name === "AbortError") {
+            await prisma.agentSession.update({
+              where: { id: sessionId },
+              data: { status: "idle", errorMessage: "Stopped by user", completedAt: new Date() },
+            });
+            sendSseEvent(controller, "error", { message: "Stopped by user" });
+            sendSseEvent(controller, "done", {
+              session: { ...session, status: "idle" },
+              artifacts: [],
+              meta: { totalToolCalls: 0, totalDurationMs: 0 },
+            });
+          } else {
+            console.error("[Agent Execution Error]", error);
+            const errMsg = error instanceof Error ? error.message : "Agent execution failed";
+            await prisma.agentSession.update({
+              where: { id: sessionId },
+              data: { status: "error", errorMessage: errMsg, completedAt: new Date() },
+            });
+            sendSseEvent(controller, "error", { message: errMsg });
+            sendSseEvent(controller, "done", {
+              session: { ...session, status: "error" },
+              artifacts: [],
+              meta: { totalToolCalls: 0, totalDurationMs: 0 },
+            });
+          }
+          controller.close();
+        } finally {
+          request.signal.removeEventListener("abort", onClientAbort);
+          activeAgents.delete(sessionId);
+          agentSignals.delete(sessionId);
         }
-
-        // Persist assistant message
-        let assistantMessage;
-        try {
-          assistantMessage = await appendMessageToChat({
-            chatId: chat.id,
-            role: "assistant",
-            content: completionResult.content,
-            reasoning: completionResult.reasoning,
-            userKey: auth.userKey,
-          });
-        } catch (dbError) {
-          console.error("[DB Write Error]", dbError);
-          sendSseEvent(controller, "error", { message: "Failed to save response." });
-        }
-
-        const artifacts = await prisma.agentArtifact.findMany({
-          where: { sessionId },
-        });
-
-        const updatedSession = await prisma.agentSession.findUnique({
-          where: { id: sessionId },
-        });
-
-        sendSseEvent(controller, "done", {
-          session: updatedSession,
-          artifacts: artifacts.map((a) => ({
-            id: a.id,
-            sessionId: a.sessionId,
-            fileName: a.fileName,
-            mimeType: a.mimeType,
-            size: a.size,
-            kind: a.kind,
-            storagePath: a.storagePath,
-            description: a.description ?? undefined,
-            createdAt: a.createdAt.toISOString(),
-          })),
-          meta: {
-            totalToolCalls: completionResult.toolCallsCount,
-            totalDurationMs: 0,
-          },
-          assistantMessage: assistantMessage ?? undefined,
-        });
-
-        controller.close();
       },
     });
 

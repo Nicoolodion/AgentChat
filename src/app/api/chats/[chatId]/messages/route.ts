@@ -44,7 +44,7 @@ function sendSseEvent(controller: ReadableStreamDefaultController, event: string
       try { controller.enqueue(encoded); } catch { /* stream closed */ }
     });
   } else {
-    controller.enqueue(encoded);
+    try { controller.enqueue(encoded); } catch { /* controller closed — ignore */ }
   }
 }
 
@@ -394,6 +394,8 @@ async function handleAgentMessage(input: {
       const ac = new AbortController();
       activeAgents.set(sessionId, ac);
       agentSignals.set(sessionId, ac);
+      const onClientAbort = () => ac.abort();
+      input.request.signal.addEventListener("abort", onClientAbort, { once: true });
 
       const toolCallMap = new Map<string, ChatToolCall>();
       // Tool outputs are captured per toolCallId from the `tool_output` event so
@@ -406,6 +408,7 @@ async function handleAgentMessage(input: {
         reasoningSegments?: { text: string; beforeToolIndex: number }[];
         contentSegments?: { text: string; beforeToolIndex: number }[];
         toolCallsCount: number;
+        runDurationMs?: number;
         finishReason?: string;
         usagePromptTokens?: number;
         usageCompletionTokens?: number;
@@ -485,6 +488,78 @@ async function handleAgentMessage(input: {
           reasoningEffort,
           modelContextLength,
         });
+
+        // Persist assistant message with toolCalls (incl. arguments + output) and
+        // ordered content/reasoning segments so the timeline survives refresh.
+        let assistantMessage;
+        const finalToolCalls = Array.from(toolCallMap.values());
+        try {
+          assistantMessage = await appendMessageToChat({
+            chatId: chat.id,
+            role: "assistant",
+            content: completionResult.content,
+            reasoning: completionResult.reasoning,
+            reasoningSegments: completionResult.reasoningSegments,
+            contentSegments: completionResult.contentSegments,
+            toolCalls: finalToolCalls.length ? finalToolCalls : undefined,
+            userKey: auth.userKey,
+            usagePromptTokens: completionResult.usagePromptTokens,
+            usageCompletionTokens: completionResult.usageCompletionTokens,
+            usageTotalTokens: completionResult.usageTotalTokens,
+            usageCachedTokens: completionResult.usageCachedTokens,
+            energyJoules: completionResult.energyJoules,
+            energyKwh: completionResult.energyKwh,
+            energyDurationSeconds: completionResult.energyDurationSeconds,
+            providerModel: completionResult.providerModel,
+            ttftMs: completionResult.ttftMs,
+            avgTokensPerSecond: completionResult.avgTokensPerSecond,
+          });
+        } catch (dbError) {
+          console.error("[DB Write Error]", dbError);
+          sendSseEvent(controller, "error", { message: "Failed to save response." });
+        }
+
+        const artifacts = await prisma.agentArtifact.findMany({
+          where: { sessionId },
+        });
+
+        const updatedSession = await prisma.agentSession.findUnique({
+          where: { id: sessionId },
+        });
+
+        sendSseEvent(controller, "done", {
+          session: updatedSession,
+          artifacts: artifacts.map((a) => ({
+            id: a.id,
+            sessionId: a.sessionId,
+            fileName: a.fileName,
+            mimeType: a.mimeType,
+            size: a.size,
+            kind: a.kind,
+            storagePath: a.storagePath,
+            description: a.description ?? undefined,
+            createdAt: a.createdAt.toISOString(),
+          })),
+          meta: {
+            totalToolCalls: completionResult.toolCallsCount,
+            totalDurationMs: completionResult.runDurationMs ?? 0,
+            finishReason: completionResult.finishReason,
+            providerModel: completionResult.providerModel,
+            usagePromptTokens: completionResult.usagePromptTokens,
+            usageCompletionTokens: completionResult.usageCompletionTokens,
+            usageTotalTokens: completionResult.usageTotalTokens,
+            usageCachedTokens: completionResult.usageCachedTokens,
+            energyJoules: completionResult.energyJoules,
+            energyKwh: completionResult.energyKwh,
+            energyDurationSeconds: completionResult.energyDurationSeconds,
+            ttftMs: completionResult.ttftMs,
+            avgTokensPerSecond: completionResult.avgTokensPerSecond,
+          },
+          assistantMessage: assistantMessage ?? undefined,
+          userMessage,
+        });
+
+        controller.close();
       } catch (error) {
         if ((error as Error).name === "AbortError") {
           await prisma.agentSession.update({
@@ -497,97 +572,26 @@ async function handleAgentMessage(input: {
             artifacts: [],
             meta: { totalToolCalls: 0, totalDurationMs: 0 },
           });
-          controller.close();
-          activeAgents.delete(sessionId);
-          agentSignals.delete(sessionId);
-          return;
+        } else {
+          console.error("[Agent Execution Error]", error);
+          const errMsg = error instanceof Error ? error.message : "Agent execution failed";
+          await prisma.agentSession.update({
+            where: { id: sessionId },
+            data: { status: "error", errorMessage: errMsg, completedAt: new Date() },
+          });
+          sendSseEvent(controller, "error", { message: errMsg });
+          sendSseEvent(controller, "done", {
+            session: { ...agentSession!, status: "error" },
+            artifacts: [],
+            meta: { totalToolCalls: 0, totalDurationMs: 0 },
+          });
         }
-
-        console.error("[Agent Execution Error]", error);
-        const errMsg = error instanceof Error ? error.message : "Agent execution failed";
-        sendSseEvent(controller, "error", { message: errMsg });
-        sendSseEvent(controller, "done", {
-          session: { ...agentSession!, status: "error" },
-          artifacts: [],
-          meta: { totalToolCalls: 0, totalDurationMs: 0 },
-        });
         controller.close();
-        return;
+      } finally {
+        input.request.signal.removeEventListener("abort", onClientAbort);
+        activeAgents.delete(sessionId);
+        agentSignals.delete(sessionId);
       }
-
-      // Persist assistant message with toolCalls (incl. arguments + output) and
-      // ordered content/reasoning segments so the timeline survives refresh.
-      let assistantMessage;
-      const finalToolCalls = Array.from(toolCallMap.values());
-      try {
-        assistantMessage = await appendMessageToChat({
-          chatId: chat.id,
-          role: "assistant",
-          content: completionResult.content,
-          reasoning: completionResult.reasoning,
-          reasoningSegments: completionResult.reasoningSegments,
-          contentSegments: completionResult.contentSegments,
-          toolCalls: finalToolCalls.length ? finalToolCalls : undefined,
-          userKey: auth.userKey,
-          usagePromptTokens: completionResult.usagePromptTokens,
-          usageCompletionTokens: completionResult.usageCompletionTokens,
-          usageTotalTokens: completionResult.usageTotalTokens,
-          usageCachedTokens: completionResult.usageCachedTokens,
-          energyJoules: completionResult.energyJoules,
-          energyKwh: completionResult.energyKwh,
-          energyDurationSeconds: completionResult.energyDurationSeconds,
-          providerModel: completionResult.providerModel,
-          ttftMs: completionResult.ttftMs,
-          avgTokensPerSecond: completionResult.avgTokensPerSecond,
-        });
-      } catch (dbError) {
-        console.error("[DB Write Error]", dbError);
-        sendSseEvent(controller, "error", { message: "Failed to save response." });
-      }
-
-      const artifacts = await prisma.agentArtifact.findMany({
-        where: { sessionId },
-      });
-
-      const updatedSession = await prisma.agentSession.findUnique({
-        where: { id: sessionId },
-      });
-
-      sendSseEvent(controller, "done", {
-        session: updatedSession,
-        artifacts: artifacts.map((a) => ({
-          id: a.id,
-          sessionId: a.sessionId,
-          fileName: a.fileName,
-          mimeType: a.mimeType,
-          size: a.size,
-          kind: a.kind,
-          storagePath: a.storagePath,
-          description: a.description ?? undefined,
-          createdAt: a.createdAt.toISOString(),
-        })),
-        meta: {
-          totalToolCalls: completionResult.toolCallsCount,
-          totalDurationMs: 0,
-          finishReason: completionResult.finishReason,
-          providerModel: completionResult.providerModel,
-          usagePromptTokens: completionResult.usagePromptTokens,
-          usageCompletionTokens: completionResult.usageCompletionTokens,
-          usageTotalTokens: completionResult.usageTotalTokens,
-          usageCachedTokens: completionResult.usageCachedTokens,
-          energyJoules: completionResult.energyJoules,
-          energyKwh: completionResult.energyKwh,
-          energyDurationSeconds: completionResult.energyDurationSeconds,
-          ttftMs: completionResult.ttftMs,
-          avgTokensPerSecond: completionResult.avgTokensPerSecond,
-        },
-        assistantMessage: assistantMessage ?? undefined,
-        userMessage,
-      });
-
-      activeAgents.delete(sessionId);
-      agentSignals.delete(sessionId);
-      controller.close();
     },
   });
 

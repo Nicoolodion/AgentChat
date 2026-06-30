@@ -420,11 +420,17 @@ def run_python(
     stderr_text = "".join(stderr_buf)
 
     if result is None:
+        # The child crashed or was killed before emitting the result sentinel.
+        # Previously this returned error=None, masking the failure as success.
+        if proc.returncode is not None and proc.returncode != 0:
+            err = f"Python process exited with code {proc.returncode} without emitting a result"
+        else:
+            err = "Python process ended without emitting a result (crashed or was killed)"
         return {
             "stdout": stdout_text[-MAX_OUTPUT_SIZE:],
             "stderr": stderr_text[-MAX_OUTPUT_SIZE:],
             "images": [],
-            "error": None,
+            "error": err,
             "execution_time_ms": 0,
         }
 

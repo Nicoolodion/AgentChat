@@ -71,7 +71,16 @@ export async function listHostWorkspaceFiles(
   }>
 > {
   const ws = getHostWorkspacePath(sessionId);
-  const target = subPath === "/" ? ws : path.join(ws, subPath);
+  const resolved = path.resolve(ws, subPath === "/" ? "." : subPath);
+  const normalizedWs = ws.split(path.sep).join("/").replace(/\/$/, "");
+  const normalizedResolved = resolved.split(path.sep).join("/");
+  if (
+    !normalizedResolved.startsWith(normalizedWs + "/") &&
+    normalizedResolved !== normalizedWs
+  ) {
+    throw new Error("Path traversal detected");
+  }
+  const target = resolved;
 
   const entries = await readdir(target, { withFileTypes: true }).catch(() => []);
   const files: Array<{
@@ -171,12 +180,15 @@ export async function cleanupOldWorkspaces(maxAgeDays = 7): Promise<number> {
       status: { in: ["completed", "error"] },
       completedAt: { lte: cutoff },
     },
-    select: { id: true },
+    select: { id: true, chatId: true },
   });
   let cleaned = 0;
   for (const session of oldSessions) {
     try {
+      // Workspaces may be keyed by chatId or session id; remove both so
+      // neither orphans regardless of the creation path that ran.
       await deleteHostWorkspace(session.id);
+      await deleteHostWorkspace(session.chatId);
       cleaned++;
     } catch { /* best-effort */ }
   }

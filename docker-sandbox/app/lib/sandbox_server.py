@@ -5,6 +5,7 @@ Provides isolated code execution, file operations, and document conversion.
 
 import argparse
 import base64
+import fcntl
 import io
 import json
 import logging
@@ -200,18 +201,64 @@ def make_success(data: dict[str, Any]) -> Response:
     return jsonify({"success": True, **data})
 
 
+# session_id values are interpolated into workspace paths and used as alloc
+# uid keys. They must never contain path separators or traversal sequences.
+# The TS client always sends UUID/cuid ids; "default" is tolerated for legacy
+# callers. Every other value must match this safe pattern.
+_VALID_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+@app.before_request
+def _validate_session_id() -> Optional[tuple]:
+    if request.method != "POST":
+        return None
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or "session_id" not in data:
+        return None
+    sid = data.get("session_id")
+    if sid == "default":
+        return None
+    if not isinstance(sid, str) or not _VALID_SESSION_ID_RE.match(sid):
+        return make_error(
+            "Invalid session_id; must match ^[A-Za-z0-9_-]{8,128}$", 400
+        )
+    return None
+
+
+def _capture_failure(prefix: str, jr: dict) -> tuple[Response, int]:
+    """Format an alloc-subprocess failure/timeout including captured output.
+
+    ``_run_as_alloc`` already captures stdout/stderr even on timeout; surfacing
+    them (mirroring ``_build_pptx_result``) makes opaque "timed out" / failure
+    messages self-explanatory in the agent UI.
+    """
+    stdout = (jr.get("stdout") or "").strip()
+    stderr = (jr.get("stderr") or "").strip()
+    parts = [prefix]
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    status = 504 if jr.get("timed_out") else 500
+    return make_error("\n".join(parts).strip(), status)
+
+
 def resolve_workspace_path(session_id: str, sub_path: str = "") -> Path:
     """Resolve a path within the session workspace, preventing traversal."""
-    session_workspace = WORKSPACE_ROOT / session_id
+    session_workspace = (WORKSPACE_ROOT / session_id).resolve()
     session_workspace.mkdir(parents=True, exist_ok=True)
 
     if sub_path:
         target = (session_workspace / sub_path.lstrip("/")).resolve()
     else:
-        target = session_workspace.resolve()
+        target = session_workspace
 
-    # Security: prevent path traversal outside workspace
-    if not str(target).startswith(str(session_workspace.resolve())):
+    # Security: prevent path traversal outside the workspace. relative_to
+    # raises ValueError if target is not within session_workspace, which is
+    # stricter and symlink-safer than a str().startswith() prefix check.
+    try:
+        target.relative_to(session_workspace)
+    except ValueError:
         raise ValueError("Path traversal detected")
 
     return target
@@ -891,7 +938,6 @@ def docx_read() -> Response:
     file_path = data.get("path", "")
     session_id = data.get("session_id", "default")
     include_images = data.get("include_images", True)
-    max_image_width = int(data.get("max_image_width", 800))
 
     if not file_path:
         return make_error("Missing 'path' field", 400)
@@ -1408,11 +1454,9 @@ def docx_build() -> Response:
         duration_ms = int((time.time() - start) * 1000)
 
         if jr.get("timed_out"):
-            return make_error("DOCX build timed out", 504)
+            return _capture_failure("DOCX build timed out", jr)
         if jr["exit_code"] != 0:
-            return make_error(
-                f"DOCX build failed:\n{jr['stdout']}\n{jr['stderr']}", 500
-            )
+            return _capture_failure("DOCX build failed", jr)
 
         with as_session_uid(session_id):
             if not out_file.exists():
@@ -1441,6 +1485,7 @@ def docx_build() -> Response:
 # We therefore use the in-place binary when it is already executable, and fall
 # back to a cached, chmod'd copy in /tmp otherwise.
 _KIMI_RUNTIME_CACHE = Path("/tmp/kimi_pptd_runtime")
+_KIMI_RUNTIME_LOCK = Path("/tmp/kimi_pptd_runtime.lock")
 
 # Packages whose data files must exist on disk next to the binary even though
 # their code is bytecode-compiled into kimi_pptd. certifi ships cacert.pem
@@ -1465,6 +1510,13 @@ def _ensure_runtime_data_pkgs(target_dir: Path) -> None:
             if dst.exists():
                 shutil.rmtree(dst)
             shutil.copytree(mod_dir, dst)
+            # The global umask is 077; copytree's own child dirs may end up at
+            # 0700, which would block the dropped alloc uid from traversing the
+            # copied package tree. Re-open the whole certifi subtree.
+            for root, _dirs, files in os.walk(dst):
+                os.chmod(root, 0o755)
+                for name in files:
+                    os.chmod(os.path.join(root, name), 0o644)
         # cacert.pem sanity check — if still missing, copy it from certifi.
         ca = target_dir / "certifi" / "cacert.pem"
         if not ca.exists():
@@ -1472,15 +1524,109 @@ def _ensure_runtime_data_pkgs(target_dir: Path) -> None:
                 import certifi
                 ca.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(certifi.where(), ca)
+                os.chmod(ca, 0o644)
             except Exception:
                 pass
     except Exception as e:  # pragma: no cover
         logger.warning("kimi_pptd runtime data-package sync failed: %s", e)
 
 
+def _kimi_cache_ready(cache_binary: Path) -> bool:
+    """True only when the cached binary exists AND is executable by the
+    non-root alloc child (S_IXOTH). Verifying the actual exec bit — instead of a
+    `.ready` sentinel — is what makes the cache self-healing: a partially
+    prepared or wrong-permission cache is detected and rebuilt rather than
+    silently causing ``[Errno 13] Permission denied`` in the dropped child."""
+    try:
+        if not cache_binary.exists():
+            return False
+        return bool(cache_binary.stat().st_mode & 0o001)  # S_IXOTH
+    except OSError:
+        return False
+
+
+def _prepare_kimi_cache(runtime_dir: Path) -> Path:
+    """Copy the read-only kimi_pptd runtime into a writable, exec-permitted cache
+    under ``/tmp/kimi_pptd_runtime``, returning the cached binary path. Safe
+    across gunicorn sync workers: preparation is serialized with a file lock so
+    two workers never race on ``shutil.copytree`` of the same destination (the
+    cause of intermittent permission/corruption errors)."""
+    _KIMI_RUNTIME_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    cache_binary = _KIMI_RUNTIME_CACHE / "kimi_pptd"
+
+    # The lock file lives as a sibling in /tmp (mode 1777), so every worker can
+    # create/open it; holding LOCK_EX serializes all preparation. The file is
+    # intentionally persistent and reused across requests/workers — unlinking
+    # it would introduce a TOCTOU race (two workers could each create+open a
+    # different inode and both think they hold the lock). It holds no data
+    # (advisory flock only), costs zero bytes, and is created once per a
+    # container's lifetime. Created 0644 (root-owned) so it's inspectable for
+    # debugging rather than the umask-077 default of 0600.
+    lf = open(_KIMI_RUNTIME_LOCK, "a+")
+    try:
+        st = os.fstat(lf.fileno())
+        if st.st_mode & 0o777 != 0o644:
+            os.chmod(_KIMI_RUNTIME_LOCK, 0o644)
+    except OSError:
+        pass
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        # Re-check under the lock: another worker may have prepared it while we
+        # waited.
+        if _kimi_cache_ready(cache_binary):
+            _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
+            return cache_binary
+
+        # (Re)build from scratch. rmtree is safe here because we hold the lock.
+        if _KIMI_RUNTIME_CACHE.exists():
+            shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
+        shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
+
+        # kimi_pptd writes oxml template fragments next to itself at runtime;
+        # ensure the dir exists and is traversable.
+        (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
+
+        # Force the whole cache tree to be traversable+readable by the non-root
+        # alloc child. Directories get 0o755 (o+x is required for traversal);
+        # the binary and the shared libraries (.so / .so.*) get 0o755 so the
+        # kernel can exec / mmap them; everything else stays 0o644. The global
+        # ``umask 077`` would otherwise leave these at 0700/0600 and the child
+        # would get EACCES — exactly the intermittent failure this fixes.
+        for root, dirs, files in os.walk(_KIMI_RUNTIME_CACHE):
+            os.chmod(root, 0o755)
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o755)
+            for name in files:
+                fp = os.path.join(root, name)
+                if name == "kimi_pptd" or name.endswith(".so") or ".so." in name:
+                    os.chmod(fp, 0o755)
+                else:
+                    os.chmod(fp, 0o644)
+        os.chmod(_KIMI_RUNTIME_CACHE, 0o755)
+        os.chmod(cache_binary, 0o755)
+
+        _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
+
+        if not _kimi_cache_ready(cache_binary):
+            raise RuntimeError(
+                "kimi_pptd cache binary is not executable after setup "
+                f"(mode {oct(cache_binary.stat().st_mode)})"
+            )
+        return cache_binary
+    finally:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+
 def _resolve_kimi_pptd() -> tuple[Path, Path]:
-    """Return (binary_path, runtime_dir) for the kimi_pptd executable,
-    preparing a cached executable copy if the mounted binary is not exec."""
+    """Return (binary_path, runtime_dir) for the kimi_pptd executable.
+
+    Prefers the mounted binary when it is already executable by others (fast
+    path, no copy). Otherwise prepares (and validates) the writable cache copy.
+    The runtime_dir returned is the directory whose libs/templates the binary
+    expects to find next to itself (used for LD_LIBRARY_PATH)."""
     runtime_dir = SKILLS_ROOT / "pptx" / "scripts" / "runtime"
     binary = runtime_dir / "kimi_pptd"
     if not binary.exists():
@@ -1489,39 +1635,124 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
         )
 
     # Fast path: mounted binary is executable BY OTHERS (the alloc child runs as
-    # a non-root uid, so it needs the other-x bit; a root-only os.access check
-    # would be too permissive now that the server is root).
-    if binary.exists():
-        mode = binary.stat().st_mode
-        if mode & 0o001:  # S_IXOTH
+    # a non-root uid, so it needs the other-x bit).
+    try:
+        if binary.stat().st_mode & 0o001:  # S_IXOTH
             return binary, runtime_dir
+    except OSError:
+        pass
 
-    # Fallback: copy the runtime into a writable location and make it executable
-    # for every uid (the alloc child must be able to exec + traverse it).
-    cache_binary = _KIMI_RUNTIME_CACHE / "kimi_pptd"
-    ready = _KIMI_RUNTIME_CACHE / ".ready"
-    if not ready.exists():
-        if _KIMI_RUNTIME_CACHE.exists():
-            shutil.rmtree(_KIMI_RUNTIME_CACHE, ignore_errors=True)
-        shutil.copytree(runtime_dir, _KIMI_RUNTIME_CACHE)
-        os.chmod(cache_binary, 0o755)
-        (_KIMI_RUNTIME_CACHE / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
-        # Make the whole cache tree world r-x so the non-root alloc child can
-        # traverse dirs and read shared libs / templates.
-        for root, dirs, files in os.walk(_KIMI_RUNTIME_CACHE):
-            os.chmod(root, 0o755)
-            for name in dirs:
-                os.chmod(os.path.join(root, name), 0o755)
-            for name in files:
-                fp = os.path.join(root, name)
-                os.chmod(fp, 0o644)
-        os.chmod(cache_binary, 0o755)
-        ready.touch()
-    # Always (re)ensure SSL trust data is present — cheap and idempotent. The
-    # embedded `requests` reads certifi.where() at import; if the on-disk
-    # certifi/cacert.pem is missing the convert path crashes hard.
-    _ensure_runtime_data_pkgs(_KIMI_RUNTIME_CACHE)
-    return cache_binary, _KIMI_RUNTIME_CACHE
+    return _prepare_kimi_cache(runtime_dir), _KIMI_RUNTIME_CACHE
+
+
+def _build_pptx_result(
+    session_id: str,
+    action: str,
+    in_file: Path,
+    out_file: Optional[Path],
+    jr: dict,
+    duration_ms: int,
+) -> dict[str, Any]:
+    """Assemble the structured kimi_pptd result record from the raw run journal.
+
+    A non-zero exit code (or a timeout) is NOT turned into an HTTP error here:
+    the caller (the orchestrator) reads ``exit_code``/``timed_out`` from the
+    structured result, and — crucially — the ``stdout``/``stderr`` stay attached
+    so the UI shows the checker/render logs instead of an opaque failure.
+    """
+    stdout = jr.get("stdout", "") or ""
+    stderr = jr.get("stderr", "") or ""
+    result: dict[str, Any] = {
+        "action": action,
+        "exit_code": jr["exit_code"],
+        "stdout": stdout[-MAX_OUTPUT_SIZE:] if len(stdout) > MAX_OUTPUT_SIZE else stdout,
+        "stderr": stderr[-MAX_OUTPUT_SIZE:] if len(stderr) > MAX_OUTPUT_SIZE else stderr,
+        "duration_ms": duration_ms,
+    }
+    if jr.get("timed_out"):
+        result["timed_out"] = True
+        result["error"] = jr.get("error") or f"kimi_pptd {action} timed out"
+
+    session_workspace = (WORKSPACE_ROOT / session_id).resolve()
+    if out_file is not None:
+        with as_session_uid(session_id):
+            if not out_file.exists():
+                out_exists = False
+                out_is_file = False
+                out_size = 0
+                rel_files: list[str] = []
+            else:
+                out_exists = True
+                out_is_file = out_file.is_file()
+                out_size = out_file.stat().st_size if out_is_file else 0
+                rel_files = []
+                if action == "screenshot":
+                    for child in sorted(out_file.iterdir()):
+                        if child.is_file() and child.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                            try:
+                                rel_files.append(str(child.relative_to(session_workspace)))
+                            except ValueError:
+                                rel_files.append(child.name)
+        if out_exists:
+            if out_is_file:
+                result["output_path"] = str(out_file)
+                result["size"] = out_size
+            elif action == "screenshot":
+                result["output_dir"] = str(out_file)
+                result["images"] = rel_files
+            else:
+                result["output_dir"] = str(out_file)
+    return result
+
+
+def _prepare_pptx_run(
+    session_id: str,
+    action: str,
+    input_path: str,
+    output_path: str,
+    pages: str,
+) -> tuple[Path, Optional[Path], Path, Path, list[str], str]:
+    """Validate + resolve paths and build the argv/env for a kimi_pptd run.
+
+    Returns ``(in_file, out_file, binary, runtime_dir, argv_tail, work_dir)``.
+    Raises ``ValueError`` for client-side input errors (bad paths), and bubbles
+    up ``FileNotFoundError`` if the kimi_pptd binary is unavailable. Split out so
+    both the JSON and streaming routes share identical preparation."""
+    if action not in ("check", "convert", "screenshot"):
+        raise ValueError("Invalid 'action'; must be one of check, convert, screenshot")
+    if not input_path:
+        raise ValueError("Missing 'input_path'")
+
+    ensure_session_dirs(session_id)
+    in_file = resolve_workspace_path(session_id, input_path)
+
+    out_file: Optional[Path] = None
+    with as_session_uid(session_id):
+        if not in_file.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+        if output_path:
+            out_file = resolve_workspace_path(session_id, output_path)
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            if action == "screenshot" or output_path.endswith("/"):
+                out_file.mkdir(parents=True, exist_ok=True)
+
+    binary, runtime_dir = _resolve_kimi_pptd()
+
+    argv_tail: list[str] = []
+    if action in ("convert", "screenshot") and out_file is not None:
+        argv_tail += ["-o", str(out_file)]
+    if action == "screenshot" and pages:
+        argv_tail += ["-p", str(pages)]
+
+    env = _alloc_run_env(session_id, base=os.environ.copy())
+    env["PYTHONUTF8"] = "1"
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
+    env["LD_LIBRARY_PATH"] = (
+        str(runtime_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    )
+
+    return in_file, out_file, binary, runtime_dir, argv_tail, env
 
 
 @app.route("/pptx/run", methods=["POST"])
@@ -1535,113 +1766,110 @@ def pptx_run() -> Response:
     output_path = data.get("output_path", "")
     pages = data.get("pages", "")
 
-    if action not in ("check", "convert", "screenshot"):
-        return make_error(
-            "Invalid 'action'; must be one of check, convert, screenshot", 400
+    try:
+        in_file, _out_file, binary, _runtime_dir, argv_tail, env = _prepare_pptx_run(
+            session_id, action, input_path, output_path, pages
         )
-    if not input_path:
-        return make_error("Missing 'input_path'", 400)
-
-    ensure_session_dirs(session_id)
-    try:
-        in_file = resolve_workspace_path(session_id, input_path)
-    except ValueError:
-        return make_error("Invalid input_path", 400)
-
-    out_file: Optional[Path] = None
-    with as_session_uid(session_id):
-        if not in_file.exists():
-            return make_error(f"Input file not found: {input_path}", 404)
-        if output_path:
-            try:
-                out_file = resolve_workspace_path(session_id, output_path)
-            except ValueError:
-                return make_error("Invalid output_path", 400)
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            if action == "screenshot" or output_path.endswith("/"):
-                out_file.mkdir(parents=True, exist_ok=True)
-
-    try:
-        binary, runtime_dir = _resolve_kimi_pptd()
+    except ValueError as e:
+        return make_error(str(e), 400)
     except FileNotFoundError as e:
-        return make_error(str(e), 500)
+        status = 404 if str(e).startswith("Input file not found") else 500
+        return make_error(str(e), status)
 
-    argv = [str(binary), action, str(in_file)]
-    if action in ("convert", "screenshot") and out_file is not None:
-        argv += ["-o", str(out_file)]
-    if action == "screenshot" and pages:
-        argv += ["-p", str(pages)]
-
-    env = _alloc_run_env(session_id, base=os.environ.copy())
-    # Match scripts/*.sh locale handling so UTF-8 paths work under POSIX/C.
-    env["PYTHONUTF8"] = "1"
-    env.setdefault("LC_ALL", "C.UTF-8")
-    env.setdefault("LANG", "C.UTF-8")
-    # Let the binary resolve its bundled shared libraries relative to itself.
-    env["LD_LIBRARY_PATH"] = (
-        str(runtime_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-    )
-
-    # Run with cwd = the input file's directory so any (legacy) relative page
-    # references resolve against the .pptd's own location.
+    argv = [str(binary), action, str(in_file)] + argv_tail
     start = time.time()
     try:
         jr = _run_as_alloc(session_id, argv, env, str(in_file.parent), 300)
         duration_ms = int((time.time() - start) * 1000)
-
-        stdout = jr.get("stdout", "") or ""
-        stderr = jr.get("stderr", "") or ""
-        result: dict[str, Any] = {
-            "action": action,
-            "exit_code": jr["exit_code"],
-            "stdout": stdout[-MAX_OUTPUT_SIZE:] if len(stdout) > MAX_OUTPUT_SIZE else stdout,
-            "stderr": stderr[-MAX_OUTPUT_SIZE:] if len(stderr) > MAX_OUTPUT_SIZE else stderr,
-            "duration_ms": duration_ms,
-        }
-
-        session_workspace = (WORKSPACE_ROOT / session_id).resolve()
-        if out_file is not None:
-            with as_session_uid(session_id):
-                if not out_file.exists():
-                    out_exists = False
-                    out_is_file = False
-                    out_size = 0
-                    rel_files: list[str] = []
-                else:
-                    out_exists = True
-                    out_is_file = out_file.is_file()
-                    out_size = out_file.stat().st_size if out_is_file else 0
-                    rel_files = []
-                    if action == "screenshot":
-                        for child in sorted(out_file.iterdir()):
-                            if child.is_file() and child.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-                                try:
-                                    rel_files.append(str(child.relative_to(session_workspace)))
-                                except ValueError:
-                                    rel_files.append(child.name)
-            if out_file is not None and out_exists:
-                if out_is_file:
-                    result["output_path"] = str(out_file)
-                    result["size"] = out_size
-                elif action == "screenshot":
-                    result["output_dir"] = str(out_file)
-                    result["images"] = rel_files
-                else:
-                    result["output_dir"] = str(out_file)
-
-        if jr.get("timed_out"):
-            return make_error(f"kimi_pptd {action} timed out", 504)
-        if jr["exit_code"] != 0:
-            return make_error(
-                f"kimi_pptd {action} failed (exit {jr['exit_code']}):\n{stdout}\n{stderr}",
-                500,
-            )
+        result = _build_pptx_result(session_id, action, in_file, _out_file, jr, duration_ms)
+        # Non-zero exit / timeout are returned as a structured success (HTTP 200)
+        # so the orchestrator keeps stdout/stderr and surfaces them in the UI
+        # instead of losing them in an error envelope.
         return make_success(result)
     except subprocess.TimeoutExpired:
-        return make_error(f"kimi_pptd {action} timed out", 504)
+        result = {
+            "action": action, "exit_code": -1, "stdout": "", "stderr": "",
+            "duration_ms": int((time.time() - start) * 1000),
+            "timed_out": True, "error": f"kimi_pptd {action} timed out",
+        }
+        return make_success(result)
     except Exception as e:  # pragma: no cover
         logger.exception("pptx_run error")
         return make_error(f"kimi_pptd {action} error: {e}", 500)
+
+
+@app.route("/pptx/run/stream", methods=["POST"])
+def pptx_run_stream():
+    """Stream kimi_pptd output live as newline-delimited JSON, matching the
+    ``/exec/python/stream`` protocol so the orchestrator can attach the same
+    chunk-forwarding callback:
+
+      {"t":"stdout","s":"..."} / {"t":"stderr","s":"..."}  — live chunks
+      {"t":"result", ...}                                   — final result record
+
+    A non-zero exit / timeout is delivered as a ``result`` record (never an HTTP
+    error) so the streamed logs are not truncated before the client sees them.
+    """
+    data = request.get_json(force=True) or {}
+    session_id = data.get("session_id", "default")
+    action = (data.get("action") or "").strip()
+    input_path = data.get("input_path", "")
+    output_path = data.get("output_path", "")
+    pages = data.get("pages", "")
+
+    try:
+        in_file, _out_file, binary, _runtime_dir, argv_tail, env = _prepare_pptx_run(
+            session_id, action, input_path, output_path, pages
+        )
+    except ValueError as e:
+        return make_error(str(e), 400)
+    except FileNotFoundError as e:
+        status = 404 if str(e).startswith("Input file not found") else 500
+        return make_error(str(e), status)
+
+    argv = [str(binary), action, str(in_file)] + argv_tail
+
+    def generate():
+        import queue as _q
+        import threading as _t
+
+        out_q: "_q.Queue" = _q.Queue()
+
+        def worker():
+            start = time.time()
+            try:
+                def cb(stream, text):
+                    out_q.put({"t": stream, "s": text})
+                jr = _run_as_alloc(session_id, argv, env, str(in_file.parent), 300, on_chunk=cb)
+                duration_ms = int((time.time() - start) * 1000)
+                result = _build_pptx_result(session_id, action, in_file, _out_file, jr, duration_ms)
+                out_q.put({"t": "result", "data": result})
+            except subprocess.TimeoutExpired:
+                out_q.put({"t": "result", "data": {
+                    "action": action, "exit_code": -1, "stdout": "", "stderr": "",
+                    "duration_ms": int((time.time() - start) * 1000),
+                    "timed_out": True, "error": f"kimi_pptd {action} timed out",
+                }})
+            except Exception as e:  # pragma: no cover
+                logger.exception("pptx_run_stream error")
+                out_q.put({"t": "result", "data": {
+                    "action": action, "exit_code": -1, "stdout": "", "stderr": "",
+                    "duration_ms": int((time.time() - start) * 1000),
+                    "error": f"kimi_pptd {action} error: {e}",
+                }})
+
+        th = _t.Thread(target=worker, daemon=True)
+        th.start()
+        try:
+            while True:
+                item = out_q.get(timeout=330)
+                yield json.dumps(item) + "\n"
+                if item.get("t") == "result":
+                    break
+        finally:
+            th.join(timeout=0)
+
+    return Response(generate(), mimetype="application/x-ndjson")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1691,9 +1919,9 @@ def convert_html_to_pdf() -> Response:
         duration_ms = int((time.time() - start) * 1000)
 
         if jr.get("timed_out"):
-            return make_error("PDF conversion timed out", 504)
+            return _capture_failure("PDF conversion timed out", jr)
         if jr["exit_code"] != 0:
-            return make_error(f"PDF conversion failed: {jr['stderr'] or jr['stdout']}", 500)
+            return _capture_failure("PDF conversion failed", jr)
 
         with as_session_uid(session_id):
             if not out_file.exists():
@@ -1762,10 +1990,10 @@ def convert_docx_to_pdf() -> Response:
                 expected_output.rename(out_file)
 
         if jr.get("timed_out"):
-            return make_error("DOCX to PDF conversion timed out", 504)
+            return _capture_failure("DOCX to PDF conversion timed out", jr)
         with as_session_uid(session_id):
             if not out_file.exists():
-                return make_error(f"LibreOffice conversion failed: {jr['stderr']}", 500)
+                return _capture_failure("LibreOffice conversion failed", jr)
             size = out_file.stat().st_size
 
         return make_success({

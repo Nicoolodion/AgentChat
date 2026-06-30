@@ -277,6 +277,10 @@ export async function deleteChatForUser(userId: string, chatId: string): Promise
 
   if (chat.agentSession) {
     try {
+      // Host workspaces may have been created keyed by either chatId (sessions
+      // route) or the agent session id (execute/files routes). Delete both
+      // candidate dirs idempotently so neither orphans.
+      await deleteHostWorkspace(chatId);
       await deleteHostWorkspace(chat.agentSession.id);
     } catch {
       // best-effort; don't block chat deletion
@@ -464,15 +468,14 @@ export async function getConversationForModel(input: {
     where: {
       chatId: input.chatId,
       chat: { userId: input.userId },
+      role: { in: ["system", "user", "assistant"] },
     },
     orderBy: { createdAt: "asc" },
     take: input.maxMessages ?? 30,
   });
 
-  return rows
-    .filter((row) => row.role === "system" || row.role === "user" || row.role === "assistant")
-    .map((row) => ({
-      role: row.role as "system" | "user" | "assistant",
-      content: decryptString(row.encryptedContent, input.userKey),
-    }));
+  return rows.map((row) => ({
+    role: row.role as "system" | "user" | "assistant",
+    content: decryptString(row.encryptedContent, input.userKey),
+  }));
 }

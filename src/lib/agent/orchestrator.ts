@@ -16,6 +16,7 @@ import { env } from "@/lib/env";
 import {
   getOpenAIClientForModel,
   isNeuralwattModel,
+  normalizeDefaultModel,
   resolveApiModelId,
   resolveReasoningEffort,
 } from "@/lib/nanogpt";
@@ -59,6 +60,7 @@ import {
   sandboxExecPythonStream,
   sandboxExecShell,
   sandboxPptxRun,
+  sandboxPptxRunStream,
   sandboxWebRender,
   type SandboxCookie,
   sandboxFileDelete,
@@ -121,7 +123,6 @@ class ThinkingSplitter {
   private buf = "";
   private inThinking = false;
   private openTag = "";
-  // We deliberately treat ` Nikki_ᵁ` block markers too.
 
   constructor(
     private onContent: (text: string) => void,
@@ -558,8 +559,17 @@ export async function runAgentExecution(input: {
   providerModel?: string;
   ttftMs?: number;
   avgTokensPerSecond?: number;
+  /** Wall-clock duration of the whole agent run (ms). */
+  runDurationMs?: number;
 }> {
-  const { sessionId, userMessage, priorConversation, model, sendEvent, signal, reasoningEffort, modelContextLength } = input;
+  const { sessionId, userMessage, priorConversation, model: inputModel, sendEvent, signal, reasoningEffort, modelContextLength } = input;
+
+  // Normalize at the routing boundary so a bare Neuralwatt default/vision model
+  // id (stored in the DB before normalization, or configured without the
+  // `neuralwatt:` prefix) routes to the Neuralwatt client instead of the
+  // keyless NanoGPT client. This also keeps downstream capability lookups
+  // (isNeuralwattModel, reasoning_effort) consistent with the actual provider.
+  const model = normalizeDefaultModel(inputModel);
 
   // Check sandbox availability before starting
   try {
@@ -723,6 +733,7 @@ export async function runAgentExecution(input: {
       providerModel,
       ttftMs,
       avgTokensPerSecond,
+      runDurationMs: Date.now() - runStartMs,
     };
   };
 
@@ -940,19 +951,6 @@ export async function runAgentExecution(input: {
       flushSegments();
     }
 
-    // Emit tool_start events once arguments are fully assembled
-    for (const tc of validToolCalls) {
-      sendEvent({
-        type: "tool_start",
-        data: {
-          toolCallId: tc.id,
-          toolName: tc.function.name,
-          arguments: safeParseArgs(tc.function.arguments),
-        },
-      });
-      startedToolCount++;
-    }
-
     if (validToolCalls.length === 0) {
       // No tool calls — we're done. Flush any trailing reasoning/content as the
       // final tail segment (positioned after the last tool, if any).
@@ -983,11 +981,30 @@ export async function runAgentExecution(input: {
       toolCallsCount++;
       if (toolCallsCount > maxToolCalls) break;
 
-      const toolCallId = tc.id;
+      // Persist a DB row for this tool call right before executing it. The
+      // toolCallId carried in live SSE events is the DB row id, which matches
+      // the id used by the stream route's replay-after-refresh (otherwise the
+      // same logical tool call would have a different id before vs after a
+      // refresh, breaking client-side grouping). The row is created here
+      // (rather than up-front for all tools) so an early loop exit (e.g.
+      // maxToolCalls) cannot orphan a "running" row. The LLM-generated id is
+      // kept separately for the conversation's tool_call_id, which the provider
+      // requires to round-trip unchanged.
+      const llmToolCallId = tc.id;
       const toolName = tc.function.name;
       const toolArgs = safeParseArgs(tc.function.arguments ?? "{}");
-
       const toolCallRecord = await createToolCall(sessionId, toolName, tc.function.arguments);
+      const toolCallId = toolCallRecord.id;
+
+      sendEvent({
+        type: "tool_start",
+        data: {
+          toolCallId,
+          toolName,
+          arguments: toolArgs,
+        },
+      });
+      startedToolCount++;
 
       const startMs = Date.now();
       let result: { ok: boolean; result?: unknown; error?: string };
@@ -1012,7 +1029,7 @@ export async function runAgentExecution(input: {
       }
 
       const durationMs = Date.now() - startMs;
-      await completeToolCall(toolCallRecord.id, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
+      await completeToolCall(toolCallId, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
 
       // For streamed tools (e.g. ipython) stdout was already emitted
       // incrementally as tool_output chunks; sending the full capture again
@@ -1043,7 +1060,7 @@ export async function runAgentExecution(input: {
 
       messages.push({
         role: "tool",
-        tool_call_id: toolCallId,
+        tool_call_id: llmToolCallId,
         content: JSON.stringify(result),
       });
     }
@@ -1174,10 +1191,30 @@ async function executeSandboxTool(
       };
     }
     case "pip_install": {
-      const pkg = String(args.package ?? args.packages ?? "").replace(/[^a-zA-Z0-9._\-[\]=<>]/g, "");
-      if (!pkg) return { ok: false, error: "Invalid package name" };
-      await sandboxExecShell(sessionId, `mkdir -p /workspace/${sessionId}/python_libs`, "/", 10);
-      const cmd = `pip install --target /workspace/${sessionId}/python_libs ${pkg}`;
+      const rawInput = args.package ?? args.packages ?? "";
+      const entryList = Array.isArray(rawInput)
+        ? rawInput.map((p) => String(p))
+        : String(rawInput).split(/[\s,]+/).map((p) => p.trim()).filter(Boolean);
+      const pkgs: string[] = [];
+      for (const entry of entryList) {
+        // Reject path separators / VCS URL markers and any char outside a
+        // safe PEP 508-ish subset (names, extras [], version specifiers
+        // <>=!~, ., _, -, +). This prevents shell metacharacter injection
+        // since the spec is passed through sandboxExecShell.
+        if (/[\/@]/.test(entry)) {
+          return { ok: false, error: `Invalid package spec: ${entry}` };
+        }
+        if (!/^[A-Za-z0-9._+\-<>=!~\[\]]+$/.test(entry)) {
+          return { ok: false, error: `Invalid package spec: ${entry}` };
+        }
+        pkgs.push(entry);
+      }
+      if (pkgs.length === 0) return { ok: false, error: "Invalid package name" };
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sessionId)) {
+        return { ok: false, error: "Invalid session id" };
+      }
+      const targetDir = `/workspace/${sessionId}/python_libs`;
+      const cmd = `mkdir -p ${targetDir} && pip install --target ${targetDir} ${pkgs.join(" ")}`;
       const res = await sandboxExecShell(sessionId, cmd, "/", 120);
       return {
         ok: res.exit_code === 0 && !res.error,
@@ -1321,12 +1358,21 @@ async function executeSandboxTool(
           return { ok: false, error: `Failed to read program_cs_path '${programCsPath}': ${msg}` };
         }
       }
-      const res = await sandboxDocxBuild(sessionId, outputPath, programCs || undefined);
-      return {
-        ok: true,
-        result: res,
-        stdout: fileToolStatus("docx_build", outputPath, { stdout: res.stdout }, res.size),
-      };
+      try {
+        const res = await sandboxDocxBuild(sessionId, outputPath, programCs || undefined);
+        return {
+          ok: true,
+          result: res,
+          stdout: fileToolStatus("docx_build", outputPath, { stdout: res.stdout }, res.size),
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          ok: false,
+          error: msg,
+          stdout: fileToolStatus("docx_build", outputPath, { error: msg }),
+        };
+      }
     }
     case "xlsx_create": {
       const outputPath = String(args.output_path ?? "");
@@ -1349,7 +1395,7 @@ async function executeSandboxTool(
       if (!inputPath) return { ok: false, error: "pptx_render requires input_path" };
       if (!outputPath) return { ok: false, error: "pptx_render requires output_path" };
       try {
-        const res = await sandboxPptxRun(sessionId, "convert", { input_path: inputPath, output_path: outputPath });
+        const { result: res, streamed } = await runPptxAction(sessionId, "convert", { input_path: inputPath, output_path: outputPath }, streamCtx);
         const sizeBytes = res.size;
         const label = "pptx_render";
         const trimmed = (res.stdout ?? "").trim();
@@ -1357,7 +1403,7 @@ async function executeSandboxTool(
         const stdout = ok
           ? fileToolStatus(label, outputPath, { stdout: trimmed }, sizeBytes)
           : `${label} FAILED → ${outputPath}\n${trimmed}\n${(res.stderr ?? "").trim()}`.slice(0, 4000);
-        return { ok, result: res, error: ok ? undefined : `pptx_render failed (exit ${res.exit_code})`, stdout };
+        return { ok, result: res, error: ok ? undefined : (res.error ?? `pptx_render failed (exit ${res.exit_code})`), stdout, streamed };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return { ok: false, error: msg, stdout: fileToolStatus("pptx_render", outputPath, { error: msg }) };
@@ -1367,18 +1413,23 @@ async function executeSandboxTool(
       const inputPath = String(args.input_path ?? "");
       if (!inputPath) return { ok: false, error: "pptx_check requires input_path" };
       try {
-        const res = await sandboxPptxRun(sessionId, "check", { input_path: inputPath });
-        const ok = res.exit_code === 0;
+        const { result: res, streamed } = await runPptxAction(sessionId, "check", { input_path: inputPath }, streamCtx);
+        const ok = res.exit_code === 0 && !res.timed_out;
         const report = [res.stdout ?? "", res.stderr ?? ""].filter(Boolean).join("\n").trim();
+        const detail = report.slice(0, 12000) || (ok ? "OK — 0 errors, 0 warnings" : "Checker returned no output");
+        const stdout = ok ? detail : `pptx_check FAILED → ${inputPath}\n${detail}`;
         return {
           ok,
           result: res,
-          error: ok ? undefined : `pptx_check reported errors (exit ${res.exit_code})`,
-          stdout: report.slice(0, 12000) || (ok ? "OK — 0 errors, 0 warnings" : "Checker returned no output"),
+          error: ok ? undefined : (res.error ?? `pptx_check reported errors (exit ${res.exit_code})`),
+          stdout,
+          streamed,
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { ok: false, error: `pptx_check failed: ${msg}` };
+        // Surface the error to the UI (not just to the model) so the operator
+        // sees why the check failed instead of an empty result area.
+        return { ok: false, error: `pptx_check failed: ${msg}`, stdout: `pptx_check FAILED → ${inputPath}\n${msg}` };
       }
     }
     case "pptx_screenshot": {
@@ -1388,16 +1439,16 @@ async function executeSandboxTool(
       if (!inputPath) return { ok: false, error: "pptx_screenshot requires input_path" };
       if (!outputPath) return { ok: false, error: "pptx_screenshot requires output_path" };
       try {
-        const res = await sandboxPptxRun(sessionId, "screenshot", { input_path: inputPath, output_path: outputPath, pages });
+        const { result: res, streamed } = await runPptxAction(sessionId, "screenshot", { input_path: inputPath, output_path: outputPath, pages }, streamCtx);
         const ok = res.exit_code === 0;
         const imgs = Array.isArray(res.images) ? res.images : [];
         const summary = ok
           ? `Rendered ${imgs.length} screenshot(s) → ${outputPath}\n${imgs.slice(0, 30).join("\n")}`
-          : `pptx_screenshot FAILED\n${(res.stdout ?? "").trim()}\n${(res.stderr ?? "").trim()}`.slice(0, 4000);
-        return { ok, result: res, error: ok ? undefined : `pptx_screenshot failed (exit ${res.exit_code})`, stdout: summary };
+          : `pptx_screenshot FAILED → ${outputPath}\n${(res.stdout ?? "").trim()}\n${(res.stderr ?? "").trim()}`.slice(0, 4000);
+        return { ok, result: res, error: ok ? undefined : (res.error ?? `pptx_screenshot failed (exit ${res.exit_code})`), stdout: summary, streamed };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { ok: false, error: `pptx_screenshot failed: ${msg}` };
+        return { ok: false, error: `pptx_screenshot failed: ${msg}`, stdout: `pptx_screenshot FAILED → ${outputPath}\n${msg}` };
       }
     }
     case "libreoffice_convert": {
@@ -1811,8 +1862,14 @@ print(json.dumps(out))
       }
 
       const headers = buildBrowserHeaders(url);
+      // Request raw (identity) bytes: this is a file download, so transparent
+      // compression only causes intermittent 0-byte / corrupt results (urllib
+      // does not auto-inflate, and a Content-Encoding/Content-Type mismatch can
+      // leave the written file empty). Sending identity makes the server hand us
+      // the real asset and lets us stream straight to disk.
+      headers["Accept-Encoding"] = "identity";
       const downloadCode = `
-import json, os, urllib.request, urllib.parse, gzip, zlib, re
+import json, os, urllib.request, urllib.parse, re, shutil
 
 def is_blocked_host(host):
     host = (host or "").lower().strip("[]")
@@ -1843,17 +1900,8 @@ try:
         if is_blocked_host(final_host):
             out["error"] = f"Blocked redirect to private/internal host: {final_host}"
         else:
-            raw = resp.read()
             out["status"] = resp.status
             out["content_type"] = resp.headers.get("Content-Type", "") or ""
-            if resp.headers.get("Content-Encoding") == "gzip":
-                try: raw = gzip.decompress(raw)
-                except Exception: pass
-            elif resp.headers.get("Content-Encoding") == "deflate":
-                try: raw = zlib.decompress(raw)
-                except Exception:
-                    try: raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-                    except Exception: pass
             # Honor Content-Disposition filename when present. Pattern is kept
             # free of inner double-quotes so it compiles inside this template.
             cd = resp.headers.get("Content-Disposition", "") or ""
@@ -1863,10 +1911,20 @@ try:
                 if name:
                     out["filename"] = urllib.parse.unquote(name)
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            # Stream straight to disk (chunked) so large downloads don't exhaust
+            # memory; the exec timeout wrapper caps the overall run.
             with open(output_path, "wb") as f:
-                f.write(raw)
-            out["size"] = len(raw)
+                shutil.copyfileobj(resp, f, length=64 * 1024)
             out["saved_path"] = output_path
+            # Report the ACTUAL on-disk size: an in-memory byte count can be
+            # wrong on a partially-flushed or empty body, and an empty file is
+            # almost never an intentional success — surface it as an error so the
+            # model knows to retry / use web_fetch instead of trusting a 0-byte
+            # artifact.
+            out["size"] = os.path.getsize(output_path)
+            if out["size"] == 0:
+                cl = resp.headers.get("Content-Length")
+                out["error"] = f"Downloaded 0 bytes (server returned an empty body; Content-Length={cl})"
 except urllib.error.HTTPError as e:
     out["status"] = e.code
     out["error"] = f"HTTP Error {e.code}: {e.reason}"
@@ -1898,17 +1956,24 @@ print(json.dumps(out))
         };
       }
       const ok = parsed.ok === true;
+      // Cross-check the reported size against the file on disk so a stale/missing
+      // body can never silently register as a 0-byte "downloaded" artifact.
+      let diskSize = parsed.size ?? 0;
+      try {
+        const info = await sandboxFileInfo(sessionId, parsed.saved_path ?? outputPath);
+        diskSize = info.size;
+      } catch { /* file may not exist on failure — keep parsed size */ }
       const out = {
         url,
         contentType: parsed.content_type ?? "",
         finalUrl: parsed.final_url ?? url,
         status: parsed.status,
-        size: parsed.size ?? 0,
+        size: diskSize,
         savedPath: parsed.saved_path ?? outputPath,
         filename: parsed.filename ?? "",
       };
       const stdout = ok
-        ? `Downloaded ${parsed.size ?? 0} bytes → ${parsed.saved_path ?? outputPath} (${parsed.content_type ?? "?"})`
+        ? `Downloaded ${diskSize} bytes → ${out.savedPath} (${out.contentType || "?"})`
         : parsed.error ?? "Download failed";
       return {
         ok,
@@ -1963,7 +2028,7 @@ print(json.dumps(out))
       for (const m of [env.AGENT_VISION_MODEL, model, env.AGENT_VISION_FALLBACK_MODEL]) {
         if (m && !seen.has(m)) {
           seen.add(m);
-          candidateModels.push(m);
+          candidateModels.push(normalizeDefaultModel(m));
         }
       }
 
@@ -2225,6 +2290,46 @@ print(json.dumps(out))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Run a kimi_pptd action (check | convert | screenshot), streaming stdout/stderr
+ * to the UI in real time when a stream context is available (mirroring how
+ * `ipython` is streamed), otherwise falling back to a single-shot call. Either
+ * way the returned result keeps the full stdout/stderr — the sandbox route
+ * returns a structured result (HTTP 200) even on a non-zero exit so the
+ * checker/render logs are never swallowed by an error envelope.
+ */
+async function runPptxAction(
+  sessionId: string,
+  action: "check" | "convert" | "screenshot",
+  params: { input_path: string; output_path?: string; pages?: string },
+  streamCtx?: { sendEvent: (event: AgentSseEvent) => void; toolCallId: string },
+): Promise<{ result: import("@/lib/agent/sandbox").SandboxPptxRunResult; streamed: boolean }> {
+  if (streamCtx) {
+    let accStdout = "";
+    let accStderr = "";
+    const res = await sandboxPptxRunStream(sessionId, action, params, (stream, text) => {
+      if (stream === "stdout") accStdout += text;
+      else accStderr += text;
+      streamCtx.sendEvent({
+        type: "tool_output",
+        data: { toolCallId: streamCtx.toolCallId, output: text },
+      });
+    });
+    // Keep full captures available so the tool result fed back to the model is
+    // non-empty on silent runs (the model needs the report even when the live
+    // streamed chunks were terse).
+    return {
+      result: {
+        ...res,
+        stdout: res.stdout || accStdout,
+        stderr: res.stderr || accStderr,
+      },
+      streamed: true,
+    };
+  }
+  return { result: await sandboxPptxRun(sessionId, action, params), streamed: false };
+}
 
 async function updateSessionStatus(sessionId: string, status: AgentSessionStatus): Promise<void> {
   await prisma.agentSession.update({

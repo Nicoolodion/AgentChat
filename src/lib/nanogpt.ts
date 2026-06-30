@@ -35,6 +35,32 @@ export function resolveApiModelId(modelId: string): string {
   return modelId;
 }
 
+/**
+ * Normalize a configured/bare model id so the completion layer routes it to the
+ * correct provider. A model is only ever served by Neuralwatt when it carries
+ * the `neuralwatt:` prefix. Operators frequently set DEFAULT_MODEL (or the
+ * vision model env vars) to a bare Neuralwatt model name (e.g.
+ * `kimi-k2.7-code-flex`) without the prefix; with no NanoGPT key configured
+ * such an id could never be served, so it would route to the (keyless) NanoGPT
+ * client and fail. This auto-prefixes it in that case.
+ *
+ * Behavior:
+ *  - already-prefixed -> untouched
+ *  - only Neuralwatt key configured -> prefixed with `neuralwatt:`
+ *  - otherwise (NanoGPT key present, or neither) -> untouched (NanoGPT is the
+ *    default namespace; operators wanting Neuralwatt alongside NanoGPT must
+ *    prefix it explicitly, which is documented in the model picker)
+ */
+export function normalizeDefaultModel(modelId: string): string {
+  const id = (modelId ?? "").trim();
+  if (!id) return id;
+  if (isNeuralwattModel(id)) return id;
+  const hasNeuralwatt = Boolean(env.NEURALWATT_API_KEY);
+  const hasNanogpt = Boolean(env.NANOGPT_API_KEY);
+  if (hasNeuralwatt && !hasNanogpt) return `${NEURALWATT_PREFIX}${id}`;
+  return id;
+}
+
 let neuralwattClient: OpenAI | null = null;
 function getNeuralwattClient(): OpenAI {
   if (!neuralwattClient) {
@@ -221,7 +247,17 @@ export async function fetchModelCatalog(): Promise<ModelInfo[]> {
     fetchModelsFromNeuralwatt().catch(() => [] as ModelInfo[]),
   ]);
 
-  const models = [...nanogptModels, ...neuralwattModels];
+  // Dedupe by id (a normalized bare Neuralwatt default can otherwise appear as
+  // both a NanoGPT-source placeholder and a real Neuralwatt row). First write
+  // wins; if a Neuralwatt-sourced row arrives it replaces a placeholder so the
+  // cached capability metadata (context/vision/tools) is the real one.
+  const byId = new Map<string, ModelInfo>();
+  for (const m of nanogptModels) byId.set(m.id, m);
+  for (const m of neuralwattModels) {
+    const prev = byId.get(m.id);
+    if (!prev || prev.source !== "neuralwatt") byId.set(m.id, m);
+  }
+  const models = [...byId.values()];
   catalogCache = { ts: now, models };
   return models;
 }
@@ -266,7 +302,11 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
   const search = (filter ?? "").trim().toLowerCase();
 
   if (!env.NANOGPT_API_KEY) {
-    const placeholder = env.DEFAULT_MODEL;
+    // No NanoGPT key configured. Surface the configured DEFAULT_MODEL — but
+    // normalized to the correct provider prefix so a bare Neuralwatt model name
+    // is actually routable instead of silently hitting the keyless NanoGPT
+    // client. This also keeps the frontend's "first model" fallback correct.
+    const placeholder = normalizeDefaultModel(env.DEFAULT_MODEL);
     if (search && !placeholder.toLowerCase().includes(search)) {
       return [];
     }
@@ -289,11 +329,12 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
 
   if (!response.ok) {
     console.warn(`Could not fetch model list (${response.status}). Falling back to DEFAULT_MODEL.`);
+    const fallback = normalizeDefaultModel(env.DEFAULT_MODEL);
     return [
       {
-        id: env.DEFAULT_MODEL,
-        name: env.DEFAULT_MODEL,
-        displayName: env.DEFAULT_MODEL,
+        id: fallback,
+        name: fallback,
+        displayName: fallback,
       },
     ];
   }
@@ -301,7 +342,8 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
   const json = (await response.json()) as { data?: ModelApiRow[] };
   const rows = Array.isArray(json.data) ? json.data : [];
   if (rows.length === 0) {
-    return [{ id: env.DEFAULT_MODEL, name: env.DEFAULT_MODEL, displayName: env.DEFAULT_MODEL }];
+    const fallback = normalizeDefaultModel(env.DEFAULT_MODEL);
+    return [{ id: fallback, name: fallback, displayName: fallback }];
   }
 
   const filtered = search
@@ -434,7 +476,11 @@ export async function streamCompletionWithCallbacks(
   callbacks: StreamCallbacks,
 ): Promise<StreamCompletionResult> {
   const hasNeuralwattKey = Boolean(env.NEURALWATT_API_KEY);
-  const isNeuralwatt = isNeuralwattModel(input.model);
+  // Normalize at the routing boundary so bare Neuralwatt default/vision model
+  // ids stored before normalization (or configured without the prefix) are
+  // routed to the Neuralwatt client instead of the keyless NanoGPT one.
+  const resolvedModel = normalizeDefaultModel(input.model);
+  const isNeuralwatt = isNeuralwattModel(resolvedModel);
   if (isNeuralwatt && !hasNeuralwattKey) {
     throw new Error("NEURALWATT_API_KEY is not configured for the selected model.");
   }
@@ -443,11 +489,11 @@ export async function streamCompletionWithCallbacks(
   }
 
   const startTime = Date.now();
-  const client = getOpenAIClientForModel(input.model);
-  const model = applyWebSearchSuffix(input.model, input.webSearchEnabled);
+  const client = getOpenAIClientForModel(resolvedModel);
+  const model = applyWebSearchSuffix(resolvedModel, input.webSearchEnabled);
   const attachments = input.attachments ?? [];
 
-  const effectiveReasoningEffort = await resolveReasoningEffort(input.model, input.reasoningEffort);
+  const effectiveReasoningEffort = await resolveReasoningEffort(resolvedModel, input.reasoningEffort);
   const createOptions: Record<string, unknown> = {
     model,
     messages: [] as ChatCompletionMessageParam[],

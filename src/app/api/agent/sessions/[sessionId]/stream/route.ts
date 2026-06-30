@@ -27,7 +27,7 @@ function sse(controller: ReadableStreamDefaultController, event: string, data: u
       try { controller.enqueue(encoded); } catch { /* stream closed */ }
     });
   } else {
-    controller.enqueue(encoded);
+    try { controller.enqueue(encoded); } catch { /* controller closed — ignore */ }
   }
 }
 
@@ -79,45 +79,61 @@ export async function GET(
         // 1. Hand the client back the current session state.
         sse(controller, "session", { session });
 
-        // Only replay persisted tool calls when the session is still running.
-        // For completed/error/idle sessions the assistant message already
-        // carries its tool calls (incl. arguments + output) — they are loaded
-        // from the chat detail endpoint, so replaying here would only
-        // duplicate them on the wrong message.
-        if (isLive) {
-          for (const tc of toolCalls) {
-            sse(controller, "replay_tool_start", {
-              toolCallId: tc.id,
-              toolName: tc.toolName,
-              arguments: safeParseArgs(tc.arguments),
-              timestamp: tc.createdAt.getTime(),
-            });
-            if (tc.result) {
+        // Transition tracker: emits each tool-call lifecycle event AT MOST ONCE
+        // per connection. This fixes two holes in the previous model (which
+        // fetched tool calls `notIn seenIds` only):
+        //   - A tool that was still running when the client re-attached never
+        //     got its completed output/done emitted (its id was already in the
+        //     "seen" set, so the poll never fetched it again).
+        //   - A tool completed before re-attach could be replayed AND later
+        //     re-emitted.
+        // Now each id gets start (once), output (once, when a result first
+        // appears) and done (once, when it reaches a terminal status),
+        // regardless of when the client connected.
+        const emittedStart = new Set<string>();
+        const emittedOutput = new Set<string>();
+        const emittedDone = new Set<string>();
+
+        const emitTransitions = (list: typeof toolCalls) => {
+          for (const tc of list) {
+            if (!emittedStart.has(tc.id)) {
+              emittedStart.add(tc.id);
+              sse(controller, "replay_tool_start", {
+                toolCallId: tc.id,
+                toolName: tc.toolName,
+                arguments: safeParseArgs(tc.arguments),
+                timestamp: tc.createdAt.getTime(),
+              });
+            }
+            if (!emittedOutput.has(tc.id) && tc.result) {
+              emittedOutput.add(tc.id);
               sse(controller, "replay_tool_output", {
                 toolCallId: tc.id,
                 output: tc.result.slice(0, 4000),
                 timestamp: tc.createdAt.getTime() + 1,
               });
             }
-            if (tc.status === "success") {
+            if (!emittedDone.has(tc.id) && (tc.status === "success" || tc.status === "error")) {
+              emittedDone.add(tc.id);
               sse(controller, "replay_tool_done", {
                 toolCallId: tc.id,
                 toolName: tc.toolName,
-                ok: true,
+                ok: tc.status === "success",
                 durationMs: tc.durationMs ?? 0,
-                timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
-              });
-            } else if (tc.status === "error") {
-              sse(controller, "replay_tool_done", {
-                toolCallId: tc.id,
-                toolName: tc.toolName,
-                ok: false,
-                durationMs: tc.durationMs ?? 0,
-                error: tc.error ?? undefined,
+                error: tc.status === "error" ? (tc.error ?? undefined) : undefined,
                 timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
               });
             }
           }
+        };
+
+        // Only replay persisted tool calls when the session is still running.
+        // For completed/error/idle sessions the assistant message already
+        // carries its tool calls (incl. arguments + output) — they are loaded
+        // from the chat detail endpoint, so replaying here would only
+        // duplicate them on the wrong message.
+        if (isLive) {
+          emitTransitions(toolCalls);
         }
 
         // 2. If the session is no longer running, we're done.
@@ -131,10 +147,12 @@ export async function GET(
           return;
         }
 
-        // 3. Otherwise, poll for new tool calls + status changes every 1.5s.
-        // while the session is running. The orchestrator continues to write
-        // to the database, so this gives us a real-time tail.
-        const seenIds = new Set(toolCalls.map((tc) => tc.id));
+        // 3. Otherwise, poll for tool-call state transitions + status changes
+        // every 1.5s while the session is running. The orchestrator continues
+        // to write to the database, so this gives us a real-time tail. We
+        // re-fetch ALL in-scope tool calls (not just unseen ids) so that a tool
+        // which transitions running→completed between polls gets its output
+        // and done events emitted exactly once.
         const start = Date.now();
         let closed = false;
 
@@ -151,44 +169,13 @@ export async function GET(
           }
           try {
             const fresh = await prisma.agentToolCall.findMany({
-              where: { sessionId, id: { notIn: Array.from(seenIds) } },
+              where: {
+                sessionId,
+                ...(fromTs > 0 ? { createdAt: { gt: new Date(fromTs) } } : {}),
+              },
               orderBy: { createdAt: "asc" },
-              take: 20,
             });
-            for (const tc of fresh) {
-              seenIds.add(tc.id);
-              sse(controller, "replay_tool_start", {
-                toolCallId: tc.id,
-                toolName: tc.toolName,
-                arguments: safeParseArgs(tc.arguments),
-                timestamp: tc.createdAt.getTime(),
-              });
-              if (tc.status === "success") {
-                if (tc.result) {
-                  sse(controller, "replay_tool_output", {
-                    toolCallId: tc.id,
-                    output: tc.result.slice(0, 4000),
-                    timestamp: tc.createdAt.getTime() + 1,
-                  });
-                }
-                sse(controller, "replay_tool_done", {
-                  toolCallId: tc.id,
-                  toolName: tc.toolName,
-                  ok: true,
-                  durationMs: tc.durationMs ?? 0,
-                  timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
-                });
-              } else if (tc.status === "error") {
-                sse(controller, "replay_tool_done", {
-                  toolCallId: tc.id,
-                  toolName: tc.toolName,
-                  ok: false,
-                  durationMs: tc.durationMs ?? 0,
-                  error: tc.error ?? undefined,
-                  timestamp: (tc.completedAt ?? tc.createdAt).getTime(),
-                });
-              }
-            }
+            emitTransitions(fresh);
 
             const cur = await prisma.agentSession.findUnique({ where: { id: sessionId } });
             if (!cur) return;

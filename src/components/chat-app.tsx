@@ -343,6 +343,10 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
 
   const [me, setMe] = useState<MePayload | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  // The server-normalized configured DEFAULT_MODEL, used as the preselected
+  // model for new chats instead of blindly taking models[0] (which, with only a
+  // Neuralwatt key, used to be a non-routable bare NanoGPT placeholder).
+  const [defaultModelId, setDefaultModelId] = useState<string>("");
   const [chats, setChats] = useState<ChatListItem[]>([]);
   const [activeChat, setActiveChat] = useState<ChatDetail | null>(null);
   const [messageInput, setMessageInput] = useState("");
@@ -453,22 +457,24 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
           router.replace("/login");
           return;
         }
-        const [{ models: modelRows }, { chats: chatRows }] = await Promise.all([
-          apiFetch<{ models: ModelInfo[] }>("/api/models"),
+        const [{ models: modelRows, defaultModel: serverDefaultModel }, { chats: chatRows }] = await Promise.all([
+          apiFetch<{ models: ModelInfo[]; defaultModel?: string }>("/api/models"),
           apiFetch<{ chats: ChatListItem[] }>("/api/chats"),
         ]);
         setModels(modelRows);
+        if (serverDefaultModel) setDefaultModelId(serverDefaultModel);
         setChats(chatRows);
 
+        const pickDefault = serverDefaultModel || modelRows[0]?.id || "";
         const targetId = chatIdFromPath(pathname) ?? initialChatId;
         if (targetId && targetId !== NEW_CHAT_ID) {
           const ok = await openChat(targetId, { skipHistory: true });
           if (!ok) {
             // Unknown chat id — fall back to a fresh new chat.
-            startNewChat(modelRows[0]?.id, { skipHistory: true, replace: true });
+            startNewChat(pickDefault, { skipHistory: true, replace: true });
           }
         } else {
-          startNewChat(modelRows[0]?.id, { skipHistory: true, replace: true });
+          startNewChat(pickDefault, { skipHistory: true, replace: true });
         }
         interactiveRef.current = true;
       } catch (err) {
@@ -623,7 +629,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     function onKeyDown(e: KeyboardEvent) {
       if (e.ctrlKey && e.key === "n" && !e.shiftKey) {
         e.preventDefault();
-        startNewChat(activeChat?.model ?? models[0]?.id);
+        startNewChat(activeChat?.model ?? (defaultModelId || models[0]?.id));
       }
       if (e.ctrlKey && e.shiftKey && (e.key === "N" || e.key === "n")) {
         e.preventDefault();
@@ -632,7 +638,8 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeChat, models]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeChat, models, defaultModelId]);
 
   // Keep web search in sync with the agent toggle: enabling the agent forces
   // web search on (the agent already has web tools). Only persisted for chats
@@ -690,7 +697,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     return {
       id: NEW_CHAT_ID,
       title: "New chat",
-      model: modelId ?? models[0]?.id ?? "",
+      model: modelId ?? (defaultModelId || models[0]?.id) ?? "",
       webSearchEnabled: false,
       agentModeLocked: null,
       createdAt: now,
@@ -798,7 +805,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     if (remaining.length && chatId === activeChat?.id) {
       await openChat(remaining[0]!.id);
     } else if (chatId === activeChat?.id) {
-      startNewChat(models[0]?.id);
+      startNewChat(defaultModelId || models[0]?.id);
     }
   }
 
@@ -887,7 +894,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
       const usingAgent = agent.isAgentMode;
       try {
         const created = await createChatNow({
-          model: activeChat.model || models[0]?.id,
+          model: activeChat.model || defaultModelId || models[0]?.id,
           // Agent mode always implies web search on (the agent ships web
           // tools). For normal mode, honour the user's toggle from the
           // transient chat.
@@ -1138,7 +1145,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                 onClick={(e) => {
                   if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
                   e.preventDefault();
-                  startNewChat(activeChat?.model ?? models[0]?.id);
+                  startNewChat(activeChat?.model ?? (defaultModelId || models[0]?.id));
                 }}
                 className="inline-flex items-center gap-2 rounded-full bg-teal-400 px-3 py-2 text-xs font-semibold text-slate-900 transition hover:bg-teal-300"
               >

@@ -25,5 +25,13 @@ export async function register() {
     setInterval(() => {
       void cleanupOldWorkspaces().catch(() => {});
     }, 24 * 60 * 60 * 1000);
+
+    // Recover sessions stuck in thinking/executing (e.g. after a worker OOM-
+    // kill) on a periodic interval, not only at boot. resetStuckSessions is
+    // idempotent (only touches thinking/executing rows) so a short interval is
+    // safe and also ensures their workspaces eventually get cleaned up.
+    setInterval(() => {
+      void resetStuckSessions().catch(() => {});
+    }, 5 * 60 * 1000);
   }
 }

@@ -5,6 +5,7 @@ import { createChatForUser, listChatsForUser } from "@/lib/chat-store";
 import { resolveAuthContext } from "@/lib/auth";
 import { requireCsrfHeader } from "@/lib/csrf";
 import { env } from "@/lib/env";
+import { normalizeDefaultModel } from "@/lib/nanogpt";
 
 const createSchema = z.object({
   model: z.string().min(1).max(150).optional(),
@@ -39,7 +40,9 @@ export async function POST(request: Request) {
   const chat = await createChatForUser({
     userId: auth.userId,
     userKey: auth.userKey,
-    model: parsed.data.model ?? env.DEFAULT_MODEL,
+    // Normalize whichever model the client picked (or the configured default)
+    // so a bare Neuralwatt default name routes to the Neuralwatt provider.
+    model: normalizeDefaultModel(parsed.data.model ?? env.DEFAULT_MODEL),
     webSearchEnabled: parsed.data.webSearchEnabled ?? false,
     title: parsed.data.title,
   });

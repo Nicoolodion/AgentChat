@@ -10,17 +10,9 @@
 import { env } from "@/lib/env";
 
 const SANDBOX_BASE_URL =
-  process.env.AGENT_SANDBOX_URL ?? "http://127.0.0.1:18080";
+  process.env.AGENT_SANDBOX_URL ?? "http://127.0.0.1:8080";
 
 const DEFAULT_TIMEOUT = 30_000;
-const SANDBOX_HEALTH_TIMEOUT = 5_000;
-const SANDBOX_UNAVAILABLE_RESULT = {
-  stdout: "",
-  stderr: "Sandbox is unavailable. Please try again later.",
-  images: [],
-  error: "Sandbox container is unreachable. Agent features are unavailable.",
-  execution_time_ms: 0,
-};
 
 // ── Low-level helpers ────────────────────────────────────────────────────────
 
@@ -423,8 +415,7 @@ export type SandboxDocxReadResult = {
 export async function sandboxDocxRead(
   sessionId: string,
   filePath: string,
-  includeImages = true,
-  maxImageWidth = 800
+  includeImages = true
 ): Promise<SandboxDocxReadResult> {
   const res = (await sandboxFetch("/docx/read", {
     method: "POST",
@@ -432,7 +423,6 @@ export async function sandboxDocxRead(
       path: filePath,
       session_id: sessionId,
       include_images: includeImages,
-      max_image_width: maxImageWidth,
     }),
     timeout: 60_000,
   })) as SandboxDocxReadResult;
@@ -547,6 +537,10 @@ export type SandboxPptxRunResult = {
   size?: number;
   output_dir?: string;
   images?: string[];
+  /** Set when the run hit the timeout wall instead of finishing. */
+  timed_out?: boolean;
+  /** Human-readable error summary (present on timeouts and setup failures). */
+  error?: string;
 };
 
 /**
@@ -571,6 +565,98 @@ export async function sandboxPptxRun(
     timeout: 310_000,
   })) as SandboxPptxRunResult;
   return res;
+}
+
+/**
+ * Streaming variant of `sandboxPptxRun`. Forwards stdout/stderr lines as they
+ * happen via `onChunk` (mirroring `sandboxExecPythonStream`), then resolves to
+ * the final structured result — which carries the full stdout/stderr even on a
+ * non-zero exit code (the sandbox route returns a structured result, not an
+ * HTTP error, for failed runs so the logs are never lost).
+ */
+export async function sandboxPptxRunStream(
+  sessionId: string,
+  action: "check" | "convert" | "screenshot",
+  params: { input_path: string; output_path?: string; pages?: string },
+  onChunk: (stream: "stdout" | "stderr", text: string) => void
+): Promise<SandboxPptxRunResult> {
+  const url = `${SANDBOX_BASE_URL}/pptx/run/stream`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 330_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        session_id: sessionId,
+        input_path: params.input_path,
+        output_path: params.output_path ?? "",
+        pages: params.pages ?? "",
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body) {
+      // Fall back to the non-streaming endpoint on any error, forwarding its
+      // captured output as a single chunk so nothing is lost.
+      const r = await sandboxPptxRun(sessionId, action, params);
+      if (r.stdout) onChunk("stdout", r.stdout);
+      if (r.stderr) onChunk("stderr", r.stderr);
+      return r;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: SandboxPptxRunResult | null = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        let evt: { t?: string; s?: string; data?: SandboxPptxRunResult; error?: string };
+        try {
+          evt = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (evt.t === "stdout" && typeof evt.s === "string") {
+          onChunk("stdout", evt.s);
+        } else if (evt.t === "stderr" && typeof evt.s === "string") {
+          onChunk("stderr", evt.s);
+        } else if (evt.t === "result") {
+          result = evt.data ?? null;
+        }
+      }
+    }
+    if (result) return result;
+    // No result record arrived — fall back.
+    return await sandboxPptxRun(sessionId, action, params);
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return {
+        action,
+        exit_code: -1,
+        stdout: "",
+        stderr: "",
+        duration_ms: 330_000,
+        error: "pptx action timed out",
+      };
+    }
+    try {
+      const r = await sandboxPptxRun(sessionId, action, params);
+      if (r.stdout) onChunk("stdout", r.stdout);
+      if (r.stderr) onChunk("stderr", r.stderr);
+      return r;
+    } catch {
+      throw err;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── OCR (PaddleOCR-VL via llama.cpp) ─────────────────────────────────────────

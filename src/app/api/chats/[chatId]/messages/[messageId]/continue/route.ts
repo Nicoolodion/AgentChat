@@ -21,7 +21,7 @@ function sendSseEvent(controller: ReadableStreamDefaultController, event: string
       try { controller.enqueue(encoded); } catch { /* stream closed */ }
     });
   } else {
-    controller.enqueue(encoded);
+    try { controller.enqueue(encoded); } catch { /* controller closed — ignore */ }
   }
 }
 
