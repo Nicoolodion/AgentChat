@@ -37,17 +37,37 @@ async function sandboxFetch<T = unknown>(
     });
     clearTimeout(timer);
 
+    // Always read the raw body so the real failure cause (an HTML 500 crash
+    // page, a reverse-proxy error envelope, an empty body, a partial HTML
+    // document) is surfaced to the model and operator instead of being
+    // discarded behind an opaque "non-JSON response" literal. This is the
+    // shared path for every sandbox tool, so every tool benefits.
+    const rawText = await res.text();
+
     let body: Record<string, unknown>;
-    try {
-      body = (await res.json()) as Record<string, unknown>;
-    } catch (parseErr) {
-      if (!res.ok) {
-        throw new SandboxError(`sandbox ${res.status} (non-JSON response)`, res.status);
+    if (rawText.trim().length > 0) {
+      try {
+        body = JSON.parse(rawText) as Record<string, unknown>;
+      } catch (parseErr) {
+        const snippet = rawText.replace(/\s+/g, " ").trim().slice(0, 800);
+        if (!res.ok) {
+          throw new SandboxError(
+            `sandbox ${res.status} (non-JSON response): ${snippet}`,
+            res.status,
+          );
+        }
+        throw new SandboxError(
+          `Failed to parse sandbox response from ${path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} — body: ${snippet}`,
+          502,
+        );
       }
-      throw new SandboxError(
-        `Failed to parse sandbox response from ${path}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
-        502,
-      );
+    } else {
+      // Empty body: still treat as an error when the status is not OK so the
+      // caller sees a clear, actionable message.
+      if (!res.ok) {
+        throw new SandboxError(`sandbox ${res.status} (empty response)`, res.status);
+      }
+      body = {} as Record<string, unknown>;
     }
 
     if (!res.ok) {
@@ -165,11 +185,32 @@ export async function sandboxExecPythonStream(
       signal: controller.signal,
     });
     if (!res.ok || !res.body) {
+      // Capture the stream endpoint's error body so the real failure (HTML
+      // 500 crash page, proxy error, empty body) is surfaced instead of
+      // discarded behind the silent non-streaming fallback below.
+      let streamErr: string | undefined;
+      if (!res.ok) {
+        try {
+          streamErr = (await res.text()).replace(/\s+/g, " ").trim().slice(0, 800);
+        } catch {
+          streamErr = undefined;
+        }
+      }
       // Fall back to non-streaming execution on any error.
-      const r = await sandboxExecPython(sessionId, code, timeout);
-      if (r.stdout) onChunk("stdout", r.stdout);
-      if (r.stderr) onChunk("stderr", r.stderr);
-      return r;
+      try {
+        const r = await sandboxExecPython(sessionId, code, timeout);
+        if (r.stdout) onChunk("stdout", r.stdout);
+        if (r.stderr) onChunk("stderr", r.stderr);
+        return r;
+      } catch (fbErr) {
+        if (streamErr) {
+          throw new SandboxError(
+            `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+            res.status,
+          );
+        }
+        throw fbErr;
+      }
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -597,12 +638,33 @@ export async function sandboxPptxRunStream(
       signal: controller.signal,
     });
     if (!res.ok || !res.body) {
+      // Capture the stream endpoint's error body so the real failure (HTML
+      // 500 crash page, proxy error, empty body) is surfaced instead of
+      // discarded behind the silent non-streaming fallback below.
+      let streamErr: string | undefined;
+      if (!res.ok) {
+        try {
+          streamErr = (await res.text()).replace(/\s+/g, " ").trim().slice(0, 800);
+        } catch {
+          streamErr = undefined;
+        }
+      }
       // Fall back to the non-streaming endpoint on any error, forwarding its
       // captured output as a single chunk so nothing is lost.
-      const r = await sandboxPptxRun(sessionId, action, params);
-      if (r.stdout) onChunk("stdout", r.stdout);
-      if (r.stderr) onChunk("stderr", r.stderr);
-      return r;
+      try {
+        const r = await sandboxPptxRun(sessionId, action, params);
+        if (r.stdout) onChunk("stdout", r.stdout);
+        if (r.stderr) onChunk("stderr", r.stderr);
+        return r;
+      } catch (fbErr) {
+        if (streamErr) {
+          throw new SandboxError(
+            `sandbox stream ${res.status}: ${streamErr || "(empty body)"}`,
+            res.status,
+          );
+        }
+        throw fbErr;
+      }
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

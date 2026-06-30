@@ -1860,9 +1860,48 @@ def pptx_run_stream():
 
         th = _t.Thread(target=worker, daemon=True)
         th.start()
+        gen_start = time.time()
+        # Overall guard slightly above the worker's 300s exec timeout so the
+        # generator can never loop forever, but is allowed to wait well past a
+        # single silent window. The previous code used ``out_q.get(timeout=330)``
+        # which raised an uncaught ``queue.Empty`` whenever kimi_pptd stayed
+        # silent for 330s (a long render/check with no stdout line and the
+        # result not yet produced). That exception escaped the WSGI generator,
+        # Flask returned an HTML 500 page, and the app surfaced it as
+        # "sandbox 500 (non-JSON response)" — breaking pptx_check/pptx_render.
+        # Now we swallow the per-window Empty and keep waiting for the worker's
+        # result record (which is always emitted, even on timeout/error).
+        overall_deadline = gen_start + 330
         try:
             while True:
-                item = out_q.get(timeout=330)
+                now = time.time()
+                remaining = overall_deadline - now
+                if remaining <= 0:
+                    # Safety net: the worker should already have emitted a
+                    # result by now (its exec timeout is 300s). If it somehow
+                    # didn't, emit a timeout result instead of crashing.
+                    yield json.dumps({"t": "result", "data": {
+                        "action": action, "exit_code": -1, "stdout": "", "stderr": "",
+                        "duration_ms": int((time.time() - gen_start) * 1000),
+                        "timed_out": True,
+                        "error": f"kimi_pptd {action} stream timed out",
+                    }}) + "\n"
+                    break
+                try:
+                    item = out_q.get(timeout=min(remaining, 30))
+                except _q.Empty:
+                    # No item within this window: keep waiting for the worker
+                    # (which has its own 300s exec timeout) rather than dying
+                    # with an unhandled queue.Empty -> HTML 500.
+                    if not th.is_alive():
+                        # Worker exited without producing a usable item — stop.
+                        yield json.dumps({"t": "result", "data": {
+                            "action": action, "exit_code": -1, "stdout": "", "stderr": "",
+                            "duration_ms": int((time.time() - gen_start) * 1000),
+                            "error": f"kimi_pptd {action} worker exited unexpectedly",
+                        }}) + "\n"
+                        break
+                    continue
                 yield json.dumps(item) + "\n"
                 if item.get("t") == "result":
                     break
