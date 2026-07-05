@@ -209,8 +209,21 @@ function ToolStep({
   isStreaming: boolean;
 }) {
   const [open, setOpen] = useState(call.status !== "success" || outputs.length > 0);
+  const [showFull, setShowFull] = useState(false);
   const status = call.status;
   const label = toolCallLabel(call.toolName, args);
+
+  // Tool output can be enormous (e.g. a loop printing 100k numbers). Rendering
+  // every chunk as its own <pre> blew up the DOM and froze the UI, so combine
+  // the chunks into one string and truncate the rendered preview — the full
+  // output is still available behind a toggle and in the exported JSON.
+  const MAX_OUTPUT_CHARS = 50_000;
+  const fullOutput = useMemo(
+    () => outputs.map((o) => o.output).join("\n"),
+    [outputs],
+  );
+  const outputTruncated = fullOutput.length > MAX_OUTPUT_CHARS;
+  const displayOutput = showFull || !outputTruncated ? fullOutput : fullOutput.slice(0, MAX_OUTPUT_CHARS);
 
   return (
     <div
@@ -267,14 +280,24 @@ function ToolStep({
               <span>{isStreaming ? "Executing…" : "Waiting for output…"}</span>
             </div>
           )}
-          {outputs.map((o, i) => (
-            <pre
-              key={`${o.toolCallId}-${i}`}
-              className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded bg-slate-950/60 p-2 font-mono text-[10px] leading-relaxed text-slate-300"
-            >
-              {o.output}
-            </pre>
-          ))}
+          {outputs.length > 0 && (
+            <div className="mt-1">
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded bg-slate-950/60 p-2 font-mono text-[10px] leading-relaxed text-slate-300">
+                {displayOutput}
+              </pre>
+              {outputTruncated && (
+                <button
+                  type="button"
+                  onClick={() => setShowFull((v) => !v)}
+                  className="mt-1 text-[10px] text-teal-300 underline underline-offset-2 hover:text-teal-200"
+                >
+                  {showFull
+                    ? "Hide full output"
+                    : `Show full output (${fullOutput.length.toLocaleString()} chars, truncated for performance)`}
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

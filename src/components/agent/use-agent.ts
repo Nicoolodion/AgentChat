@@ -459,6 +459,27 @@ export function useAgent(chatId: string | undefined) {
   // Auto-restore agent mode on mount / chatId change
   useEffect(() => {
     if (!chatId || restoringRef.current) return;
+
+    // A transient "new chat" is never persisted, so /api/chats/new-chat would
+    // 404. Reset to a fresh unlocked state (this is also what unlocks the
+    // toggle when the user clicks "New" mid-conversation).
+    if (chatId === NEW_CHAT_ID) {
+      setState((s) => ({
+        ...s,
+        isAgentMode: false,
+        modeLocked: false,
+        sidebarOpen: false,
+        isInitializing: false,
+        isExecuting: false,
+        currentStep: null,
+        agentSession: null,
+        terminalEntries: [],
+        artifacts: [],
+        error: null,
+      }));
+      return;
+    }
+
     restoringRef.current = true;
 
     fetch(`/api/chats/${chatId}`)
@@ -693,10 +714,22 @@ function handleSseEvent(
       break;
     }
     case "done": {
+      const typed = data as {
+        artifacts?: AgentArtifact[];
+        session?: { id?: string; status?: string };
+      };
       setState((s) => ({
         ...s,
         isExecuting: false,
         currentStep: null,
+        // The terminal `done` event carries the authoritative artifacts list
+        // (and the final session row), so replace — not append — to avoid
+        // duplicates when individual `artifact` events were already forwarded.
+        artifacts: typed.artifacts ?? s.artifacts,
+        agentSession:
+          typed.session && s.agentSession
+            ? { ...s.agentSession, status: (typed.session.status as AgentSession["status"]) ?? s.agentSession.status }
+            : s.agentSession,
       }));
       break;
     }

@@ -371,6 +371,9 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   // Active agent runs in OTHER chats (so the sidebar can badge them). Polled
   // every few seconds while the tab is visible.
   const [activeRunChats, setActiveRunChats] = useState<Record<string, { title: string; status: string }>>({});
+  // Ref mirror so the polling effect (mounted once) can read the latest value
+  // without re-subscribing on every change and stacking intervals.
+  const activeRunChatsRef = useRef<Record<string, { title: string; status: string }>>({});
 
   const modelDropdownRef = useRef<HTMLDivElement | null>(null);
   const modelSearchRef = useRef<HTMLInputElement | null>(null);
@@ -508,9 +511,11 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
 
   // Poll for actively-running agent sessions across all of the user's chats so
   // the sidebar can badge chats that are still executing (e.g. in another tab).
-  // Paused while the tab is hidden to avoid wasted requests.
+  // Paused while the tab is hidden, and backs off to a slow cadence when there
+  // are no active runs (instead of hammering the endpoint at a fixed 5s forever).
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     async function pollActiveRuns() {
       if (typeof document !== "undefined" && document.hidden) return;
       try {
@@ -520,18 +525,29 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
         if (cancelled) return;
         const map: Record<string, { title: string; status: string }> = {};
         for (const s of data.sessions ?? []) map[s.chatId] = { title: s.title, status: s.status };
+        activeRunChatsRef.current = map;
         setActiveRunChats(map);
       } catch {
         // ignore — best-effort indicator
       }
     }
+    function scheduleNext() {
+      if (cancelled) return;
+      // Fast while there are active runs to watch; idle otherwise.
+      const hasActive = Object.keys(activeRunChatsRef.current).length > 0;
+      const delay = hasActive ? 4000 : 30000;
+      timer = setTimeout(async () => {
+        await pollActiveRuns();
+        scheduleNext();
+      }, delay);
+    }
     void pollActiveRuns();
-    const id = setInterval(pollActiveRuns, 5000);
-    const onVis = () => { if (!document.hidden) void pollActiveRuns(); };
+    scheduleNext();
+    const onVis = () => { if (!document.hidden) { void pollActiveRuns(); } };
     document.addEventListener("visibilitychange", onVis);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
@@ -1009,15 +1025,31 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
 
   function exportChat(format: "json" | "markdown") {
     if (!activeChat) return;
+    // The live message list (stream.messages) is always more up-to-date than
+    // activeChat.messages — the latter is only refreshed on chat load, so right
+    // after a send (before any page refresh) it would still be empty/stale.
+    // Merge the live messages + agent session into the exported payload so the
+    // JSON reflects the conversation the user actually sees.
+    const liveSession =
+      agent.agentSession
+        ? { id: agent.agentSession.id, status: agent.agentSession.status }
+        : activeChat.agentSession;
+    const exportPayload = {
+      ...activeChat,
+      messages: stream.messages,
+      agentSession: liveSession,
+      artifacts: agent.artifacts,
+      updatedAt: new Date().toISOString(),
+    };
     let content: string;
     let filename: string;
     if (format === "json") {
-      // activeChat.messages[].toolCalls now carry arguments + output, so the
-      // exported JSON is a faithful record of the whole conversation.
-      content = JSON.stringify(activeChat, null, 2);
-      filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.json`;
+      // messages[].toolCalls now carry arguments + output, so the exported
+      // JSON is a faithful record of the whole conversation.
+      content = JSON.stringify(exportPayload, null, 2);
+      filename = `${exportPayload.title.replace(/[^a-zA-Z0-9]/g, "_")}.json`;
     } else {
-      const lines = activeChat.messages.map((m) => {
+      const lines = exportPayload.messages.map((m) => {
         const role = m.role === "user" ? "**You**" : m.role === "assistant" ? "**Assistant**" : m.role;
         let body = m.content;
         const toolCalls = m.toolCalls ?? [];
@@ -1035,8 +1067,8 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
         }
         return `${role}:\n${body}`;
       });
-      content = `# ${activeChat.title}\n\n${lines.join("\n\n---\n\n")}`;
-      filename = `${activeChat.title.replace(/[^a-zA-Z0-9]/g, "_")}.md`;
+      content = `# ${exportPayload.title}\n\n${lines.join("\n\n---\n\n")}`;
+      filename = `${exportPayload.title.replace(/[^a-zA-Z0-9]/g, "_")}.md`;
     }
     const blob = new Blob([content], { type: format === "json" ? "application/json" : "text/markdown" });
     const url = URL.createObjectURL(blob);
@@ -1446,7 +1478,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
 
             <div className="flex items-center gap-2">
               <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-300">
-                Context: {activeModelInfo?.contextLength?.toLocaleString() ?? "unknown"}
+                Context: {activeModelInfo?.contextLength ? formatContext(activeModelInfo.contextLength) : "unknown"}
               </div>
               <button
                 onClick={() => exportChat("json")}
@@ -1844,8 +1876,13 @@ function forwardAgentEvent(
       return { event: "status", data };
     case "error":
       return { event: "error", data };
+    // `artifact` events are emitted by the orchestrator as files are created,
+    // and the terminal `done` event carries a full artifacts[] array. Without
+    // forwarding these, the Artifacts panel stays empty until a page refresh.
+    case "artifact":
+      return { event: "artifact", data };
     case "done":
-      return null;
+      return { event: "done", data };
     default:
       return null;
   }

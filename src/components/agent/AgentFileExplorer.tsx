@@ -15,8 +15,10 @@ import {
   Download,
   Eye,
   ArrowUp,
+  EyeOff,
 } from "lucide-react";
 import type { SandboxFileInfo } from "@/lib/agent/types";
+import { cn } from "@/lib/ui";
 
 export function AgentFileExplorer({
   sessionId,
@@ -30,6 +32,10 @@ export function AgentFileExplorer({
   const [expanded, setExpanded] = useState<Set<string>>(new Set(["/"]));
   const [currentPath, setCurrentPath] = useState("/");
   const [hoveredFile, setHoveredFile] = useState<string | null>(null);
+  // Internal working dirs/files (e.g. .home, .docx-work, .session_images,
+  // .session_state.pkl, .iso_migrated) are hidden by default to keep the tree
+  // focused on user-relevant output. "Advanced" reveals them.
+  const [showHidden, setShowHidden] = useState(false);
 
   const loadFiles = useCallback(
     async (path: string) => {
@@ -159,6 +165,12 @@ export function AgentFileExplorer({
 
   const currentFiles = tree.get(currentPath) ?? [];
 
+  // Hide internal/dotfile entries at the workspace root unless "Advanced" is on.
+  const visibleFiles =
+    showHidden || currentPath !== "/"
+      ? currentFiles
+      : currentFiles.filter((f) => !f.name.startsWith("."));
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
@@ -182,6 +194,18 @@ export function AgentFileExplorer({
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
+          {currentPath === "/" && (
+            <button
+              onClick={() => setShowHidden((v) => !v)}
+              className={cn(
+                "rounded p-1 transition hover:bg-white/10",
+                showHidden ? "text-slate-200" : "text-slate-400 hover:text-white",
+              )}
+              title={showHidden ? "Hide internal files" : "Show internal files (Advanced)"}
+            >
+              {showHidden ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+            </button>
+          )}
           <label className="cursor-pointer rounded p-1 text-slate-400 transition hover:bg-white/10 hover:text-white">
             <Upload className="h-3.5 w-3.5" />
             <input type="file" multiple className="hidden" onChange={handleUpload} />
@@ -190,7 +214,7 @@ export function AgentFileExplorer({
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 py-2">
-        {currentFiles.length === 0 && !loadingPaths.has(currentPath) && (
+        {visibleFiles.length === 0 && !loadingPaths.has(currentPath) && (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-slate-500">
             <FolderOpen className="h-6 w-6" />
             <p className="text-xs">Workspace is empty</p>
@@ -198,7 +222,7 @@ export function AgentFileExplorer({
           </div>
         )}
 
-        {currentFiles.map((file) => {
+        {visibleFiles.map((file) => {
           const isOpen = expanded.has(file.path);
           const Icon = getIcon(file, isOpen);
           return (

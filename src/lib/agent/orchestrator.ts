@@ -1544,10 +1544,18 @@ print(json.dumps({"results": results[:max_results], "error": error}))
         parsed = JSON.parse(lastLine);
       } catch { /* ignore parse error */ }
       const results = Array.isArray(parsed.results) ? parsed.results : [];
-      const stdout = JSON.stringify(results, null, 2);
+      // SearXNG sometimes returns an empty result set when its upstream
+      // engines rate-limit / block it — not an error, just nothing. Surface a
+      // clear hint so the model knows search is currently unreliable and should
+      // fall back to web_fetch / a more specific URL instead of retrying blindly.
+      const emptyHint =
+        results.length === 0 && !parsed.error && !res.error && !!searxngUrl
+          ? "Search returned no results (the search backend may be temporarily rate-limited or blocked). Try web_fetch against a specific URL, or rephrase the query."
+          : undefined;
+      const stdout = results.length > 0 ? JSON.stringify(results, null, 2) : JSON.stringify(emptyHint ? { note: emptyHint, results: [] } : results);
       return {
         ok: !res.error && !parsed.error,
-        result: { results, error: parsed.error },
+        result: { results, error: parsed.error, note: emptyHint },
         error: parsed.error ?? (res.error || undefined),
         stdout,
       };
