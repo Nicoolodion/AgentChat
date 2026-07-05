@@ -63,6 +63,7 @@ import {
   sandboxPptxRunStream,
   sandboxWebRender,
   type SandboxCookie,
+  type SandboxFileEntry,
   sandboxFileDelete,
   sandboxFileList,
   sandboxFileRead,
@@ -1886,51 +1887,61 @@ def is_blocked_host(host):
         return True
     return False
 
-url = ${JSON.stringify(url)}
-output_path = ${JSON.stringify(outputPath)}
-headers = ${JSON.stringify(headers)}
-out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "saved_path": output_path, "filename": os.path.basename(output_path), "error": None}
-try:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        # Re-validate the final (post-redirect) host to block SSRF via redirect.
-        final_url = resp.geturl()
-        out["final_url"] = final_url
-        final_host = urllib.parse.urlparse(final_url).hostname or ""
-        if is_blocked_host(final_host):
-            out["error"] = f"Blocked redirect to private/internal host: {final_host}"
-        else:
-            out["status"] = resp.status
-            out["content_type"] = resp.headers.get("Content-Type", "") or ""
-            # Honor Content-Disposition filename when present. Pattern is kept
-            # free of inner double-quotes so it compiles inside this template.
-            cd = resp.headers.get("Content-Disposition", "") or ""
-            m = re.search(r"filename\\*?=(?:UTF-8'')?([^;]+)", cd, re.I)
-            if m:
-                name = m.group(1).strip().strip('"').strip()
-                if name:
-                    out["filename"] = urllib.parse.unquote(name)
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            # Stream straight to disk (chunked) so large downloads don't exhaust
-            # memory; the exec timeout wrapper caps the overall run.
-            with open(output_path, "wb") as f:
-                shutil.copyfileobj(resp, f, length=64 * 1024)
-            out["saved_path"] = output_path
-            # Report the ACTUAL on-disk size: an in-memory byte count can be
-            # wrong on a partially-flushed or empty body, and an empty file is
-            # almost never an intentional success — surface it as an error so the
-            # model knows to retry / use web_fetch instead of trusting a 0-byte
-            # artifact.
-            out["size"] = os.path.getsize(output_path)
-            if out["size"] == 0:
-                cl = resp.headers.get("Content-Length")
-                out["error"] = f"Downloaded 0 bytes (server returned an empty body; Content-Length={cl})"
-except urllib.error.HTTPError as e:
-    out["status"] = e.code
-    out["error"] = f"HTTP Error {e.code}: {e.reason}"
-except Exception as e:
-    out["error"] = f"Download error: {e}"
-out["ok"] = not out["error"]
+# Run inside a function so transient objects (file handle, HTTPResponse,
+# Request) stay LOCAL and can never leak into the persistent IPython globals.
+# The persistent-state wrapper pickles module globals via dill between calls;
+# a leaked "wb" file handle would be REOPENED in truncate mode on the next
+# call's state restore, silently zeroing the just-downloaded file (the real
+# cause of back-to-back web_download losing every file except the last).
+def _run_download():
+    url = ${JSON.stringify(url)}
+    output_path = ${JSON.stringify(outputPath)}
+    headers = ${JSON.stringify(headers)}
+    out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "saved_path": output_path, "filename": os.path.basename(output_path), "error": None}
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            # Re-validate the final (post-redirect) host to block SSRF via redirect.
+            final_url = resp.geturl()
+            out["final_url"] = final_url
+            final_host = urllib.parse.urlparse(final_url).hostname or ""
+            if is_blocked_host(final_host):
+                out["error"] = f"Blocked redirect to private/internal host: {final_host}"
+            else:
+                out["status"] = resp.status
+                out["content_type"] = resp.headers.get("Content-Type", "") or ""
+                # Honor Content-Disposition filename when present. Pattern is kept
+                # free of inner double-quotes so it compiles inside this template.
+                cd = resp.headers.get("Content-Disposition", "") or ""
+                m = re.search(r"filename\\*?=(?:UTF-8'')?([^;]+)", cd, re.I)
+                if m:
+                    name = m.group(1).strip().strip('"').strip()
+                    if name:
+                        out["filename"] = urllib.parse.unquote(name)
+                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                # Stream straight to disk (chunked) so large downloads don't exhaust
+                # memory; the exec timeout wrapper caps the overall run.
+                with open(output_path, "wb") as f:
+                    shutil.copyfileobj(resp, f, length=64 * 1024)
+                out["saved_path"] = output_path
+                # Report the ACTUAL on-disk size: an in-memory byte count can be
+                # wrong on a partially-flushed or empty body, and an empty file is
+                # almost never an intentional success — surface it as an error so
+                # the model knows to retry / use web_fetch instead of trusting a
+                # 0-byte artifact.
+                out["size"] = os.path.getsize(output_path)
+                if out["size"] == 0:
+                    cl = resp.headers.get("Content-Length")
+                    out["error"] = f"Downloaded 0 bytes (server returned an empty body; Content-Length={cl})"
+    except urllib.error.HTTPError as e:
+        out["status"] = e.code
+        out["error"] = f"HTTP Error {e.code}: {e.reason}"
+    except Exception as e:
+        out["error"] = f"Download error: {e}"
+    out["ok"] = not out["error"]
+    return out
+
+out = _run_download()
 print(json.dumps(out))
 `;
       const res = await sandboxExecPython(sessionId, downloadCode, 70);
@@ -2376,19 +2387,43 @@ async function scanForArtifacts(
   sendEvent: (event: AgentSseEvent) => void
 ): Promise<void> {
   // After file write or conversion tools, scan the output directory for new artifacts
-  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_render", "pptx_screenshot", "chart_create", "libreoffice_convert", "shell"].includes(toolName)) return;
+  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_render", "pptx_screenshot", "chart_create", "libreoffice_convert", "shell", "web_download"].includes(toolName)) return;
 
   try {
-    const files = await sandboxFileList(sessionId, "output/");
+    // Walk output/ recursively so files downloaded/generated into
+    // subdirectories (e.g. output/female_moan_sfx/*.mp3) are registered as
+    // artifacts too — the previous top-level-only listing silently dropped
+    // every nested file, which is the common case for web_download.
+    const discovered: SandboxFileEntry[] = [];
+    const stack: string[] = ["output/"];
+    let guard = 0;
+    while (stack.length > 0 && guard++ < 200) {
+      const dir = stack.pop()!;
+      let entries: SandboxFileEntry[];
+      try {
+        entries = await sandboxFileList(sessionId, dir);
+      } catch {
+        continue;
+      }
+      for (const file of entries) {
+        const childRel = dir.endsWith("/") ? `${dir}${file.name}` : `${dir}/${file.name}`;
+        if (file.is_directory) {
+          stack.push(`${childRel}/`);
+        } else {
+          discovered.push({ ...file, path: childRel });
+        }
+      }
+    }
+
     const existingArtifacts = await prisma.agentArtifact.findMany({
       where: { sessionId },
       select: { storagePath: true },
     });
     const existingPaths = new Set(existingArtifacts.map((a) => a.storagePath));
 
-    for (const file of files) {
+    for (const file of discovered) {
       if (file.is_directory) continue;
-      const relativePath = `output/${file.name}`;
+      const relativePath = file.path;
       if (existingPaths.has(relativePath)) continue;
 
       const kind = inferArtifactKind(file.name, file.mime_type);

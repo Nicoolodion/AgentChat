@@ -154,6 +154,24 @@ class FlushingStream:
 sys.stdout = FlushingStream(sys.__stdout__)
 
 import time as _time
+import io as _io
+
+# File-like objects (real files, HTTPResponse, StringIO, ...) must NEVER be
+# persisted across calls: dill records their path + mode and, on the NEXT call's
+# restore, REOPENS the file with that mode. For "w"/"wb" handles that silently
+# truncates the just-written file to 0 bytes — which is exactly why back-to-back
+# web_download (or any tool that opens a file at module scope) lost every file
+# except the last. They are also useless across process boundaries (the
+# underlying fd is gone), so dropping them is strictly safe. io.IOBase is the
+# precise base covered; it does not match arbitrary user objects.
+def _persistable(_v):
+    try:
+        if isinstance(_v, _io.IOBase):
+            return False
+    except Exception:
+        return False
+    return True
+
 start = _time.time()
 try:
     old_stderr = sys.stderr
@@ -177,7 +195,11 @@ try:
             if _k.startswith("__"):
                 continue
             if _k in ("dill", "sys", "os", "io", "json", "base64", "traceback",
-                       "time", "FlushingStream", "real_stdout"):
+                       "time", "FlushingStream", "real_stdout", "_io",
+                       "_persistable"):
+                continue
+            if not _persistable(_v):
+                skipped += 1
                 continue
             try:
                 dill.dumps(_v)
@@ -192,7 +214,11 @@ try:
         for _k, _v in exec_globals.items():
             if _k.startswith("__") or _k in ("sys", "os", "io", "json", "base64",
                                                "traceback", "time", "FlushingStream",
-                                               "real_stdout"):
+                                               "real_stdout", "_io",
+                                               "_persistable"):
+                continue
+            if not _persistable(_v):
+                skipped += 1
                 continue
             try:
                 json.dumps(_v)
