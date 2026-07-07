@@ -63,6 +63,33 @@ const envSchema = z.object({
   // false, the OCR tool is never advertised to the agent (no sandbox probe).
   AGENT_OCR_ENABLED: boolLike.default(true),
   SEARXNG_URL: z.string().optional(),
+
+  // ── Mobile Task Launcher / Email-reply feature ───────────────────────────
+  // Mobile bearer tokens mirror Session TTL by default (7 days).
+  MOBILE_TOKEN_TTL_HOURS: z.coerce.number().int().positive().default(24 * 7),
+  // Title (subject line) model for task emails; defaults to TITLE_MODEL.
+  TASK_TITLE_MODEL: z.string().optional(),
+
+  // Outbound mail (SMTP) — all optional. When MAIL_SMTP_HOST is unset the app
+  // skips the email-completion path entirely (push-only or nothing).
+  MAIL_FROM: z.string().default("agent@nicoolodion.com"),
+  MAIL_SMTP_HOST: z.string().optional(),
+  MAIL_SMTP_PORT: z.coerce.number().int().positive().default(587),
+  MAIL_SMTP_SECURE: boolLike.default(false),
+  MAIL_SMTP_USER: z.string().optional(),
+  MAIL_SMTP_PASS: z.string().optional(),
+
+  // Inbound mail (IMAP poller). Disable with MAIL_INBOUND_ENABLED=false.
+  MAIL_INBOUND_ENABLED: boolLike.default(true),
+  MAIL_INBOX_HOST: z.string().optional(),
+  MAIL_INBOX_PORT: z.coerce.number().int().positive().default(993),
+  MAIL_INBOX_USER: z.string().optional(),
+  MAIL_INBOX_PASS: z.string().optional(),
+  MAIL_INBOX_POLL_SECONDS: z.coerce.number().int().positive().default(30),
+
+  // Push (self-hosted ntfy / UnifiedPush). No Firebase.
+  NTFY_BASE_URL: z.string().optional(),
+  NTFY_DEFAULT_AUTH: z.string().optional(),
 });
 
 export const env = envSchema.parse({
@@ -93,4 +120,20 @@ export const env = envSchema.parse({
   AGENT_VISION_FALLBACK_MODEL: process.env.AGENT_VISION_FALLBACK_MODEL,
   AGENT_OCR_ENABLED: process.env.AGENT_OCR_ENABLED,
   SEARXNG_URL: process.env.SEARXNG_URL,
+  MOBILE_TOKEN_TTL_HOURS: process.env.MOBILE_TOKEN_TTL_HOURS,
+  TASK_TITLE_MODEL: process.env.TASK_TITLE_MODEL,
+  MAIL_FROM: process.env.MAIL_FROM,
+  MAIL_SMTP_HOST: process.env.MAIL_SMTP_HOST,
+  MAIL_SMTP_PORT: process.env.MAIL_SMTP_PORT,
+  MAIL_SMTP_SECURE: process.env.MAIL_SMTP_SECURE,
+  MAIL_SMTP_USER: process.env.MAIL_SMTP_USER,
+  MAIL_SMTP_PASS: process.env.MAIL_SMTP_PASS,
+  MAIL_INBOUND_ENABLED: process.env.MAIL_INBOUND_ENABLED,
+  MAIL_INBOX_HOST: process.env.MAIL_INBOX_HOST,
+  MAIL_INBOX_PORT: process.env.MAIL_INBOX_PORT,
+  MAIL_INBOX_USER: process.env.MAIL_INBOX_USER,
+  MAIL_INBOX_PASS: process.env.MAIL_INBOX_PASS,
+  MAIL_INBOX_POLL_SECONDS: process.env.MAIL_INBOX_POLL_SECONDS,
+  NTFY_BASE_URL: process.env.NTFY_BASE_URL,
+  NTFY_DEFAULT_AUTH: process.env.NTFY_DEFAULT_AUTH,
 });

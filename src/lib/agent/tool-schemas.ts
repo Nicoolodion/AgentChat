@@ -487,6 +487,27 @@ export const AGENT_TOOL_SCHEMAS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "send_email",
+      description: "Send an email to the user (or a specified address) with optional file attachments. Use this when the user asks to receive something by email (e.g. 'schick es mir per email'). Defaults the recipient to the user's verified email. Attachments are workspace paths (e.g. 'output/report.pdf') copied into the outbound MIME. Does NOT run in the sandbox — executes server-side with the configured SMTP credentials. If the user has no verified email yet, the tool returns an error; tell them to set one up in the app Settings. NOTE: if this task was started FROM an email reply, a completion email will already be sent automatically at the end of the run — do NOT call send_email in that case (it would double-mail).",
+      parameters: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Recipient email. Omit to send to the user's verified email." },
+          subject: { type: "string", description: "Email subject line. Omit to derive from the task." },
+          body: { type: "string", description: "Plain text body. Omit to derive from the task result." },
+          html: { type: "string", description: "Optional HTML body. Overrides plain-text rendering when set." },
+          attachments: {
+            type: "array",
+            items: { type: "string" },
+            description: "Workspace-relative file paths to attach (e.g. ['output/report.pdf']).",
+          },
+        },
+      },
+    },
+  },
 ];
 
 export const SKILL_EXTENSIONS: Record<string, string> = {
@@ -615,6 +636,9 @@ Think step-by-step. When you need to act, use a tool. After receiving tool resul
 - todo_read() — read current todo list
 - todo_update(mark_done?, mark_pending?, add?, remove?) — modify an existing list incrementally by 1-based index (as shown by todo_read). Check off items as you complete them, reopen, append, or remove items. Prefer this over todo_create whenever a list already exists.
 
+### Communication
+- send_email(to?, subject?, body?, html?, attachments?) — email the user (or a specified address) with optional workspace-file attachments. Use when the user asks to receive something by email ("schick es mir per Email"). Defaults the recipient to the user's verified email. If this run started from an email reply, the system already auto-sends a completion email — do NOT call send_email then (would double-mail).
+
 ## Skills
 Skills are mounted at /app/skills/ and provide domain expertise for document generation tasks. The relevant SKILL.md content for your task is automatically injected below when applicable.
 - /app/skills/docx/ — Word documents (C# + OpenXML SDK creation, WIR editing)
@@ -630,7 +654,13 @@ If you need a skill not included below, use file_read with the path /app/skills/
 - If a step fails, retry with a different approach or ask the user.
 - For document generation, the relevant SKILL.md has been included — follow its routing rules and quality standards.`;
 
-export function buildSystemPrompt(skillContent?: Map<string, string>): string {
+export function buildSystemPrompt(
+  skillContent?: Map<string, string>,
+  context?: {
+    taskSource?: "mobile" | "email" | "desktop";
+    userProfile?: { country?: string | null; language?: string | null; timezone?: string | null };
+  },
+): string {
   let prompt = AGENT_SYSTEM_PROMPT_BASE;
 
   prompt += `\n\nCurrent date/time: ${new Date().toISOString()}`;
@@ -641,6 +671,30 @@ export function buildSystemPrompt(skillContent?: Map<string, string>): string {
       sections.push(`## Skill: ${skillName}\n\n${content}`);
     }
     prompt += `\n\n---\n\n# Auto-Loaded Skill Instructions\n\nThe following skill instructions were automatically loaded based on the files in the upload/ directory. Follow these rules without needing to read them again:\n\n${sections.join("\n\n")}`;
+  }
+
+  // Source-aware guidance for email tasks: the system auto-sends a completion
+  // email at the end of the run, so the agent must NOT also call send_email
+  // (would double-mail). Only applies when this run was started from email.
+  if (context?.taskSource) {
+    const sourceNote =
+      context.taskSource === "email"
+        ? "This task was started from an email reply. A completion email with the final answer and artifacts will be sent automatically by the system at the end of this run — do NOT call send_email mid-run (it would double-mail the user)."
+        : `This task was started via ${context.taskSource}. send_email is available if the user asks to receive something by email; otherwise no email is auto-sent.`;
+    prompt += `\n\n---\n\n# Task Source\n\n${sourceNote}`;
+  }
+
+  // Country / locale inference (Phase E): helps the agent resolve ambiguous
+  // regional requests ("current polls", "last election") to the user's locale.
+  if (context?.userProfile && (context.userProfile.country || context.userProfile.language)) {
+    const country = context.userProfile.country ?? "unknown";
+    const language = context.userProfile.language ?? "unknown";
+    const tz = context.userProfile.timezone ?? "unknown";
+    prompt +=
+      `\n\n---\n\n# User Context\n\n` +
+      `The user is in ${country} (${language}), timezone ${tz}. ` +
+      `When a request is ambiguous about country/region (e.g. "current polls", "last election", "news", "salary"), ` +
+      `assume ${country} unless the message explicitly says otherwise.`;
   }
 
   return prompt;

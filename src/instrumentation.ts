@@ -22,6 +22,16 @@ export async function register() {
       }
     });
 
+    // Wire up the task-completion notify dispatcher (email + ntfy) so finished
+    // mobile/email tasks dispatch their notifications.
+    const { registerNotifyDispatcher } = await import("@/lib/notify");
+    registerNotifyDispatcher();
+
+    // Start the IMAP inbound poller (email-reply loop). Self-gating: if
+    // MAIL_INBOUND_ENABLED=false or IMAP creds are absent, it stays idle.
+    const { startMailboxPoller } = await import("@/lib/mailbox");
+    startMailboxPoller();
+
     setInterval(() => {
       void cleanupOldWorkspaces().catch(() => {});
     }, 24 * 60 * 60 * 1000);

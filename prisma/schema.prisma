@@ -18,6 +18,10 @@ model User {
   sessions          Session[]
   chats             Chat[]
   agentSessions     AgentSession[]
+  emails            UserEmail[]
+  mobileTokens      UserMobileToken[]
+  mobileTasks       MobileTask[]
+  profile           UserProfile?
 }
 
 model Session {
@@ -46,6 +50,7 @@ model Chat {
   user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages          Message[]
   agentSession      AgentSession?
+  mobileTasks       MobileTask[]
 
   @@index([userId, updatedAt])
 }
@@ -91,6 +96,7 @@ model AgentSession {
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   toolCalls      AgentToolCall[]
   artifacts      AgentArtifact[]
+  mobileTasks    MobileTask[]
 
   @@index([userId])
   @@index([chatId])
@@ -135,4 +141,67 @@ model RateLimitBucket {
   key      String   @id
   count    Int      @default(0)
   resetAt  DateTime
+}
+
+// ── Mobile Task Launcher / Email-reply feature ───────────────────────────────
+
+model UserEmail {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  address       String    @unique
+  verifiedAt    DateTime?
+  verifyToken   String?
+  createdAt     DateTime  @default(now())
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserMobileToken {
+  id                  String   @id @default(cuid())
+  userId              String
+  tokenHash           String   @unique
+  wrappedUserKeyCipher String
+  installId           String
+  label               String?
+  ntfyTopic           String
+  ntfyAuth            String?
+  lastSeenAt          DateTime @default(now())
+  expiresAt           DateTime
+  createdAt           DateTime @default(now())
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model MobileTask {
+  id                  String    @id @default(cuid())
+  userId              String
+  agentSessionId      String?
+  chatId              String?
+  source              String
+  prompt              String
+  model               String?
+  status              String
+  emailAddress        String?
+  emailMessageId      String?
+  emailThreadId       String?
+  answeredFromDesktop Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+  errorMessage        String?
+  user                User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentSession        AgentSession?   @relation(fields: [agentSessionId], references: [id], onDelete: SetNull)
+  chat                Chat?           @relation(fields: [chatId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([emailThreadId])
+}
+
+model UserProfile {
+  userId    String   @id
+  country   String?
+  language  String?
+  timezone String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

@@ -542,6 +542,7 @@ export async function runAgentExecution(input: {
   signal?: AbortSignal;
   reasoningEffort?: ReasoningEffort;
   modelContextLength?: number;
+  taskSource?: "mobile" | "email" | "desktop";
 }): Promise<{
   content: string;
   reasoning?: string;
@@ -625,6 +626,21 @@ export async function runAgentExecution(input: {
     ) {
       neededSkills.add("pptx");
     }
+    // Email skill: auto-load when the user asks to send/receive something by
+    // email (DE + EN phrasings). Same keyword-trigger pattern as docx/pdf/pptx.
+    if (
+      msgLower.includes("email") ||
+      msgLower.includes("mail") ||
+      msgLower.includes("per mail") ||
+      msgLower.includes("per email") ||
+      msgLower.includes("schick mir") ||
+      msgLower.includes("schicke mir") ||
+      msgLower.includes("send") ||
+      msgLower.includes("sende") ||
+      msgLower.includes("per e-mail")
+    ) {
+      neededSkills.add("email");
+    }
     for (const skill of neededSkills) {
       try {
         const res = await sandboxFileRead(sessionId, `/app/skills/${skill}/SKILL.md`, "utf8");
@@ -633,7 +649,10 @@ export async function runAgentExecution(input: {
     }
   } catch { /* workspace may not have files yet */ }
 
-  const systemPrompt = buildSystemPrompt(skillContent);
+  const systemPrompt = buildSystemPrompt(skillContent, {
+    taskSource: input.taskSource,
+    userProfile: await loadUserProfileSafe(input.sessionId),
+  });
 
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: systemPrompt },
@@ -2303,6 +2322,102 @@ print(json.dumps(out))
         stdout: `${summary}\n${newContent}`,
       };
     }
+    case "send_email": {
+      // Server-side dispatch (NOT the sandbox — it has no SMTP creds and a
+      // read-only rootfs). Resolves the task's userId from the session, defaults
+      // the recipient to the user's verified email, loads attachment bytes
+      // host-side from the workspace, and sends via the mail module.
+      try {
+        const { sendMail } = await import("@/lib/mail/send-mail");
+        const { taskMessageId: taskEmailMessageId } = await import("@/lib/mail/render-task-email");
+        const { resolveHostWorkspaceFile } = await import("@/lib/agent/workspace");
+        const { readFile } = await import("node:fs/promises");
+        const { mailOutboundReady } = await import("@/lib/feature-flags");
+        if (!mailOutboundReady()) {
+          return {
+            ok: false,
+            error: "Email is not configured on the server (MAIL_SMTP_HOST missing). Tell the user email delivery is unavailable.",
+          };
+        }
+        const session = await prisma.agentSession.findUnique({
+          where: { id: sessionId },
+          select: { userId: true },
+        });
+        if (!session) {
+          return { ok: false, error: "Could not resolve task owner for email." };
+        }
+        const userEmail = await prisma.userEmail.findFirst({
+          where: { userId: session.userId, verifiedAt: { not: null } },
+          select: { address: true },
+        });
+        const to = String(args.to ?? "").trim() || userEmail?.address;
+        if (!to) {
+          return {
+            ok: false,
+            error: "No recipient email provided and the user has no verified email. Ask the user to verify an email in the app Settings first.",
+          };
+        }
+        const subject = String(args.subject ?? "").trim() || "From your agent";
+        const body = String(args.body ?? "").trim();
+        const html = String(args.html ?? "").trim() || undefined;
+
+        const attachmentPaths = Array.isArray(args.attachments)
+          ? args.attachments.filter((p): p is string => typeof p === "string" && p.length > 0)
+          : [];
+        const attachments: Array<{ filename: string; content: Buffer; contentType: string }> = [];
+        for (const relPath of attachmentPaths) {
+          try {
+            const absPath = resolveHostWorkspaceFile(sessionId, relPath);
+            const content = await readFile(absPath);
+            attachments.push({
+              filename: relPath.split("/").pop() ?? relPath,
+              content,
+              contentType: "application/octet-stream",
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { ok: false, error: `Could not attach ${relPath}: ${msg}` };
+          }
+        }
+
+        // Threading: if there's a linked MobileTask, reply in its thread.
+        const task = await prisma.mobileTask.findFirst({
+          where: { agentSessionId: sessionId },
+          select: { id: true, emailThreadId: true },
+        });
+        const messageId = task ? taskEmailMessageId(task.id) : undefined;
+
+        const res = await sendMail({
+          to,
+          subject,
+          text: body || "(see attached result)",
+          html,
+          attachments: attachments.map((a) => ({
+            filename: a.filename,
+            content: a.content,
+            contentType: a.contentType,
+          })),
+          messageId,
+          references: task?.emailThreadId ? [task.emailThreadId] : undefined,
+          headers: task ? { "X-Task-Id": task.id } : undefined,
+        });
+
+        if (!res.ok) {
+          return { ok: false, error: `send_email failed: ${res.error ?? "SMTP error"}` };
+        }
+        const attachedSummary = attachments.length
+          ? ` (+${attachments.length} attachment(s))`
+          : "";
+        return {
+          ok: true,
+          result: { to, subject, messageId: res.messageId, attachments: attachments.length },
+          stdout: `Sent email to ${to}: "${subject}"${attachedSummary}`,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `send_email failed: ${msg}` };
+      }
+    }
     default:
       return { ok: false, error: `Unknown tool: ${toolName}` };
   }
@@ -2355,6 +2470,23 @@ async function updateSessionStatus(sessionId: string, status: AgentSessionStatus
     where: { id: sessionId },
     data: { status },
   });
+}
+
+async function loadUserProfileSafe(sessionId: string): Promise<{ country?: string | null; language?: string | null; timezone?: string | null } | undefined> {
+  try {
+    const session = await prisma.agentSession.findUnique({
+      where: { id: sessionId },
+      select: { userId: true },
+    });
+    if (!session) return undefined;
+    const profile = await prisma.userProfile.findUnique({
+      where: { userId: session.userId },
+      select: { country: true, language: true, timezone: true },
+    });
+    return profile ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function createToolCall(sessionId: string, toolName: string, args: string): Promise<{ id: string }> {

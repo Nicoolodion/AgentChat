@@ -92,6 +92,20 @@ export async function POST(
       });
     }
 
+    // ── Desktop suppress path ──────────────────────────────────────────────
+    // The user sent a message from the desktop UI on a chat that has a running
+    // mobile task → flag it so the completion email/push is skipped (they're
+    // already in front of the desktop and would be double-notified). Per-turn
+    // logic (not sticky): the next email-originated reply resumes delivery.
+    await prisma.mobileTask.updateMany({
+      where: {
+        chatId: chat.id,
+        userId: auth.userId,
+        status: { in: ["queued", "running"] },
+      },
+      data: { answeredFromDesktop: true },
+    }).catch(() => undefined);
+
     // ── Agent Mode Routing ─────────────────────────────────────────────────
     if (agentEnabled) {
       return handleAgentMessage({

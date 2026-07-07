@@ -1,0 +1,31 @@
+# ntfy serve config — self-hosted UnifiedPush server.
+# Mounted read-only at /etc/ntfy/server.yml by the `ntfy` compose service.
+#
+# Security model:
+#   - Topics are random-suffixed (user-<userId>-<ic>) and unguessable.
+#   - Subscribing is allowed without a token (security through obscurity of
+#     the random topic suffix, the same model the official ntfy.sh instance uses).
+#   - Publishing requires a bearer token, so only the app server can POST a
+#     completion (the publish token lives on UserMobileToken.ntfyAuth and falls
+#     back to NTFY_DEFAULT_AUTH).
+#
+# The Android distributor (ntfy app) only needs the topic + server URL to
+# subscribe; no token gymnastics on the phone.
+#
+# Docs: https://ntfy.sh/docs/config/
+
+base-url: "https://ntfy.nicoolodion.com"
+listen-http: ":80"
+behind-proxy: true
+
+# Anonymous subscribe OK (topics unguessable); publish requires a token.
+auth-default-access: "read-only"
+auth-file: "/var/lib/ntfy/user.db"
+
+# Set up a publish token after first start (see deploy/mobile-setup.md):
+#   docker exec -it chatinterface-ntfy ntfy user add publisher
+#   docker exec -it chatinterface-ntfy ntfy access '*' publisher write
+# Then put that token's value in NTFY_DEFAULT_AUTH (.env), or per-device on
+# UserMobileToken.ntfyAuth via the /api/mobile/pair response.
+
+keepalive-interval: "45s"

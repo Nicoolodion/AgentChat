@@ -31,6 +31,35 @@ keys). When changing container-related files, keep this in sync:
 Workflow: `.github/workflows/build-and-deploy.yml` (build -> push -> POST to
 webhook on push to `master` or manual dispatch).
 
+## Mobile Task Launcher / Email-reply (new)
+
+A "Task" is a headless `AgentSession` run launched from the mobile app, the
+`/m` web route, or an email reply. The same orchestrator runs it (no second
+engine); the headless launcher (`src/lib/tasks/`) calls `runAgentExecution`
+with a noop `sendEvent`. Completion dispatches an email (SMTP) + a ntfy push.
+
+New compose service: `ntfy` (upstream image `binwiederhier/ntfy:latest`,
+profile `["full"]`). Config at `deploy/ntfy.yml`, persisted at
+`./data/ntfy`. Exposed behind your reverse proxy at e.g.
+`ntfy.nicoolodion.com`. No custom build / no `build-and-deploy.yml` change.
+
+New env (all optional — app degrades gracefully when unset):
+`MAIL_*` (SMTP out), `MAIL_INBOX_*` (IMAP in), `NTFY_BASE_URL` /
+`NTFY_DEFAULT_AUTH` (push), `MOBILE_TOKEN_TTL_HOURS`, `PUBLIC_BASE_URL`,
+`TASK_TITLE_MODEL`. Documented in `.env.example`. The IMAP poller is
+self-gating (`MAIL_INBOUND_ENABLED=false` → idle). Both the notify
+dispatcher and the IMAP poller start in `src/instrumentation.ts`.
+
+Mobile bearer auth mirrors the cookie-`Session` pattern exactly (token hash
+at rest, `wrappedUserKeyCipher` decryptable only with
+`SESSION_ENCRYPTION_KEY`). Mobile routes do NOT use CSRF (bearer, not cookies)
+and run under the existing `rate-limit.ts` with a tighter per-token + per-IP
+ceiling.
+
+Android app lives in `android-app/`; signed release APK built by
+`.github/workflows/android-release.yml` on `mobile-v*` tags (separate from
+the app/sandbox/webhook matrix build).
+
 ## Model selection & provider routing
 
 Models are served by one of two OpenAI-compatible providers, selected by the

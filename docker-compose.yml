@@ -151,6 +151,32 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # ntfy (self-hosted, UnifiedPush-compatible) push server. The Android app
+  # subscribes to its per-user topic; the app POSTs to it on task completion.
+  # Upstream official image — no custom build needed. Behind your reverse
+  # proxy at e.g. ntfy.<your-domain>. Runs under the "full" profile like the
+  # sandbox so a lightweight app-only deploy omits it.
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: chatinterface-ntfy
+    restart: unless-stopped
+    command: serve
+    profiles: ["full"]
+    ports:
+      - "8090:80"
+    networks:
+      - app-net
+    volumes:
+      - ./data/ntfy:/var/lib/ntfy
+      - ./deploy/ntfy.yml:/etc/ntfy/server.yml:ro
+    environment:
+      - NTFY_BASE_URL=${NTFY_BASE_URL}
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 networks:
   app-net:
     driver: bridge
