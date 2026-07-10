@@ -141,6 +141,8 @@ model RateLimitBucket {
   key      String   @id
   count    Int      @default(0)
   resetAt  DateTime
+
+  @@index([resetAt])
 }
 
 // ── Mobile Task Launcher / Email-reply feature ───────────────────────────────
@@ -153,6 +155,8 @@ model UserEmail {
   verifyToken   String?
   createdAt     DateTime  @default(now())
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([verifyToken])
 }
 
 model UserMobileToken {
@@ -204,4 +208,10 @@ model UserProfile {
   language  String?
   timezone String?
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model MailboxState {
+  id          String   @id @default("singleton")
+  lastSeenUid Int      @default(0)
+  updatedAt   DateTime @updatedAt
 }

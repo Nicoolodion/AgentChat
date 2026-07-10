@@ -150,6 +150,7 @@ export function AgentFileExplorer({
       const res = await fetch(`/api/agent/sessions/${sessionId}/files/upload`, {
         method: "POST",
         body: formData,
+        headers: { "X-Requested-With": "ChatInterface" },
       });
       if (!res.ok) throw new Error("Upload failed");
       await loadFiles(currentPath);

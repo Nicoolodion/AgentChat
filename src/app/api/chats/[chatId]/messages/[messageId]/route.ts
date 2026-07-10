@@ -2,12 +2,16 @@ import { NextResponse } from "next/server";
 
 import { deleteMessageForUser, getChatByIdForUser } from "@/lib/chat-store";
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 export async function DELETE(
   request: Request,
   context: { params: Promise<{ chatId: string; messageId: string }> },
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

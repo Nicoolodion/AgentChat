@@ -5,11 +5,6 @@ export function requireCsrfHeader(request: Request): NextResponse | null {
     return null;
   }
 
-  const contentType = request.headers.get("content-type") ?? "";
-  if (contentType.includes("multipart/form-data")) {
-    return null;
-  }
-
   const header = request.headers.get("x-requested-with");
   if (header !== "ChatInterface") {
     return NextResponse.json(

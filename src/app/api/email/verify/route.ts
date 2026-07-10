@@ -26,7 +26,26 @@ export async function GET(request: Request) {
   }
 
   return new Response(
-    `<html><body style="font-family:sans-serif;padding:2rem"><h1>Email verified</h1><p>${row.address} is now linked to your account. You can close this tab.</p></body></html>`,
+    `<html><body style="font-family:sans-serif;padding:2rem"><h1>Email verified</h1><p>${escapeHtml(String(row.address))} is now linked to your account. You can close this tab.</p></body></html>`,
     { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } },
   );
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return c;
+    }
+  });
 }

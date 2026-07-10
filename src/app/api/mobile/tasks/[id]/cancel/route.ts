@@ -34,11 +34,16 @@ export async function POST(
     return NextResponse.json({ ok: true, status: "cancel_requested" });
   }
 
-  // Not currently running — mark as suppressed so no completion email fires.
-  await prisma.mobileTask.update({
-    where: { id },
-    data: { status: "suppressed", completedAt: new Date() },
-  }).catch(() => undefined);
+  // Not currently running — mark as cancelled so no completion email fires.
+  try {
+    await prisma.mobileTask.update({
+      where: { id },
+      data: { status: "cancelled", completedAt: new Date() },
+    });
+  } catch (err) {
+    console.error("[Task Cancel Error]", err);
+    return NextResponse.json({ ok: false, message: "Failed to cancel task" }, { status: 500 });
+  }
 
-  return NextResponse.json({ ok: true, status: "not_running" });
+  return NextResponse.json({ ok: true, status: "cancelled" });
 }

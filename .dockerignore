@@ -13,7 +13,6 @@ coverage
 data
 prisma/dev.db
 prisma/dev.db-journal
-prisma/migrations
 **/*.log
 .DS_Store
 *.pem

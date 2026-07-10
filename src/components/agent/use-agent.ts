@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AgentArtifact, AgentSession, AgentSseEvent, AgentToolCall } from "@/lib/agent/types";
+import type { AgentArtifact, AgentSession, AgentToolCall } from "@/lib/agent/types";
 import { NEW_CHAT_ID } from "@/lib/chat-types";
 
 export type TerminalEntry =
@@ -134,6 +134,7 @@ export function useAgent(chatId: string | undefined) {
     (sessionId: string) => {
       stopPolling();
       pollIntervalRef.current = setInterval(async () => {
+        if (typeof document !== "undefined" && document.hidden) return;
         try {
           const res = await fetch(`/api/agent/sessions/${sessionId}`);
           if (!res.ok) return;
@@ -168,7 +169,7 @@ export function useAgent(chatId: string | undefined) {
         } catch {
           // ignore poll errors
         }
-      }, 2500);
+      }, 2000);
     },
     [stopPolling, setArtifacts]
   );

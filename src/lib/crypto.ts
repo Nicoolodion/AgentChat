@@ -1,7 +1,4 @@
 import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptCallback } from "node:crypto";
-import { promisify } from "node:util";
-
-const scrypt = promisify(scryptCallback);
 
 const ALGO = "aes-256-gcm";
 const IV_LENGTH = 12;
@@ -26,8 +23,13 @@ function encodePayload(iv: Buffer, tag: Buffer, encrypted: Buffer): string {
 }
 
 function decodePayload(cipherText: string): EncryptedPayload {
-  const parsed = JSON.parse(Buffer.from(cipherText, "base64").toString("utf8")) as EncryptedPayload;
-  if (!parsed?.data || !parsed?.iv || !parsed?.tag) {
+  let parsed: EncryptedPayload;
+  try {
+    parsed = JSON.parse(Buffer.from(cipherText, "base64").toString("utf8")) as EncryptedPayload;
+  } catch {
+    throw new Error("Invalid encrypted payload format.");
+  }
+  if (!parsed || typeof parsed.v !== "number" || parsed.v !== 1 || !parsed.data || !parsed.iv || !parsed.tag) {
     throw new Error("Invalid encrypted payload format.");
   }
 
@@ -52,8 +54,18 @@ export function generateSaltBase64(size = 16): string {
 
 export async function deriveKeyFromPassword(password: string, saltBase64: string): Promise<Buffer> {
   const salt = Buffer.from(saltBase64, "base64");
-  const result = (await scrypt(password, salt, KEY_LENGTH)) as Buffer;
-  return Buffer.from(result);
+  return new Promise((resolve, reject) => {
+    scryptCallback(
+      password,
+      salt,
+      KEY_LENGTH,
+      { N: 32768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 },
+      (err: Error | null, derivedKey: Buffer) => {
+        if (err) reject(err);
+        else resolve(derivedKey);
+      },
+    );
+  });
 }
 
 export function encryptString(plainText: string, key: Buffer): string {

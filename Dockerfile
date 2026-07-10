@@ -52,8 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates openssl python3 gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Provide safe defaults so `prisma db push` can read DATABASE_URL at startup
-# when no .env has been baked into the image. Real values come from
+# Provide safe defaults so `prisma migrate deploy` can read DATABASE_URL at
+# startup when no .env has been baked into the image. Real values come from
 # docker-compose env_file at runtime and override these.
 ENV DATABASE_URL=file:./data/chatinterface.db
 
@@ -61,15 +61,25 @@ ENV DATABASE_URL=file:./data/chatinterface.db
 RUN groupadd -r chatapp -g 1001 \
  && useradd -r -g chatapp -u 1001 -m chatapp
 
-# Copy only what we need to run
+# Copy only what we need to run. Next.js standalone (output: "standalone" in
+# next.config.ts) bundles a minimal, traced node_modules + server.js, so the
+# full dev node_modules is no longer shipped. Static assets + public are served
+# by the standalone server when placed at ./.next/static and ./public.
+COPY --from=builder --chown=chatapp:chatapp /app/.next/standalone ./
+COPY --from=builder --chown=chatapp:chatapp /app/.next/static ./.next/static
 COPY --from=builder --chown=chatapp:chatapp /app/public ./public
-COPY --from=builder --chown=chatapp:chatapp /app/.next ./.next
-COPY --from=builder --chown=chatapp:chatapp /app/node_modules ./node_modules
-COPY --from=builder --chown=chatapp:chatapp /app/package.json ./package.json
+
+# Prisma schema + migrations, used by `prisma migrate deploy` at startup
+# (replaces the data-loss-prone `prisma db push`).
 COPY --from=builder --chown=chatapp:chatapp /app/prisma ./prisma
 COPY --from=builder --chown=chatapp:chatapp /app/prisma.config.ts ./prisma.config.ts
-COPY --from=builder --chown=chatapp:chatapp /app/next.config.ts ./next.config.ts
-COPY --from=builder --chown=chatapp:chatapp /app/tsconfig.json ./tsconfig.json
+
+# The `prisma` CLI + its engine/internals packages are NOT traced by Next.js
+# (app code only imports @prisma/client, never the CLI), so copy them
+# explicitly to run migrations at runtime without a network download.
+COPY --from=builder --chown=chatapp:chatapp /app/node_modules/prisma ./node_modules/prisma
+COPY --from=builder --chown=chatapp:chatapp /app/node_modules/@prisma ./node_modules/@prisma
+COPY --from=builder --chown=chatapp:chatapp /app/node_modules/.prisma ./node_modules/.prisma
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
 RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
@@ -82,7 +92,11 @@ ENTRYPOINT ["docker-entrypoint.sh"]
 
 EXPOSE 3000
 
+# NOTE: a dedicated GET /api/health route returning 200 unauthenticated is the
+# recommended probe. It does not exist yet, so any HTTP response < 500
+# (including the 401 from /api/auth/me) is treated as healthy: it proves the
+# Next.js server is up and routing requests.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || exit 1
+  CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))" || exit 1
 
-CMD ["sh", "-c", "npx prisma db push && node node_modules/next/dist/bin/next start -H 0.0.0.0 -p 3000"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node server.js"]

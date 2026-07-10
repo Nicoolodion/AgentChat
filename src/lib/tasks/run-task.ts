@@ -8,7 +8,7 @@ import {
 } from "@/lib/chat-store";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
-import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
+import { agentSignals } from "@/lib/agent/runner-store";
 import { generateChatTitle } from "@/lib/nanogpt";
 
 import type { TaskSource } from "./types";
@@ -64,7 +64,6 @@ export async function runTask(taskId: string): Promise<void> {
     include: { agentSession: true },
   });
   if (!task) return;
-  if (task.status !== "queued") return;
 
   const session = task.agentSession;
   if (!session) {
@@ -74,6 +73,8 @@ export async function runTask(taskId: string): Promise<void> {
     });
     return;
   }
+
+  if (agentSignals.has(session.id)) return;
 
   // Reload the userKey. The MobileTask row carries userId; the caller is
   // responsible for having passed a valid userKey. For the email-inbound path
@@ -93,10 +94,11 @@ export async function runTask(taskId: string): Promise<void> {
 
   const prompt = decryptString(task.prompt, userKey);
 
-  await prisma.mobileTask.update({
-    where: { id: taskId },
+  const claimed = await prisma.mobileTask.updateMany({
+    where: { id: taskId, status: "queued" },
     data: { status: "running", startedAt: new Date() },
   });
+  if (claimed.count === 0) return;
 
   await appendMessageToChat({
     chatId: session.chatId,
@@ -113,7 +115,6 @@ export async function runTask(taskId: string): Promise<void> {
   });
 
   const ac = new AbortController();
-  activeAgents.set(session.id, ac);
   agentSignals.set(session.id, ac);
 
   try {
@@ -209,7 +210,6 @@ export async function runTask(taskId: string): Promise<void> {
     });
     if (!aborted) console.error("[Task Run Error]", error);
   } finally {
-    activeAgents.delete(session.id);
     agentSignals.delete(session.id);
   }
 }

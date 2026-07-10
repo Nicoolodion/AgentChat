@@ -44,7 +44,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # ── .NET 8 SDK ────────────────────────────────────────────────────────────────
-# Microsoft packages are not in Debian repos; use the official install script.
+# Required by the `docx` skill, which builds DOCX files via a C# + OpenXML SDK
+# pipeline (skills/docx/scripts/docx runs `dotnet build` / `dotnet run`). The
+# SDK is therefore intentionally kept despite the audit (C13); removing it
+# would break DOCX generation. Microsoft packages are not in Debian repos; use
+# the official install script.
 RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin \
     --channel 8.0 \
     --install-dir /usr/share/dotnet \
@@ -62,6 +66,10 @@ RUN groupadd -r sandbox -g 1001 \
     && chown -R sandbox:sandbox /workspace /ms-playwright 2>/dev/null || true
 
 # ── Python packages ───────────────────────────────────────────────────────────
+# NOTE (C13): versions below are intentionally unpinned for now. For production
+# reproducibility, pin every package to an exact version (preferably via a
+# requirements.txt referenced here) and rebuild. --no-cache-dir keeps this
+# layer small.
 RUN pip install --no-cache-dir \
     jupyter ipython ipykernel \
     python-docx docxtpl python-pptx openpyxl lxml \

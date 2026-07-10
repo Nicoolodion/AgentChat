@@ -6,7 +6,8 @@ import {
   sandboxFileList,
   type SandboxFileEntry,
 } from "@/lib/agent/sandbox";
-import { listHostWorkspaceFiles, createHostWorkspace } from "@/lib/agent/workspace";
+import { listHostWorkspaceFiles, createHostWorkspace, getHostWorkspacePath } from "@/lib/agent/workspace";
+import path from "node:path";
 
 function notFound() {
   return NextResponse.json({ error: "Session not found" }, { status: 404 });
@@ -62,20 +63,24 @@ export async function GET(
     if (session.userId !== auth.userId) return forbidden();
 
     const { searchParams } = new URL(request.url);
-    const path = searchParams.get("path") ?? "/";
+    const reqPath = searchParams.get("path") ?? "/";
 
-    if (path.includes("..")) {
+    const workspaceRoot = getHostWorkspacePath(sessionId);
+    const normalizedReqPath = reqPath === "/" ? "." : reqPath;
+    const resolvedPath = path.resolve(workspaceRoot, normalizedReqPath);
+    const relPath = path.relative(workspaceRoot, resolvedPath);
+    if (relPath.startsWith("..") || path.isAbsolute(relPath)) {
       return NextResponse.json({ error: "Invalid path" }, { status: 400 });
     }
 
     try {
-      const entries = await sandboxFileList(sessionId, path);
+      const entries = await sandboxFileList(sessionId, reqPath);
       return NextResponse.json({ files: entries.map((e) => mapEntry(sessionId, e)) });
     } catch {
       // Sandbox unreachable (network) or errored — best-effort host fallback so
       // the explorer still works for legacy/pre-isolation sessions offline.
       await createHostWorkspace(sessionId).catch(() => undefined);
-      const files = await listHostWorkspaceFiles(sessionId, path).catch(() => []);
+      const files = await listHostWorkspaceFiles(sessionId, reqPath).catch(() => []);
       return NextResponse.json({ files });
     }
   } catch (error) {

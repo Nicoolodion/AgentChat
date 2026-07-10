@@ -798,6 +798,30 @@ export function truncateForOutput(text: string, max = 50000): string {
   return `${text.slice(0, max)}\n\n[...truncated ${text.length - max} chars]`;
 }
 
+/** Minimal HTML sanitizer for model-originated outbound email bodies: strips
+ *  <script>/<style>/<iframe>/<object>/<embed> blocks and standalone tags, HTML
+ *  comments, on* event-handler attributes, and javascript:/vbscript: URLs in
+ *  href/src. There is no DOMPurify available in this project, so this regex
+ *  pass neutralizes the common XSS vectors a prompt-injected agent could use. */
+export function sanitizeHtml(html: string): string {
+  if (!html) return "";
+  return html
+    .replace(/<\s*(script|style|iframe|object|embed|applet|noscript|template|form|textarea|button|select|option)\b[\s\S]*?<\/\s*\1\s*>/gi, "")
+    .replace(/<\s*(script|style|iframe|object|embed|applet|link|meta|base|frame|frameset|input|textarea|button|select|option)\b[^>]*>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/(href|src)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (attr) => {
+      const eq = attr.indexOf("=");
+      const raw = attr.slice(eq + 1).trim().replace(/^["']|["']$/g, "").trim();
+      return /^(?:javascript|vbscript):/i.test(raw) ? "" : attr;
+    })
+    .replace(/style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, (attr) => {
+      const eq = attr.indexOf("=");
+      const raw = attr.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+      return /expression\s*\(|javascript:|vbscript:|@import|url\s*\(\s*['"]?\s*(?:javascript|vbscript):/i.test(raw) ? "" : attr;
+    });
+}
+
 // ── SSRF protection ──────────────────────────────────────────────────────────
 
 /** Hostnames that must never be fetched (cloud metadata + common local names). */
@@ -863,6 +887,76 @@ export function validateFetchUrl(raw: string): UrlValidation {
   }
   return { ok: true, url: u };
 }
+
+/** Shared Python SSRF guard, embedded into the sandbox fetcher scripts in the
+ *  orchestrator (web_fetch / web_download) so the lexical denylist + DNS
+ *  resolution check live in one place instead of being triplicated and
+ *  drifting (see audit A9). Mirrors `isPrivateHost`'s ranges, including
+ *  ::ffff: mapped IPv4, and resolves the host via socket.getaddrinfo to reject
+ *  hostnames whose A/AAAA records point at private/loopback/link-local IPs
+ *  (defeats DNS-rebinding against urllib, which resolves at connect time). */
+export const SSRF_PYTHON_GUARD = `
+class _SsrfBlocked(Exception):
+    pass
+
+def _ssrf_private_v4(a, b):
+    return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
+
+def _ssrf_private_ip(ip):
+    ip = (ip or "").lower().strip()
+    if ip in ("::1", "::"):
+        return True
+    if ip.startswith("fe80:") or ip.startswith("fc") or ip.startswith("fd"):
+        return True
+    v4 = __import__("re").match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", ip)
+    if v4:
+        return _ssrf_private_v4(int(v4.group(1)), int(v4.group(2)))
+    if ip.startswith("::ffff:"):
+        m = __import__("re").match(r"::ffff:(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", ip)
+        if m:
+            return _ssrf_private_v4(int(m.group(1)), int(m.group(2)))
+        return True
+    return False
+
+def is_blocked_host(host):
+    host = (host or "").lower().strip("[]")
+    blocked = {"localhost", "metadata.google.internal", "metadata", "169.254.169.254", "metadata.aws.internal"}
+    if host in blocked:
+        return True
+    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
+        return True
+    v4 = __import__("re").match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
+    if v4:
+        return _ssrf_private_v4(int(v4.group(1)), int(v4.group(2)))
+    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
+        return True
+    if host.startswith("::ffff:"):
+        m = __import__("re").match(r"::ffff:(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
+        if m:
+            return _ssrf_private_v4(int(m.group(1)), int(m.group(2)))
+        return True
+    return False
+
+def host_resolves_blocked(host):
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = info[4][0]
+        except Exception:
+            ip = ""
+        if ip and _ssrf_private_ip(ip):
+            return True
+    return False
+
+def host_blocked_full(host):
+    if is_blocked_host(host):
+        return True
+    return host_resolves_blocked(host)
+`;
 
 // ── Vision response classification & error sanitization ──────────────────────
 

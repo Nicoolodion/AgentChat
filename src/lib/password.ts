@@ -21,5 +21,24 @@ export async function hashPassword(password: string): Promise<string> {
 }
 
 export async function verifyPasswordHash(password: string, passwordHash: string): Promise<boolean> {
-  return verify(passwordHash, password);
+  try {
+    return await verify(passwordHash, password);
+  } catch (error) {
+    void import("@/lib/logger")
+      .then((m) => m.log.warn("Password hash verification threw — treating as invalid credentials.", {
+        name: error instanceof Error ? error.name : String(error),
+        message: error instanceof Error ? error.message : undefined,
+      }))
+      .catch(() => undefined);
+    return false;
+  }
+}
+
+let dummyHashCache: string | null = null;
+
+export async function getDummyPasswordHash(): Promise<string> {
+  if (!dummyHashCache) {
+    dummyHashCache = await hash("dummy", getHashOptions());
+  }
+  return dummyHashCache;
 }

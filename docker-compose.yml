@@ -43,8 +43,11 @@ services:
     volumes:
       # Persist DB + encrypted user files + agent workspaces on the host
       - ./data:/app/data
+    # A dedicated GET /api/health route returning 200 unauthenticated is the
+    # recommended probe; it does not exist yet, so treat any HTTP response < 500
+    # (the 401 from /api/auth/me proves the server is up) as healthy.
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/auth/me').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/auth/me').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -133,18 +136,35 @@ services:
       - app-net
     # Same-path bind so docker compose (run inside, against host daemon)
     # resolves relative volume binds correctly. Must be the absolute host
-    # path that contains this docker-compose.yml.
+    # path that contains this docker-compose.yml. Mounted read-only (C10):
+    # deploy.sh tolerates this and still pulls/recreates images; update
+    # docker-compose.yml itself with a manual host `git pull`.
     volumes:
-      - ${HOST_DEPLOY_PATH}:${HOST_DEPLOY_PATH}
+      - ${HOST_DEPLOY_PATH}:${HOST_DEPLOY_PATH}:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # Persist deploy run logs + status JSON across webhook container
       # restarts. Defaults to ./data/deploy-logs inside the host checkout.
+      # This is the only writable host path mounted into the container.
       - ./data/deploy-logs:/app/logs
     environment:
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
       - HOST_DEPLOY_PATH=${HOST_DEPLOY_PATH}
       - PORT=9000
       - DEPLOY_LOG_DIR=/app/logs
+    # Hardening (C10): the webhook runs git + docker compose (plain socket I/O
+    # + file ops) as root, so it needs no Linux capabilities and must not gain
+    # any. The Docker socket stays mounted because it is required to drive
+    # deploys, but no-new-privileges + cap_drop:ALL cap the blast radius.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     logging:
       driver: json-file
       options:
@@ -171,6 +191,12 @@ services:
       - ./deploy/ntfy.yml:/etc/ntfy/server.yml:ro
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:

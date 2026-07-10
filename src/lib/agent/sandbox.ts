@@ -226,33 +226,37 @@ export async function sandboxExecPythonStream(
     const decoder = new TextDecoder();
     let buffer = "";
     let result: SandboxExecPythonResult | null = null;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        if (!line.trim()) continue;
-        let evt: { t?: string; s?: string; data?: SandboxExecPythonResult };
-        try {
-          evt = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (evt.t === "stdout" && typeof evt.s === "string") {
-          onChunk("stdout", evt.s);
-        } else if (evt.t === "stderr" && typeof evt.s === "string") {
-          onChunk("stderr", evt.s);
-        } else if (evt.t === "result" && evt.data) {
-          result = evt.data;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (!line.trim()) continue;
+          let evt: { t?: string; s?: string; data?: SandboxExecPythonResult };
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (evt.t === "stdout" && typeof evt.s === "string") {
+            onChunk("stdout", evt.s);
+          } else if (evt.t === "stderr" && typeof evt.s === "string") {
+            onChunk("stderr", evt.s);
+          } else if (evt.t === "result" && evt.data) {
+            result = evt.data;
+          }
         }
       }
+      if (result) return result;
+      // No result record arrived — fall back.
+      return await sandboxExecPython(sessionId, code, timeout);
+    } finally {
+      await reader.cancel().catch(() => {});
     }
-    if (result) return result;
-    // No result record arrived — fall back.
-    return await sandboxExecPython(sessionId, code, timeout);
   } catch (err) {
     // Abort due to our own timeout: surface a clean timeout error.
     if ((err as Error).name === "AbortError") {
@@ -691,33 +695,37 @@ export async function sandboxPptxRunStream(
     const decoder = new TextDecoder();
     let buffer = "";
     let result: SandboxPptxRunResult | null = null;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        if (!line.trim()) continue;
-        let evt: { t?: string; s?: string; data?: SandboxPptxRunResult; error?: string };
-        try {
-          evt = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (evt.t === "stdout" && typeof evt.s === "string") {
-          onChunk("stdout", evt.s);
-        } else if (evt.t === "stderr" && typeof evt.s === "string") {
-          onChunk("stderr", evt.s);
-        } else if (evt.t === "result") {
-          result = evt.data ?? null;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (!line.trim()) continue;
+          let evt: { t?: string; s?: string; data?: SandboxPptxRunResult; error?: string };
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (evt.t === "stdout" && typeof evt.s === "string") {
+            onChunk("stdout", evt.s);
+          } else if (evt.t === "stderr" && typeof evt.s === "string") {
+            onChunk("stderr", evt.s);
+          } else if (evt.t === "result") {
+            result = evt.data ?? null;
+          }
         }
       }
+      if (result) return result;
+      // No result record arrived — fall back.
+      return await sandboxPptxRun(sessionId, action, params);
+    } finally {
+      await reader.cancel().catch(() => {});
     }
-    if (result) return result;
-    // No result record arrived — fall back.
-    return await sandboxPptxRun(sessionId, action, params);
   } catch (err) {
     if ((err as Error).name === "AbortError") {
       return {

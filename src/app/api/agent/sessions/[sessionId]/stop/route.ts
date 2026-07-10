@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { ZodError, z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";

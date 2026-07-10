@@ -124,7 +124,8 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStream {
     setMessages(chat.messages);
     setToolOutputs({});
     setToolArguments({});
-  }, [chat.id, chat.messages]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.id]);
 
   // Abort any orphaned streams when the hook unmounts (e.g. navigating to a
   // different route). The server-side agent keeps running independently; the

@@ -1,8 +1,9 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 import { decodeKeyFromBase64, decryptString, deriveKeyFromPassword, encryptString } from "@/lib/crypto";
 import { env } from "@/lib/env";
-import { verifyPasswordHash } from "@/lib/password";
+import { getSessionKey, hashToken } from "@/lib/keys";
+import { getDummyPasswordHash, verifyPasswordHash } from "@/lib/password";
 import { prisma } from "@/lib/prisma";
 
 export type MobileAuthContext = {
@@ -12,20 +13,8 @@ export type MobileAuthContext = {
   tokenId: string;
 };
 
-function hashToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
-function getSessionKey(): Buffer {
-  return decodeKeyFromBase64(env.SESSION_ENCRYPTION_KEY, "SESSION_ENCRYPTION_KEY");
-}
-
 export function createMobileToken(): string {
   return randomBytes(48).toString("base64url");
-}
-
-export function hashMobileToken(token: string): string {
-  return hashToken(token);
 }
 
 /**
@@ -88,7 +77,10 @@ export async function pairMobileDevice(input: {
 }): Promise<{ token: string; userId: string; ntfyTopic: string; ntfyAuth: string | null } | null> {
   const normalized = input.username.trim().toLowerCase();
   const user = await prisma.user.findUnique({ where: { username: normalized } });
-  if (!user) return null;
+  if (!user) {
+    await verifyPasswordHash(input.password, await getDummyPasswordHash());
+    return null;
+  }
 
   const ok = await verifyPasswordHash(input.password, user.passwordHash);
   if (!ok) return null;
@@ -118,8 +110,4 @@ export async function pairMobileDevice(input: {
   });
 
   return { token, userId: user.id, ntfyTopic, ntfyAuth };
-}
-
-export async function revokeMobileToken(tokenId: string, userId: string): Promise<void> {
-  await prisma.userMobileToken.deleteMany({ where: { id: tokenId, userId } }).catch(() => undefined);
 }

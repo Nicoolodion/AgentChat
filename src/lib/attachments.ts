@@ -11,7 +11,7 @@ const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 40;
 const MAX_TEXT_PER_ATTACHMENT = 32_000;
 const MAX_TOTAL_EXTRACTED_TEXT = 28_000;
-const MAX_PDF_IMAGE_PAGES = 100;
+const MAX_PDF_IMAGE_PAGES = 50;
 const IMAGE_RENDER_SCALE = 1.35;
 
 const IMAGE_MIME_TYPES = new Set([
@@ -317,11 +317,11 @@ export function isOversizeModelError(err: unknown): boolean {
 
   const message = (asError.message ?? "").toLowerCase();
   return (
-    message.includes("payload") ||
+    message.includes("payload too large") ||
     message.includes("too large") ||
     message.includes("context length") ||
     message.includes("maximum context") ||
-    message.includes("request entity")
+    message.includes("request entity too large")
   );
 }
 
@@ -464,6 +464,51 @@ function toDataUrl(mimeType: string, buffer: Buffer): string {
   return `data:${mimeType};base64,${buffer.toString("base64")}`;
 }
 
+const PREPARE_CONCURRENCY = 3;
+
+async function prepareSingleAttachment(input: {
+  userId: string;
+  userKey: Buffer;
+  attachmentId: string;
+}): Promise<PreparedAttachment> {
+  const { meta, bytes } = await loadStoredAttachment(input);
+
+  if (meta.kind === "image") {
+    return {
+      id: meta.id,
+      fileName: meta.fileName,
+      mimeType: meta.mimeType,
+      size: meta.size,
+      kind: meta.kind,
+      images: [{ label: meta.fileName, mimeType: meta.mimeType, buffer: bytes }],
+    };
+  }
+
+  if (meta.kind === "pdf") {
+    const pdf = await analyzePdf(bytes);
+    return {
+      id: meta.id,
+      fileName: meta.fileName,
+      mimeType: meta.mimeType,
+      size: meta.size,
+      kind: meta.kind,
+      extractedText: shrinkText(pdf.text, MAX_TEXT_PER_ATTACHMENT),
+      images: pdf.images,
+    };
+  }
+
+  const extractedText = await extractTextForAttachment(meta.fileName, meta.mimeType, bytes);
+  return {
+    id: meta.id,
+    fileName: meta.fileName,
+    mimeType: meta.mimeType,
+    size: meta.size,
+    kind: meta.kind,
+    extractedText: extractedText ? shrinkText(extractedText, MAX_TEXT_PER_ATTACHMENT) : undefined,
+    images: [],
+  };
+}
+
 export async function prepareAttachmentsForModel(input: {
   userId: string;
   userKey: Buffer;
@@ -477,54 +522,25 @@ export async function prepareAttachmentsForModel(input: {
 
   await cleanupExpiredAttachmentsForUser(input.userId);
 
-  const prepared: PreparedAttachment[] = [];
+  const results: PreparedAttachment[] = new Array(ids.length);
+  let nextIndex = 0;
 
-  for (const attachmentId of ids) {
-    const { meta, bytes } = await loadStoredAttachment({
-      userId: input.userId,
-      userKey: input.userKey,
-      attachmentId,
-    });
-
-    if (meta.kind === "image") {
-      prepared.push({
-        id: meta.id,
-        fileName: meta.fileName,
-        mimeType: meta.mimeType,
-        size: meta.size,
-        kind: meta.kind,
-        images: [{ label: meta.fileName, mimeType: meta.mimeType, buffer: bytes }],
+  const runWorker = async (): Promise<void> => {
+    for (;;) {
+      const i = nextIndex++;
+      if (i >= ids.length) return;
+      results[i] = await prepareSingleAttachment({
+        userId: input.userId,
+        userKey: input.userKey,
+        attachmentId: ids[i],
       });
-      continue;
     }
+  };
 
-    if (meta.kind === "pdf") {
-      const pdf = await analyzePdf(bytes);
-      prepared.push({
-        id: meta.id,
-        fileName: meta.fileName,
-        mimeType: meta.mimeType,
-        size: meta.size,
-        kind: meta.kind,
-        extractedText: shrinkText(pdf.text, MAX_TEXT_PER_ATTACHMENT),
-        images: pdf.images,
-      });
-      continue;
-    }
+  const workerCount = Math.min(PREPARE_CONCURRENCY, ids.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 
-    const extractedText = await extractTextForAttachment(meta.fileName, meta.mimeType, bytes);
-    prepared.push({
-      id: meta.id,
-      fileName: meta.fileName,
-      mimeType: meta.mimeType,
-      size: meta.size,
-      kind: meta.kind,
-      extractedText: extractedText ? shrinkText(extractedText, MAX_TEXT_PER_ATTACHMENT) : undefined,
-      images: [],
-    });
-  }
-
-  return prepared;
+  return results;
 }
 
 function formatAttachmentSummary(attachments: PreparedAttachment[]): string {

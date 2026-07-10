@@ -295,6 +295,7 @@ export async function deleteChatForUser(userId: string, chatId: string): Promise
 }
 
 const MAX_MESSAGES_PER_CHAT = 500;
+const PRUNE_INTERVAL = 50;
 
 export async function appendMessageToChat(input: {
   chatId: string;
@@ -351,7 +352,7 @@ export async function appendMessageToChat(input: {
   });
 
   const chatMessageCount = await prisma.message.count({ where: { chatId: input.chatId } });
-  if (chatMessageCount > MAX_MESSAGES_PER_CHAT) {
+  if (chatMessageCount - MAX_MESSAGES_PER_CHAT >= PRUNE_INTERVAL) {
     const oldest = await prisma.message.findMany({
       where: { chatId: input.chatId },
       orderBy: { createdAt: "asc" },
@@ -402,19 +403,22 @@ export async function appendContentToMessageForUser(input: {
   userKey: Buffer;
   appendContent: string;
 }): Promise<ChatMessage | null> {
-  const message = await prisma.message.findFirst({
-    where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
-  });
-  if (!message) return null;
+  const updated = await prisma.$transaction(async (tx) => {
+    const message = await tx.message.findFirst({
+      where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
+    });
+    if (!message) return null;
 
-  const existingContent = decryptString(message.encryptedContent, input.userKey);
-  const updated = await prisma.message.update({
-    where: { id: input.messageId },
-    data: {
-      encryptedContent: encryptString(existingContent + input.appendContent, input.userKey),
-    },
+    const existingContent = decryptString(message.encryptedContent, input.userKey);
+    return tx.message.update({
+      where: { id: input.messageId },
+      data: {
+        encryptedContent: encryptString(existingContent + input.appendContent, input.userKey),
+      },
+    });
   });
 
+  if (!updated) return null;
   return decryptMessage(updated, input.userKey);
 }
 
@@ -433,28 +437,30 @@ export async function appendTailSegmentToMessageForUser(input: {
   segmentText: string;
   beforeToolIndex: number;
 }): Promise<ChatMessage | null> {
-  const message = await prisma.message.findFirst({
-    where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
-    include: {},
+  const updated = await prisma.$transaction(async (tx) => {
+    const message = await tx.message.findFirst({
+      where: { id: input.messageId, chatId: input.chatId, chat: { userId: input.userId } },
+    });
+    if (!message) return null;
+
+    const existingSegmentsRaw = message.encryptedContentSegments
+      ? decryptString(message.encryptedContentSegments, input.userKey)
+      : "[]";
+    const existingSegments = (safeJson(existingSegmentsRaw) ?? []) as MessageSegment[];
+    existingSegments.push({ text: input.segmentText, beforeToolIndex: input.beforeToolIndex });
+
+    const existingContent = decryptString(message.encryptedContent, input.userKey);
+
+    return tx.message.update({
+      where: { id: input.messageId },
+      data: {
+        encryptedContent: encryptString(existingContent + input.segmentText, input.userKey),
+        encryptedContentSegments: encryptString(JSON.stringify(existingSegments), input.userKey),
+      },
+    });
   });
-  if (!message) return null;
 
-  const existingSegmentsRaw = message.encryptedContentSegments
-    ? decryptString(message.encryptedContentSegments, input.userKey)
-    : "[]";
-  const existingSegments = (safeJson(existingSegmentsRaw) ?? []) as MessageSegment[];
-  existingSegments.push({ text: input.segmentText, beforeToolIndex: input.beforeToolIndex });
-
-  const existingContent = decryptString(message.encryptedContent, input.userKey);
-
-  const updated = await prisma.message.update({
-    where: { id: input.messageId },
-    data: {
-      encryptedContent: encryptString(existingContent + input.segmentText, input.userKey),
-      encryptedContentSegments: encryptString(JSON.stringify(existingSegments), input.userKey),
-    },
-  });
-
+  if (!updated) return null;
   return decryptMessage(updated, input.userKey);
 }
 

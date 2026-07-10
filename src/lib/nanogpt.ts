@@ -11,11 +11,6 @@ import {
 import type { ModelInfo, ReasoningEffort } from "@/lib/chat-types";
 import { env } from "@/lib/env";
 
-const titleClient = new OpenAI({
-  apiKey: env.NANOGPT_API_KEY ?? "missing",
-  baseURL: env.NANOGPT_BASE_URL,
-});
-
 // Neuralwatt models are namespaced with this prefix so the completion layer can
 // route them to the Neuralwatt API instead of NanoGPT. The prefix is stripped
 // before the model id is sent to the provider.
@@ -258,7 +253,13 @@ export async function fetchModelCatalog(): Promise<ModelInfo[]> {
     if (!prev || prev.source !== "neuralwatt") byId.set(m.id, m);
   }
   const models = [...byId.values()];
-  catalogCache = { ts: now, models };
+  if (models.length > 0) {
+    catalogCache = { ts: now, models };
+    return models;
+  }
+  if (catalogCache) {
+    return catalogCache.models;
+  }
   return models;
 }
 
@@ -319,7 +320,7 @@ export async function fetchModelsFromNanoGPT(filter?: string): Promise<ModelInfo
     ];
   }
 
-  const response = await fetch(`${env.NANOGPT_BASE_URL}/v1/models?detailed=true`, {
+  const response = await fetch(`${env.NANOGPT_BASE_URL}/models?detailed=true`, {
     headers: {
       Authorization: `Bearer ${env.NANOGPT_API_KEY}`,
       "Content-Type": "application/json",
@@ -641,17 +642,22 @@ export async function generateChatTitle({
   userMessage: string;
   assistantMessage: string;
 }): Promise<string> {
-  if (!env.NANOGPT_API_KEY) {
+  const titleModel = normalizeDefaultModel(env.TITLE_MODEL);
+  const isNeuralwatt = isNeuralwattModel(titleModel);
+  if (isNeuralwatt ? !env.NEURALWATT_API_KEY : !env.NANOGPT_API_KEY) {
     return "New chat";
   }
+
+  const client = getOpenAIClientForModel(titleModel);
+  const model = resolveApiModelId(titleModel);
 
   const maxAttempts = 3;
   let lastResult = "";
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      const response = await titleClient.chat.completions.create({
-        model: env.TITLE_MODEL,
+      const response = await client.chat.completions.create({
+        model,
         messages: [
           { role: "system", content: TITLE_SYSTEM_PROMPT },
           {

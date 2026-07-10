@@ -25,6 +25,9 @@ export async function GET(
   }
 
   const { chatId } = await context.params;
+  if (chatId === "new-chat") {
+    return NextResponse.json({ error: "Invalid chat ID" }, { status: 400 });
+  }
   const chat = await getChatDetailForUser(auth.userId, chatId, auth.userKey);
   if (!chat) {
     return NextResponse.json({ error: "Chat not found" }, { status: 404 });

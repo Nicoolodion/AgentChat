@@ -5,7 +5,7 @@ import { resolveMobileAuth } from "@/lib/mobile-auth";
 import { prisma } from "@/lib/prisma";
 
 const updateSchema = z.object({
-  ntfyTopic: z.string().min(4).max(128).optional(),
+  ntfyTopic: z.string().min(4).max(128).regex(/^[a-zA-Z0-9_-]+$/).optional(),
   ntfyAuth: z.string().max(512).nullable().optional(),
   label: z.string().max(64).optional(),
 });

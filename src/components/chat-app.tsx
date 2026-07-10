@@ -362,7 +362,6 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   const [modelSearch, setModelSearch] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [reasoningEffort, setReasoningEffort] = useState<"none" | ReasoningEffort>("none");
   // Inline chat rename: editingChatId holds the chat being renamed; renameDraft
   // is the live text. Enter/blur commits, Escape cancels.
@@ -833,7 +832,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
       try {
         const fd = new FormData();
         for (const f of files) fd.append("files", f, f.name);
-        const res = await fetch("/api/uploads", { method: "POST", body: fd });
+        const res = await fetch("/api/uploads", { method: "POST", body: fd, headers: { "X-Requested-With": "ChatInterface" } });
         const j = (await res.json().catch(() => ({}))) as { attachments?: UploadedAttachment[]; error?: string };
         if (!res.ok) throw new Error(j.error ?? "Upload failed");
         setPendingAttachments((curr) => [...curr, ...(j.attachments ?? [])].slice(0, 40));
@@ -1141,7 +1140,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   }
 
   return (
-    <div className={`relative flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5 ${theme === "light" ? "theme-light" : ""}`}>
+    <div className="relative flex h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(13,148,136,0.18),transparent_35%),radial-gradient(circle_at_85%_5%,rgba(251,146,60,0.2),transparent_30%),linear-gradient(135deg,#0f172a,#111827_45%,#020617)] p-3 md:p-5">
       {dropOverlayActive && (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-slate-950/60 backdrop-blur-sm">
           <div className="flex items-center gap-2 rounded-full border border-teal-300/80 bg-teal-300/10 px-5 py-3 text-sm font-medium text-teal-100">
@@ -1186,6 +1185,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
               </a>
               <button
                 onClick={() => setMobileSidebarOpen(false)}
+                aria-label="Close sidebar"
                 className="xl:hidden rounded-lg border border-white/10 p-1.5 text-slate-300 hover:bg-white/10"
               >
                 <X className="h-4 w-4" />
@@ -1247,6 +1247,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                       }}
                       onBlur={() => void commitRename(c.id, renameDraft)}
                       className="min-w-0 flex-1 rounded border border-teal-300/50 bg-slate-900 px-1.5 py-0.5 text-sm text-white outline-none"
+                      aria-label="Rename chat"
                       maxLength={120}
                     />
                   ) : (
@@ -1331,6 +1332,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
               <div className="relative" ref={modelDropdownRef}>
                 <button
                   onClick={() => setModelDropdownOpen((p) => !p)}
+                  aria-label="Select model"
                   className="min-w-[240px] truncate rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-left text-sm text-slate-100 outline-none ring-teal-300/40 focus:ring"
                 >
                   <span className="font-mono text-xs">{activeModelDisplay ?? "Select model"}</span>
@@ -1494,13 +1496,6 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                 <LogOut className="h-4 w-4" />
                 Logout
               </button>
-              <button
-                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
-                title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
-              >
-                {theme === "dark" ? "☀" : "🌙"}
-              </button>
             </div>
           </div>
 
@@ -1556,6 +1551,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                 multiple
                 accept="image/*,.pdf,.docx,.odt,.odp,.pptx,.txt,.md,.csv,.json,.xml,.rtf"
                 className="hidden"
+                aria-label="Attach files"
                 onChange={(e) => {
                   const files = Array.from(e.target.files ?? []);
                   if (files.length) void uploadFiles(files);
@@ -1591,6 +1587,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
               <textarea
                 value={messageInput}
                 onChange={(e) => setMessageInput(e.target.value)}
+                aria-label="Message composer"
                 onPaste={(e) => {
                   // Allow pasting images directly into the composer (mirrors the
                   // drag-and-drop path). Text-only pastes fall through to the
@@ -1735,6 +1732,16 @@ function FilePreviewDialog({
   sessionId: string;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const url = `/api/agent/sessions/${sessionId}/files/download?path=${encodeURIComponent(file.path)}&preview=1&mimeType=${encodeURIComponent(file.mimeType)}`;
   const downloadUrl = `/api/agent/sessions/${sessionId}/files/download?path=${encodeURIComponent(file.path)}&mimeType=${encodeURIComponent(file.mimeType)}`;
 
@@ -1744,6 +1751,11 @@ function FilePreviewDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={file.name}
         className="max-h-[92vh] w-full max-w-4xl overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95"
         onClick={(e) => e.stopPropagation()}
       >
@@ -1804,6 +1816,16 @@ function AttachmentPreviewDialog({
   attachment: MessageAttachmentRef;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const url = `/api/uploads/${encodeURIComponent(attachment.id)}`;
   return (
     <div
@@ -1811,6 +1833,11 @@ function AttachmentPreviewDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={attachment.fileName}
         className="max-h-[92vh] w-full max-w-5xl overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95"
         onClick={(e) => e.stopPropagation()}
       >
@@ -1871,6 +1898,15 @@ function forwardAgentEvent(
     case "replay_tool_output":
       return { event: "tool_output", data };
     case "replay_tool_done":
+      return { event: "tool_done", data };
+    // Live tool events arrive with the same name+shape the sidebar hook
+    // expects, so forward them unchanged. Without these the default returns
+    // null and the agent sidebar terminal stays empty during a fresh send.
+    case "tool_start":
+      return { event: "tool_start", data };
+    case "tool_output":
+      return { event: "tool_output", data };
+    case "tool_done":
       return { event: "tool_done", data };
     case "status":
       return { event: "status", data };

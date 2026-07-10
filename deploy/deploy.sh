@@ -18,8 +18,15 @@ set -eu
 cd "${HOST_DEPLOY_PATH:?HOST_DEPLOY_PATH is not set}"
 
 echo "==> git: fetch + reset to origin/master"
-git fetch --all
-git reset --hard origin/master
+# The compose directory is mounted read-only in production (see docker-
+# compose.yml, C10), so fetch/reset may be unable to write to .git or the
+# working tree. Treat that as best-effort: image pulls + container recreation
+# below still apply the latest images. For docker-compose.yml / deploy file
+# changes, git-pull on the host (with a temporarily writable mount) is still
+# required.
+if ! git fetch --all || ! git reset --hard origin/master; then
+  echo "  WARN: git update failed or skipped (checkout may be read-only); continuing with current docker-compose.yml"
+fi
 
 echo "==> pulling app + agent-sandbox images"
 docker compose --profile full pull app agent-sandbox

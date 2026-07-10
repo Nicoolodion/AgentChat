@@ -1,6 +1,7 @@
 import { env } from "@/lib/env";
 import { prisma } from "@/lib/prisma";
 import { mailInboundEnabled } from "@/lib/feature-flags";
+import { log } from "@/lib/logger";
 import { decryptString, encryptString, decodeKeyFromBase64 } from "@/lib/crypto";
 
 import { createTask, enqueueTask } from "@/lib/tasks";
@@ -27,9 +28,16 @@ let lastSeenUid = 0;
  * false or IMAP creds are absent, this is a no-op. Started once at boot from
  * instrumentation.ts.
  */
-export function startMailboxPoller(intervalSeconds?: number): void {
+export async function startMailboxPoller(intervalSeconds?: number): Promise<void> {
   if (!mailInboundEnabled()) return;
   if (pollTimer) return;
+  // Load the persisted UID cursor before the first poll so a restart does not
+  // re-fetch and re-process every message still in INBOX.
+  await loadMailboxState().catch((err) => {
+    log.warn("Failed to load mailbox cursor; starting from 0", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
   const interval = (intervalSeconds ?? env.MAIL_INBOX_POLL_SECONDS) * 1000;
   // Fire once shortly after boot, then on the interval.
   setTimeout(() => {
@@ -45,6 +53,22 @@ export function stopMailboxPoller(): void {
   pollTimer = null;
 }
 
+async function loadMailboxState(): Promise<void> {
+  const row = await prisma.mailboxState.upsert({
+    where: { id: "singleton" },
+    create: { id: "singleton", lastSeenUid: 0 },
+    update: {},
+  });
+  lastSeenUid = row.lastSeenUid;
+}
+
+async function persistMailboxState(uid: number): Promise<void> {
+  await prisma.mailboxState.update({
+    where: { id: "singleton" },
+    data: { lastSeenUid: uid },
+  });
+}
+
 /**
  * pollInbox — IMAP fetch of unread messages for the agent mailbox since the
  * last seen UID. Each message is handed to processInboundEmail.
@@ -56,11 +80,24 @@ export async function pollInbox(): Promise<number> {
   let processed = 0;
   try {
     const { ImapFlow } = await import("imapflow");
+    // Read IMAP connection config from process.env directly and derive
+    // implicit-TLS from the port: 993 => implicit TLS, 143 => STARTTLS.
+    const host = process.env.MAIL_INBOX_HOST;
+    const port = Number(process.env.MAIL_INBOX_PORT) || 993;
+    const user = process.env.MAIL_INBOX_USER;
+    const pass = process.env.MAIL_INBOX_PASS;
+    if (!host || !user || !pass) {
+      log.warn("Mailbox poll skipped: IMAP connection config incomplete");
+      return 0;
+    }
+    const secure = port === 993;
     const client = new ImapFlow({
-      host: env.MAIL_INBOX_HOST!,
-      port: env.MAIL_INBOX_PORT,
-      secure: true,
-      auth: { user: env.MAIL_INBOX_USER!, pass: env.MAIL_INBOX_PASS! },
+      host,
+      port,
+      secure,
+      auth: { user, pass },
+      // Require STARTTLS on plaintext ports (143); implicit TLS (993) needs none.
+      ...(secure ? {} : { doSTARTTLS: true }),
       logger: false,
     });
     await client.connect();
@@ -75,7 +112,7 @@ export async function pollInbox(): Promise<number> {
           source: true,
           headers: true,
         })) {
-          if (msg.uid && msg.uid > lastSeenUid) lastSeenUid = msg.uid;
+          let inbound: InboundEmail | undefined;
           try {
             const { simpleParser } = await import("mailparser");
             const parsed = await simpleParser(msg.source as Buffer);
@@ -85,22 +122,57 @@ export async function pollInbox(): Promise<number> {
               const v = parsed.headers.get(key);
               if (typeof v === "string") headers[key.toLowerCase()] = v;
             }
-            const inbound: InboundEmail = {
+            inbound = {
               from: fromAddr,
               subject: parsed.subject ?? "",
               text: parsed.text ?? "",
-              html: parsed.html ? String(parsed.html) : undefined,
-              messageId: parsed.messageId ?? undefined,
-              inReplyTo: parsed.inReplyTo ?? undefined,
-              references: parsed.references
-                ? String(parsed.references).split(/\s+/).filter(Boolean)
-                : undefined,
+              ...(parsed.html ? { html: String(parsed.html) } : {}),
+              ...(parsed.messageId ? { messageId: parsed.messageId } : {}),
+              ...(parsed.inReplyTo ? { inReplyTo: parsed.inReplyTo } : {}),
+              ...(parsed.references
+                ? { references: String(parsed.references).split(/\s+/).filter(Boolean) }
+                : {}),
               headers,
             };
-            await processInboundEmail(inbound);
-            processed++;
           } catch (err) {
-            console.error("[Mailbox message parse error]", err);
+            // An unparseable message must not stall the batch forever:
+            // advance the cursor past it and continue.
+            log.error("Mailbox message parse error", {
+              uid: msg.uid,
+              err: err instanceof Error ? err.message : String(err),
+            });
+            if (msg.uid && msg.uid > lastSeenUid) lastSeenUid = msg.uid;
+            continue;
+          }
+
+          const email = inbound!;
+
+          try {
+            // messageId dedup: skip messages already turned into a MobileTask
+            // so restarts / re-deliveries don't spawn duplicate tasks.
+            if (email.messageId) {
+              const existing = await prisma.mobileTask.findFirst({
+                where: { emailMessageId: email.messageId },
+                select: { id: true },
+              });
+              if (existing) {
+                if (msg.uid && msg.uid > lastSeenUid) lastSeenUid = msg.uid;
+                continue;
+              }
+            }
+            await processInboundEmail(email);
+            processed++;
+            // Advance the cursor only after a successful process so a failed
+            // message is retried on the next poll instead of being lost.
+            if (msg.uid && msg.uid > lastSeenUid) lastSeenUid = msg.uid;
+          } catch (err) {
+            log.error("Mailbox message processing error", {
+              uid: msg.uid,
+              err: err instanceof Error ? err.message : String(err),
+            });
+            // Do not advance past the failed message — stop the batch so it is
+            // retried on the next poll rather than silently skipped.
+            break;
           }
         }
       } finally {
@@ -110,10 +182,16 @@ export async function pollInbox(): Promise<number> {
       await client.logout().catch(() => undefined);
     }
   } catch (err) {
-    console.error("[Mailbox poll error]", err);
+    log.error("Mailbox poll error", { err: err instanceof Error ? err.message : String(err) });
   } finally {
     pollInFlight = false;
   }
+  // Persist the cursor after each poll batch so a restart resumes here.
+  await persistMailboxState(lastSeenUid).catch((err) => {
+    log.warn("Failed to persist mailbox cursor", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
   return processed;
 }
 
@@ -176,32 +254,50 @@ export async function processInboundEmail(email: InboundEmail): Promise<void> {
     emailAddress: userEmail.address,
   });
 
-  // Stamp the threading key so the completion email will thread with this
-  // inbound message.
+  // Stamp the inbound Message-ID (for idempotent dedup on restart) and the
+  // threading key so the completion email will thread with this inbound message.
   const msgId = taskMessageId(created.taskId);
   await prisma.mobileTask.update({
     where: { id: created.taskId },
     data: {
-      emailMessageId: msgId,
+      emailMessageId: email.messageId ?? msgId,
       emailThreadId: email.messageId ?? msgId,
     },
-  }).catch(() => undefined);
+  }).catch((err) => {
+    log.warn("Failed to stamp email threading fields on task", {
+      taskId: created.taskId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   enqueueTask(created.taskId);
 }
 
-async function handleReply(email: InboundEmail, _sender: string, threadKey: string): Promise<void> {
+async function handleReply(email: InboundEmail, sender: string, threadKey: string): Promise<void> {
   // The thread key may be a <task-...@domain> Message-ID OR a raw taskId.
   const taskId = extractTaskIdFromMessageId(threadKey) ?? threadKey;
 
   const task = await prisma.mobileTask.findUnique({
     where: { id: taskId },
     include: {
-      user: { select: { id: true, username: true } },
+      user: { select: { id: true, username: true, emails: { select: { address: true, verifiedAt: true } } } },
       agentSession: { select: { id: true, chatId: true } },
     },
   });
   if (!task || !task.agentSession || !task.user) return;
+
+  // Verify the reply sender is the task owner. The threading key is sent in
+  // every completion email and is learnable, so anyone holding it must still
+  // prove they own the address the task belongs to.
+  const allowedSenders = new Set<string>();
+  if (task.emailAddress) allowedSenders.add(task.emailAddress.toLowerCase().trim());
+  for (const e of task.user.emails) {
+    if (e.verifiedAt) allowedSenders.add(e.address.toLowerCase().trim());
+  }
+  if (!allowedSenders.has(sender)) {
+    log.warn("Reply sender does not match task owner; dropping", { taskId });
+    return;
+  }
 
   const userKey = await resolveUserKeyForUser(task.user.id);
   if (!userKey) return;
@@ -233,6 +329,7 @@ async function handleReply(email: InboundEmail, _sender: string, threadKey: stri
       model: task.model,
       status: "queued",
       emailAddress: task.emailAddress,
+      emailMessageId: email.messageId ?? null,
       emailThreadId: email.messageId ?? task.emailThreadId,
     },
   });
@@ -248,7 +345,7 @@ async function sendVerificationChallenge(address: string): Promise<void> {
   // the app, then reply-trigger flows). For now: best-effort auto-reply that
   // tells them to pair via the app first.
   if (!env.MAIL_SMTP_HOST) return;
-  const baseUrl = (process.env.PUBLIC_BASE_URL ?? "https://chat.nicoolodion.com").replace(/\/$/, "");
+  const baseUrl = (process.env.PUBLIC_BASE_URL ?? "http://localhost:3000").replace(/\/$/, "");
   await sendMail({
     to: address,
     subject: "Re: verify your email to use the agent",

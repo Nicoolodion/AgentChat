@@ -27,7 +27,7 @@ import {
   AgentSessionStatus,
   AgentToolCallStatus,
 } from "./types";
-import { safeParseArgs } from "./parse-args";
+import { parseToolArgs } from "./parse-args";
 import { SKILL_EXTENSIONS, buildSystemPrompt, getAgentToolSchemas, OCR_TASKS } from "./tool-schemas";
 import { getOcrStatus, sandboxOcr, type OcrTask } from "./sandbox";
 import {
@@ -49,6 +49,8 @@ import {
   validateFetchUrl,
   type FetchFormat,
   type VisionResponseStatus,
+  sanitizeHtml,
+  SSRF_PYTHON_GUARD,
 } from "./web-tools";
 import {
   sandboxConvertDocxToPdf,
@@ -81,6 +83,11 @@ export type SseController = {
 };
 
 const MAX_CONVERSATION_CHARS = 80000;
+
+let toolCallIdSeq = 0;
+
+const MAX_SEND_EMAIL_PER_SESSION = 5;
+const sendEmailCountBySession = new Map<string, number>();
 
 /** Matches JSON-parse error signatures thrown or echoed back by LLM
  *  providers/gateways when the model emits malformed tool-call arguments,
@@ -687,7 +694,7 @@ export async function runAgentExecution(input: {
   // Provider finish_reason for the final assistant turn. Used to detect
   // truncation ("length") so the client can offer "Continue generating".
   let lastFinishReason: string | undefined;
-  const maxToolCalls = Number(process.env.AGENT_MAX_TOOL_CALLS ?? "250");
+  const maxToolCalls = env.AGENT_MAX_TOOL_CALLS;
 
   // Real usage + energy totals from the provider (Neuralwatt reports them on
   // the final chunk of each streamed turn). Summed across every LLM turn in
@@ -776,6 +783,7 @@ export async function runAgentExecution(input: {
     }> = [];
     let currentToolCallIndex = -1;
     let contentBuffer = "";
+    const finalContentStartLen = finalContent.length;
 
     const trimmedMessages = summarizeOldMessages(messages, modelContextLength);
     const apiModel = resolveApiModelId(model);
@@ -785,7 +793,7 @@ export async function runAgentExecution(input: {
       messages: trimmedMessages,
       tools: toolSchemas,
       tool_choice: "auto",
-      parallel_tool_calls: true,
+      parallel_tool_calls: false,
       stream: true,
     };
     if (effectiveReasoningEffort) {
@@ -818,7 +826,6 @@ export async function runAgentExecution(input: {
     );
     const useSentinelSplitter = isNeuralwattModel(model);
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       response = await client.chat.completions.create(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         createOptions as any,
@@ -832,6 +839,9 @@ export async function runAgentExecution(input: {
         throw streamErr;
       }
       const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      finalContent = finalContent.slice(0, finalContentStartLen);
+      contentBuffer = "";
+      currentContentSeg = "";
       await updateSessionStatus(sessionId, "executing");
       sendEvent({ type: "status", data: { status: "executing", step: "Recovering from a stream error" } });
       messages.push({ role: "user", content: malformedArgsGuidance(msg) });
@@ -895,11 +905,11 @@ export async function runAgentExecution(input: {
 
         const toolCalls = delta.tool_calls ?? [];
         for (const toolCall of toolCalls) {
-          const idx = toolCall.index ?? 0;
+          const idx = toolCall.index ?? Math.max(0, currentToolCallIndex);
           if (idx !== currentToolCallIndex) {
             currentToolCallIndex = idx;
             accumulatedToolCalls[idx] = {
-              id: toolCall.id ?? `call_${Date.now()}_${idx}`,
+              id: toolCall.id ?? `call_${Date.now()}_${idx}_${toolCallIdSeq++}`,
               type: toolCall.type ?? "function",
               function: {
                 name: toolCall.function?.name ?? "",
@@ -925,6 +935,9 @@ export async function runAgentExecution(input: {
         throw streamErr;
       }
       const msg = streamErr instanceof Error ? streamErr.message : String(streamErr);
+      finalContent = finalContent.slice(0, finalContentStartLen);
+      contentBuffer = "";
+      currentContentSeg = "";
       await updateSessionStatus(sessionId, "executing");
       sendEvent({ type: "status", data: { status: "executing", step: "Recovering from a stream error" } });
       messages.push({ role: "user", content: malformedArgsGuidance(msg) });
@@ -957,6 +970,7 @@ export async function runAgentExecution(input: {
       await updateSessionStatus(sessionId, "executing");
       sendEvent({ type: "status", data: { status: "executing", step: "Recovering from malformed tool-call arguments" } });
       messages.push({ role: "user", content: malformedArgsGuidance(contentBuffer.slice(0, 500)) });
+      finalContent = finalContent.slice(0, finalContentStartLen);
       currentContentSeg = "";
       contentBuffer = "";
       continue;
@@ -995,6 +1009,7 @@ export async function runAgentExecution(input: {
     await updateSessionStatus(sessionId, "executing");
     sendEvent({ type: "status", data: { status: "executing", step: `Executing ${validToolCalls.length} tool(s)` } });
 
+    let scannedThisTurn = false;
     for (const tc of validToolCalls) {
       if (signal?.aborted) break;
       if (!tc?.function?.name) continue;
@@ -1012,9 +1027,10 @@ export async function runAgentExecution(input: {
       // requires to round-trip unchanged.
       const llmToolCallId = tc.id;
       const toolName = tc.function.name;
-      const toolArgs = safeParseArgs(tc.function.arguments ?? "{}");
+      const toolArgsResult = parseToolArgs(tc.function.arguments ?? "{}");
       const toolCallRecord = await createToolCall(sessionId, toolName, tc.function.arguments);
       const toolCallId = toolCallRecord.id;
+      const toolArgs: Record<string, unknown> = toolArgsResult.ok ? toolArgsResult.args : {};
 
       sendEvent({
         type: "tool_start",
@@ -1031,21 +1047,29 @@ export async function runAgentExecution(input: {
       let output = "";
       let streamed = false;
 
-      try {
-        const execResult = await executeSandboxTool(sessionId, toolName, toolArgs, model, {
-          sendEvent,
-          toolCallId,
-        });
-        result = { ok: execResult.ok, result: execResult.result, error: execResult.error };
-        output = execResult.stdout ?? "";
-        streamed = !!execResult.streamed;
+      if (!toolArgsResult.ok) {
+        result = { ok: false, error: toolArgsResult.error };
+        output = toolArgsResult.error;
+      } else {
+        try {
+          const execResult = await executeSandboxTool(sessionId, toolName, toolArgs, model, {
+            sendEvent,
+            toolCallId,
+          });
+          result = { ok: execResult.ok, result: execResult.result, error: execResult.error };
+          output = execResult.stdout ?? "";
+          streamed = !!execResult.streamed;
 
-        // Detect artifacts after file-writing tools
-        await scanForArtifacts(sessionId, toolName, toolArgs, sendEvent);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        result = { ok: false, error: msg };
-        output = msg;
+          // Detect artifacts after file-writing tools
+          if (!scannedThisTurn) {
+            const didScan = await scanForArtifacts(sessionId, toolName, toolArgs, sendEvent);
+            if (didScan) scannedThisTurn = true;
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          result = { ok: false, error: msg };
+          output = msg;
+        }
       }
 
       const durationMs = Date.now() - startMs;
@@ -1483,7 +1507,7 @@ async function executeSandboxTool(
       // probes created root-owned /tmp/.cache (mode 0700), which is exactly
       // what made LibreOffice fail with "User installation could not be
       // completed" / dconf "Permission denied".
-      const cmd = `libreoffice --headless --nologo --convert-to ${outputFormat} --outdir "${outDir.replace(/"/g, '\\"')}" "${inputPath.replace(/"/g, '\\"')}"`;
+      const cmd = `libreoffice --headless --nologo --convert-to ${outputFormat} --outdir ${shellEscape(outDir)} ${shellEscape(inputPath)}`;
       const res = await sandboxExecShell(sessionId, cmd, "/", 120);
       let sizeBytes: number | undefined;
       try { sizeBytes = (await sandboxFileInfo(sessionId, outputPath)).size; } catch { /* may not exist */ }
@@ -1602,25 +1626,15 @@ print(json.dumps({"results": results[:max_results], "error": error}))
       const fetchCode = `
 import json, urllib.request, urllib.parse, gzip, zlib
 
-def is_blocked_host(host):
-    host = (host or "").lower().strip("[]")
-    blocked = {"localhost", "metadata.google.internal", "metadata", "169.254.169.254", "metadata.aws.internal"}
-    if host in blocked:
-        return True
-    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
-        return True
-    v4 = __import__("re").match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
-    if v4:
-        a, b = int(v4.group(1)), int(v4.group(2))
-        return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
-    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
-        return True
-    return False
+${SSRF_PYTHON_GUARD}
 
 url = ${JSON.stringify(url)}
 headers = ${JSON.stringify(headers)}
 out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "body": None, "error": None}
 try:
+    _pre_host = urllib.parse.urlparse(url).hostname or ""
+    if host_blocked_full(_pre_host):
+        raise _SsrfBlocked(f"Blocked private/internal host: {_pre_host}")
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=25) as resp:
         raw = resp.read()
@@ -1633,7 +1647,7 @@ try:
             final_host = urllib.parse.urlparse(out["final_url"]).hostname or ""
         except Exception:
             final_host = ""
-        if is_blocked_host(final_host):
+        if host_blocked_full(final_host):
             out["error"] = f"Blocked redirect to private/internal host: {final_host}"
         else:
             if resp.headers.get("Content-Encoding") == "gzip":
@@ -1661,6 +1675,8 @@ try:
             else:
                 out["body"] = None
     out["ok"] = True if not out["error"] else False
+except _SsrfBlocked as _sb:
+    out["error"] = str(_sb)
 except urllib.error.HTTPError as e:
     out["status"] = e.code
     out["error"] = f"HTTP Error {e.code}: {e.reason}"
@@ -1899,20 +1915,7 @@ print(json.dumps(out))
       const downloadCode = `
 import json, os, urllib.request, urllib.parse, re, shutil
 
-def is_blocked_host(host):
-    host = (host or "").lower().strip("[]")
-    blocked = {"localhost", "metadata.google.internal", "metadata", "169.254.169.254", "metadata.aws.internal"}
-    if host in blocked:
-        return True
-    if host.endswith(".internal") or host.endswith(".local") or host.endswith(".localhost"):
-        return True
-    v4 = re.match(r"^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$", host)
-    if v4:
-        a, b = int(v4.group(1)), int(v4.group(2))
-        return a in (0, 10, 127) or (a == 169 and b == 254) or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 100 and 64 <= b <= 127)
-    if host in ("::1", "::") or host.startswith("fe80:") or host.startswith("fc") or host.startswith("fd"):
-        return True
-    return False
+${SSRF_PYTHON_GUARD}
 
 # Run inside a function so transient objects (file handle, HTTPResponse,
 # Request) stay LOCAL and can never leak into the persistent IPython globals.
@@ -1926,13 +1929,16 @@ def _run_download():
     headers = ${JSON.stringify(headers)}
     out = {"ok": False, "status": 0, "content_type": "", "final_url": url, "size": 0, "saved_path": output_path, "filename": os.path.basename(output_path), "error": None}
     try:
+        _pre_host = urllib.parse.urlparse(url).hostname or ""
+        if host_blocked_full(_pre_host):
+            raise _SsrfBlocked(f"Blocked private/internal host: {_pre_host}")
         req = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=60) as resp:
             # Re-validate the final (post-redirect) host to block SSRF via redirect.
             final_url = resp.geturl()
             out["final_url"] = final_url
             final_host = urllib.parse.urlparse(final_url).hostname or ""
-            if is_blocked_host(final_host):
+            if host_blocked_full(final_host):
                 out["error"] = f"Blocked redirect to private/internal host: {final_host}"
             else:
                 out["status"] = resp.status
@@ -1960,6 +1966,8 @@ def _run_download():
                 if out["size"] == 0:
                     cl = resp.headers.get("Content-Length")
                     out["error"] = f"Downloaded 0 bytes (server returned an empty body; Content-Length={cl})"
+    except _SsrfBlocked as _sb:
+        out["error"] = str(_sb)
     except urllib.error.HTTPError as e:
         out["status"] = e.code
         out["error"] = f"HTTP Error {e.code}: {e.reason}"
@@ -2350,16 +2358,42 @@ print(json.dumps(out))
           where: { userId: session.userId, verifiedAt: { not: null } },
           select: { address: true },
         });
-        const to = String(args.to ?? "").trim() || userEmail?.address;
+        const ownerEmail = userEmail?.address;
+        const requestedTo = String(args.to ?? "").trim();
+        const to = requestedTo || ownerEmail;
         if (!to) {
           return {
             ok: false,
             error: "No recipient email provided and the user has no verified email. Ask the user to verify an email in the app Settings first.",
           };
         }
+        const allowedRecipients = (process.env.ALLOWED_EMAIL_RECIPIENTS ?? "")
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean);
+        const toLower = to.toLowerCase();
+        const isOwnerRecipient = ownerEmail != null && toLower === ownerEmail.toLowerCase();
+        if (!isOwnerRecipient) {
+          if (allowedRecipients.length === 0 || !allowedRecipients.includes(toLower)) {
+            return {
+              ok: false,
+              error: `Refused to send email to ${to}: only the session owner's verified email${
+                allowedRecipients.length ? " or an operator-approved recipient" : ""
+              } is permitted.`,
+            };
+          }
+        }
+        const sendCount = sendEmailCountBySession.get(sessionId) ?? 0;
+        if (sendCount >= MAX_SEND_EMAIL_PER_SESSION) {
+          return {
+            ok: false,
+            error: `send_email rate limit reached (${MAX_SEND_EMAIL_PER_SESSION} per session).`,
+          };
+        }
+        sendEmailCountBySession.set(sessionId, sendCount + 1);
         const subject = String(args.subject ?? "").trim() || "From your agent";
         const body = String(args.body ?? "").trim();
-        const html = String(args.html ?? "").trim() || undefined;
+        const html = String(args.html ?? "").trim() ? sanitizeHtml(String(args.html ?? "")) : undefined;
 
         const attachmentPaths = Array.isArray(args.attachments)
           ? args.attachments.filter((p): p is string => typeof p === "string" && p.length > 0)
@@ -2525,9 +2559,9 @@ async function scanForArtifacts(
   toolName: string,
   args: Record<string, unknown>,
   sendEvent: (event: AgentSseEvent) => void
-): Promise<void> {
+): Promise<boolean> {
   // After file write or conversion tools, scan the output directory for new artifacts
-  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_render", "pptx_screenshot", "chart_create", "libreoffice_convert", "shell", "web_download"].includes(toolName)) return;
+  if (!["file_write", "pdf_from_html", "docx_to_pdf", "ipython", "docx_create", "docx_build", "docx_template_fill", "xlsx_create", "pptx_render", "pptx_screenshot", "chart_create", "libreoffice_convert", "shell", "web_download"].includes(toolName)) return false;
 
   try {
     // Walk output/ recursively so files downloaded/generated into
@@ -2599,6 +2633,7 @@ async function scanForArtifacts(
   } catch {
     // Non-critical — don't fail the whole execution
   }
+  return true;
 }
 
 function inferArtifactKind(fileName: string, mimeType: string | null): AgentArtifactKind {
@@ -2611,4 +2646,9 @@ function inferArtifactKind(fileName: string, mimeType: string | null): AgentArti
   if (lowered.endsWith(".zip") || lowered.endsWith(".tar") || lowered.endsWith(".gz")) return "archive";
   if (lowered.endsWith(".js") || lowered.endsWith(".ts") || lowered.endsWith(".py") || lowered.endsWith(".html") || lowered.endsWith(".css")) return "code";
   return "other";
+}
+
+function shellEscape(arg: string): string {
+  if (arg === "") return "''";
+  return `'${arg.replace(/'/g, "'\\''")}'`;
 }

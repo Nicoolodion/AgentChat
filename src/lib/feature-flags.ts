@@ -1,7 +1,7 @@
 import { env } from "@/lib/env";
 
 export function mailOutboundReady(): boolean {
-  return Boolean(env.MAIL_SMTP_HOST && env.MAIL_SMTP_USER);
+  return Boolean(env.MAIL_SMTP_HOST && env.MAIL_SMTP_USER && env.MAIL_SMTP_PASS);
 }
 
 export function mailInboundEnabled(): boolean {

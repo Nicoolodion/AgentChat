@@ -2,9 +2,15 @@ import { NextResponse } from "next/server";
 
 import { env } from "@/lib/env";
 import { fetchModelsFromNanoGPT, fetchModelsFromNeuralwatt, normalizeDefaultModel } from "@/lib/nanogpt";
+import { resolveAuthContext } from "@/lib/auth";
 import type { ModelInfo } from "@/lib/chat-types";
 
 export async function GET(request: Request) {
+  const auth = await resolveAuthContext(request);
+  if (!auth) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
   try {
     const { searchParams } = new URL(request.url);
     const search = searchParams.get("search") ?? "";

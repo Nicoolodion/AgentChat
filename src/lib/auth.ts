@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
@@ -11,7 +11,8 @@ import {
   generateSaltBase64,
 } from "@/lib/crypto";
 import { env } from "@/lib/env";
-import { hashPassword, verifyPasswordHash } from "@/lib/password";
+import { getSessionKey, hashToken } from "@/lib/keys";
+import { getDummyPasswordHash, hashPassword, verifyPasswordHash } from "@/lib/password";
 import { prisma } from "@/lib/prisma";
 
 export type AuthContext = {
@@ -33,14 +34,6 @@ export function validateUsername(username: string): boolean {
 
 function createSessionToken(): string {
   return randomBytes(48).toString("base64url");
-}
-
-function hashToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
-function getSessionKey(): Buffer {
-  return decodeKeyFromBase64(env.SESSION_ENCRYPTION_KEY, "SESSION_ENCRYPTION_KEY");
 }
 
 function getGuestUserKey(): Buffer {
@@ -88,15 +81,19 @@ async function loadSessionByToken(token: string): Promise<AuthContext | null> {
     return null;
   }
 
-  const userKeyBase64 = decryptString(session.wrappedUserKey, getSessionKey());
-  const userKey = decodeKeyFromBase64(userKeyBase64, "wrapped user key");
+  try {
+    const userKeyBase64 = decryptString(session.wrappedUserKey, getSessionKey());
+    const userKey = decodeKeyFromBase64(userKeyBase64, "wrapped user key");
 
-  return {
-    userId: session.user.id,
-    username: session.user.username,
-    userKey,
-    isGuest: false,
-  };
+    return {
+      userId: session.user.id,
+      username: session.user.username,
+      userKey,
+      isGuest: false,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function resolveAuthContext(request: Request): Promise<AuthContext | null> {
@@ -167,6 +164,7 @@ export async function loginUser(
   const normalizedUsername = normalizeUsername(username);
   const user = await prisma.user.findUnique({ where: { username: normalizedUsername } });
   if (!user) {
+    await verifyPasswordHash(password, await getDummyPasswordHash());
     throw new Error("Invalid username or password.");
   }
 
@@ -208,7 +206,7 @@ export function writeSessionCookie(response: NextResponse, token: string): void 
     path: "/",
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: env.COOKIE_SECURE ?? (process.env.NODE_ENV === "production"),
     maxAge: env.SESSION_TTL_HOURS * 60 * 60,
   });
 }
@@ -220,7 +218,7 @@ export function clearSessionCookie(response: NextResponse): void {
     path: "/",
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: env.COOKIE_SECURE ?? (process.env.NODE_ENV === "production"),
     maxAge: 0,
   });
 }
@@ -239,9 +237,17 @@ export async function cleanupExpiredSessions(): Promise<number> {
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startSessionCleanup(intervalMs = 60 * 60 * 1000): void {
-  void cleanupExpiredSessions();
+  void cleanupExpiredSessions().catch(() => {});
   if (cleanupTimer) return;
   cleanupTimer = setInterval(() => {
     void cleanupExpiredSessions().catch(() => {});
   }, intervalMs);
+  cleanupTimer.unref();
+}
+
+export function stopSessionCleanup(): void {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
 }

@@ -15,7 +15,7 @@ import {
   sandboxFileInfo,
   sandboxFileList,
 } from "@/lib/agent/sandbox";
-import { resolveHostWorkspaceFile } from "@/lib/agent/workspace";
+import { resolveHostWorkspaceFile, getHostWorkspacePath } from "@/lib/agent/workspace";
 import { readFile, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
@@ -45,7 +45,14 @@ export async function GET(
     const filePath = searchParams.get("path") ?? "";
     const isPreview = searchParams.get("preview") === "1";
 
-    if (!filePath || filePath.includes("..")) {
+    if (!filePath) {
+      return jsonError("Invalid path", 400);
+    }
+
+    const workspaceRoot = getHostWorkspacePath(sessionId);
+    const resolvedPath = path.resolve(workspaceRoot, filePath);
+    const relPath = path.relative(workspaceRoot, resolvedPath);
+    if (relPath.startsWith("..") || path.isAbsolute(relPath)) {
       return jsonError("Invalid path", 400);
     }
 

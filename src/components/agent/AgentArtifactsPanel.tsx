@@ -1,6 +1,6 @@
 "use client";
 
-import { FileText, FileImage, FileCode, FileArchive, Database, Presentation, PackageOpen, Download, Eye } from "lucide-react";
+import { FileText, FileImage, FileCode, FileArchive, Database, Presentation, PackageOpen, Download } from "lucide-react";
 import type { AgentArtifact } from "@/lib/agent/types";
 
 export function AgentArtifactsPanel({
@@ -85,6 +85,7 @@ export function AgentArtifactsPanel({
                     rel="noopener noreferrer"
                     className="rounded p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
                     title="Download"
+                    aria-label={`Download ${artifact.fileName}`}
                   >
                     <Download className="h-4 w-4" />
                   </a>

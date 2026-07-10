@@ -2,12 +2,13 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 import { prisma } from "@/lib/prisma";
 import { deleteHostWorkspace } from "@/lib/agent/workspace";
-import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
+import { agentSignals } from "@/lib/agent/runner-store";
 
 const patchSchema = z.object({
-  status: z.enum(["idle", "thinking", "executing", "completed", "error"]).optional(),
+  status: z.enum(["idle", "completed", "error"]).optional(),
 });
 
 function notFound() {
@@ -64,6 +65,9 @@ export async function DELETE(
   context: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -77,25 +81,15 @@ export async function DELETE(
     if (!session) return notFound();
     if (session.userId !== auth.userId) return forbidden();
 
-    // Abort any in-flight orchestrator before tearing down resources, so the
-    // run cannot keep writing to the workspace/DB we are about to delete.
     const ac = agentSignals.get(sessionId);
     if (ac) {
       ac.abort();
       agentSignals.delete(sessionId);
-      activeAgents.delete(sessionId);
     }
 
-    // Clean up the host workspace directory. Workspaces may be keyed by either
-    // the chatId or the session id depending on the creation path; remove both
-    // candidates idempotently so neither orphans.
-    try {
-      await deleteHostWorkspace(session.chatId);
-      await deleteHostWorkspace(session.id);
-    } catch (cleanupErr) {
+    await deleteHostWorkspace(session.id).catch((cleanupErr: unknown) => {
       console.error("[Agent Workspace Cleanup Error]", cleanupErr);
-      // Continue even if cleanup fails — DB record is more important
-    }
+    });
 
     await prisma.agentSession.update({
       where: { id: sessionId },
@@ -120,6 +114,9 @@ export async function PATCH(
   context: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -133,9 +130,7 @@ export async function PATCH(
     if (!session) return notFound();
     if (session.userId !== auth.userId) return forbidden();
 
-    // Guard against racing an active run: if the orchestrator is currently
-    // executing for this session, a client PATCH could corrupt its status.
-    if (activeAgents.has(sessionId)) {
+    if (agentSignals.has(sessionId)) {
       return NextResponse.json(
         { error: "Agent is currently running for this session." },
         { status: 409 }
@@ -152,8 +147,7 @@ export async function PATCH(
       updateData.status = parsed.data.status;
       if (parsed.data.status === "completed" || parsed.data.status === "error") {
         updateData.completedAt = new Date();
-      } else if (parsed.data.status === "thinking" || parsed.data.status === "executing") {
-        // Moving back into a running state must clear any prior completion time.
+      } else if (parsed.data.status === "idle") {
         updateData.completedAt = null;
       }
     }

@@ -153,7 +153,6 @@ export async function GET(
         // re-fetch ALL in-scope tool calls (not just unseen ids) so that a tool
         // which transitions running→completed between polls gets its output
         // and done events emitted exactly once.
-        const start = Date.now();
         let closed = false;
 
         const safeClose = () => {
@@ -195,22 +194,19 @@ export async function GET(
             // ignore — keep polling
             console.warn("[Agent Stream] poll error", err);
           }
-        }, 1500);
+        }, 2000);
 
-        // Safety: cap connection at 30 minutes
+        // Safety: cap connection at 15 minutes
         setTimeout(() => {
           clearInterval(interval);
           safeClose();
-        }, 30 * 60 * 1000);
+        }, 15 * 60 * 1000);
 
         // Close on client disconnect
         request.signal.addEventListener("abort", () => {
           clearInterval(interval);
           safeClose();
         });
-
-        // Touch start to satisfy linter
-        void start;
       } catch (err) {
         console.error("[Agent Stream Error]", err);
         try {

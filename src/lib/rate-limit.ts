@@ -6,28 +6,30 @@ export async function enforceRateLimit(
   windowSeconds: number,
 ): Promise<{ ok: boolean; retryAfterSeconds: number }> {
   const now = new Date();
+  const resetAt = new Date(Date.now() + windowSeconds * 1000);
 
-  const current = await prisma.rateLimitBucket.findUnique({ where: { key } });
+  const incremented = await prisma.rateLimitBucket.updateMany({
+    where: { key, count: { lt: maxRequests }, resetAt: { gt: now } },
+    data: { count: { increment: 1 } },
+  });
 
-  if (!current || current.resetAt <= now) {
+  if (incremented.count > 0) {
+    return { ok: true, retryAfterSeconds: 0 };
+  }
+
+  const existing = await prisma.rateLimitBucket.findUnique({ where: { key } });
+
+  if (!existing || existing.resetAt <= now) {
     await prisma.rateLimitBucket.upsert({
       where: { key },
-      create: { key, count: 1, resetAt: new Date(Date.now() + windowSeconds * 1000) },
-      update: { count: 1, resetAt: new Date(Date.now() + windowSeconds * 1000) },
+      create: { key, count: 1, resetAt },
+      update: { count: 1, resetAt },
     });
     return { ok: true, retryAfterSeconds: 0 };
   }
 
-  if (current.count >= maxRequests) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((current.resetAt.getTime() - Date.now()) / 1000));
-    return { ok: false, retryAfterSeconds };
-  }
-
-  await prisma.rateLimitBucket.update({
-    where: { key },
-    data: { count: current.count + 1 },
-  });
-  return { ok: true, retryAfterSeconds: 0 };
+  const retryAfterSeconds = Math.max(1, Math.ceil((existing.resetAt.getTime() - Date.now()) / 1000));
+  return { ok: false, retryAfterSeconds };
 }
 
 export async function cleanupExpiredBuckets(): Promise<number> {

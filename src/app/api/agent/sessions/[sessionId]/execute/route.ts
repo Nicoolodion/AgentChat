@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 import { getChatByIdForUser, getConversationForModel, appendMessageToChat } from "@/lib/chat-store";
 import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
@@ -56,6 +57,9 @@ export async function POST(
   context: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    const csrfError = requireCsrfHeader(request);
+    if (csrfError) return csrfError;
+
     const auth = await resolveAuthContext(request);
     if (!auth) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -237,7 +241,7 @@ export async function POST(
               where: { id: sessionId },
               data: { status: "error", errorMessage: errMsg, completedAt: new Date() },
             });
-            sendSseEvent(controller, "error", { message: errMsg });
+            sendSseEvent(controller, "error", { message: "Agent execution failed" });
             sendSseEvent(controller, "done", {
               session: { ...session, status: "error" },
               artifacts: [],

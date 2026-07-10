@@ -7,7 +7,7 @@ import { prisma } from "@/lib/prisma";
 
 const localeSchema = z.object({
   country: z.string().length(2).optional(),
-  language: z.string().max(16).optional(),
+  language: z.string().max(16).regex(/^[a-z]{2}(-[A-Z]{2})?$/).optional(),
   timezone: z.string().max(64).optional(),
 });
 

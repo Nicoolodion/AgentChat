@@ -8,7 +8,7 @@ import { env } from "@/lib/env";
 import { normalizeDefaultModel } from "@/lib/nanogpt";
 
 const createSchema = z.object({
-  model: z.string().min(1).max(150).optional(),
+  model: z.string().min(1).max(150).regex(/^[a-zA-Z0-9/._:-]+$/).optional(),
   webSearchEnabled: z.boolean().optional(),
   title: z.string().max(120).optional(),
 });

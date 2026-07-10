@@ -1,7 +1,8 @@
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 import { prisma } from "@/lib/prisma";
 import { sandboxFileWrite, SandboxError } from "@/lib/agent/sandbox";
-import { resolveHostWorkspaceFile, createHostWorkspace } from "@/lib/agent/workspace";
+import { resolveHostWorkspaceFile, createHostWorkspace, getHostWorkspacePath } from "@/lib/agent/workspace";
 import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -26,6 +27,9 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ sessionId: string }> }
 ) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   try {
     const auth = await resolveAuthContext(request);
     if (!auth) {
@@ -57,7 +61,21 @@ export async function POST(
         return jsonError(`File ${file.name} exceeds 25MB limit`, 413);
       }
 
-      const destRel = `upload/${file.name}`;
+      const safeName = file.name
+        .replace(/[/\\]/g, "")
+        .replace(/\.\./g, "")
+        .replace(/[\x00-\x1f]/g, "")
+        .replace(/^\.+/, "");
+      if (!safeName) {
+        return jsonError("Invalid filename", 400);
+      }
+      const destRel = `upload/${safeName}`;
+      const workspaceRoot = getHostWorkspacePath(sessionId);
+      const resolvedDest = path.resolve(workspaceRoot, destRel);
+      const relDest = path.relative(workspaceRoot, resolvedDest);
+      if (relDest.startsWith("..") || path.isAbsolute(relDest)) {
+        return jsonError("Invalid filename", 400);
+      }
       const buffer = Buffer.from(await file.arrayBuffer());
 
       try {

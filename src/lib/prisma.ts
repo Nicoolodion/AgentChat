@@ -30,26 +30,15 @@ function getPrismaInternal(): PrismaClient {
   return _prisma;
 }
 
-export function getPrismaClient(): PrismaClient {
-  try {
-    const client = getPrismaInternal();
-    void client.$queryRaw`SELECT 1`;
-    return client;
-  } catch {
-    _prisma = undefined;
-    if (global.prismaGlobal) global.prismaGlobal = undefined;
-    const fresh = createPrismaClient();
-    _prisma = fresh;
-    if (process.env.NODE_ENV !== "production") {
-      global.prismaGlobal = fresh;
-    }
-    return fresh;
-  }
-}
-
 export const prisma = new Proxy({} as PrismaClient, {
   get(_target, prop, receiver) {
-    const client = getPrismaInternal();
-    return Reflect.get(client, prop, receiver);
+    try {
+      const client = getPrismaInternal();
+      return Reflect.get(client, prop, receiver);
+    } catch (error) {
+      throw new Error(
+        `Prisma client initialization failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   },
 });

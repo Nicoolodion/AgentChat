@@ -7,6 +7,18 @@ interface LogEntry {
   [key: string]: unknown;
 }
 
+function errorReplacer(_key: string, value: unknown): unknown {
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack,
+      ...(value.cause ? { cause: value.cause } : {}),
+    };
+  }
+  return value;
+}
+
 function structLog(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
   const entry: LogEntry = {
     ts: new Date().toISOString(),
@@ -14,7 +26,7 @@ function structLog(level: LogLevel, message: string, fields?: Record<string, unk
     msg: message,
     ...fields,
   };
-  const output = JSON.stringify(entry);
+  const output = JSON.stringify(entry, errorReplacer);
 
   switch (level) {
     case "error":

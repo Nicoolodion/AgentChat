@@ -14,7 +14,7 @@ const KNOWN_BAD_KEYS = new Set([
 ]);
 
 const base64KeySchema = z.string().refine((val) => {
-  if (process.env.NODE_ENV === "production" && KNOWN_BAD_KEYS.has(val)) {
+  if (KNOWN_BAD_KEYS.has(val)) {
     return false;
   }
   try {
@@ -28,7 +28,7 @@ const base64KeySchema = z.string().refine((val) => {
 const envSchema = z.object({
   DATABASE_URL: z.string().default("file:./prisma/dev.db"),
   NANOGPT_API_KEY: z.string().optional(),
-  NANOGPT_BASE_URL: z.string().url().default("https://nano-gpt.com/api"),
+  NANOGPT_BASE_URL: z.string().url().default("https://nano-gpt.com/api/v1"),
   NEURALWATT_API_KEY: z.string().optional(),
   NEURALWATT_BASE_URL: z.string().url().default("https://api.neuralwatt.com/v1"),
   DEFAULT_MODEL: z.string().default("moonshotai/kimi-k2.6:thinking"),
@@ -36,6 +36,7 @@ const envSchema = z.object({
   AUTH_REQUIRED: boolLike.default(true),
   REGISTRATION_ENABLED: boolLike.default(true),
   COOKIE_NAME: z.string().default("chatinterface_session"),
+  COOKIE_SECURE: boolLike.optional(),
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24 * 7),
   APP_ENCRYPTION_KEY: base64KeySchema.default(
     "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
@@ -103,6 +104,7 @@ export const env = envSchema.parse({
   AUTH_REQUIRED: process.env.AUTH_REQUIRED,
   REGISTRATION_ENABLED: process.env.REGISTRATION_ENABLED,
   COOKIE_NAME: process.env.COOKIE_NAME,
+  COOKIE_SECURE: process.env.COOKIE_SECURE,
   SESSION_TTL_HOURS: process.env.SESSION_TTL_HOURS,
   APP_ENCRYPTION_KEY: process.env.APP_ENCRYPTION_KEY,
   SESSION_ENCRYPTION_KEY: process.env.SESSION_ENCRYPTION_KEY,

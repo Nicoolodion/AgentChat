@@ -26,7 +26,7 @@ export function MobileTaskApp({ defaultModel, isGuest }: Props) {
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const polling = useRef<ReturnType<typeof setInterval> | null>(null);
+  const hasActiveRef = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [locale, setLocale] = useState<{ country: string | null; language: string | null } | null>(null);
@@ -46,12 +46,18 @@ export function MobileTaskApp({ defaultModel, isGuest }: Props) {
 
   useEffect(() => {
     let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
     const loadTasks = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const res = await fetch("/api/tasks", { cache: "no-store" });
         if (active && res.ok) {
           const data = (await res.json()) as { tasks: TaskRow[] };
           setTasks(data.tasks);
+          hasActiveRef.current = data.tasks.some(
+            (t) => t.active || t.status === "running" || t.status === "queued",
+          );
         }
       } catch {
         /* ignore */
@@ -70,13 +76,22 @@ export function MobileTaskApp({ defaultModel, isGuest }: Props) {
     };
     void loadTasks();
     void loadLocale();
-    const interval = setInterval(() => {
-      void loadTasks();
-    }, 4000);
-    polling.current = interval;
+    function scheduleNext() {
+      if (!active) return;
+      // Fast while tasks are running/queued; idle otherwise.
+      const delay = hasActiveRef.current ? 4000 : 30000;
+      timer = setTimeout(async () => {
+        await loadTasks();
+        scheduleNext();
+      }, delay);
+    }
+    scheduleNext();
+    const onVis = () => { if (!document.hidden) { void loadTasks(); } };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       active = false;
-      if (polling.current) clearInterval(polling.current);
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
 

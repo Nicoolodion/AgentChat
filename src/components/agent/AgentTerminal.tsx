@@ -15,6 +15,30 @@ import type { TerminalEntry } from "./use-agent";
 
 type ExpandedMap = Record<string, boolean>;
 
+const MAX_OUTPUT_LINES = 1000;
+
+// Tool output can be tens of thousands of lines (e.g. verbose stdout).
+// Rendering the full string creates an enormous DOM that freezes the UI, so
+// the display is capped at MAX_OUTPUT_LINES with a truncation note. The
+// full text is still included by `copyAll` for the clipboard.
+function OutputPre({ output }: { output: string }) {
+  const lines = output.split("\n");
+  const truncated = lines.length > MAX_OUTPUT_LINES;
+  const display = truncated ? lines.slice(0, MAX_OUTPUT_LINES).join("\n") : output;
+  return (
+    <>
+      <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-slate-950/60 p-1.5 text-[10px] text-slate-300">
+        {display}
+      </pre>
+      {truncated && (
+        <p className="text-[9px] text-slate-500">
+          Output truncated — showing first {MAX_OUTPUT_LINES.toLocaleString()} of {lines.length.toLocaleString()} lines
+        </p>
+      )}
+    </>
+  );
+}
+
 export function AgentTerminal({
   entries,
   isExecuting,
@@ -156,6 +180,7 @@ export function AgentTerminal({
             onClick={copyAll}
             className="rounded p-1 text-slate-400 transition hover:bg-white/10 hover:text-white"
             title="Copy all"
+            aria-label="Copy all"
           >
             <Copy className="h-3.5 w-3.5" />
           </button>
@@ -163,6 +188,7 @@ export function AgentTerminal({
             onClick={onClear}
             className="rounded p-1 text-slate-400 transition hover:bg-white/10 hover:text-white"
             title="Clear"
+            aria-label="Clear terminal"
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -276,12 +302,7 @@ export function AgentTerminal({
                         </div>
                         <div className="space-y-1">
                           {group.outputs.map((out, idx) => (
-                            <pre
-                              key={idx}
-                              className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-slate-950/60 p-1.5 text-[10px] text-slate-300"
-                            >
-                              {out.output}
-                            </pre>
+                            <OutputPre key={idx} output={out.output} />
                           ))}
                         </div>
                       </div>
@@ -335,12 +356,7 @@ export function AgentTerminal({
             return (
               <div key={key} className="mb-1.5 space-y-1">
                 {group.outputs.map((out, idx) => (
-                  <pre
-                    key={idx}
-                    className="max-h-48 overflow-auto whitespace-pre-wrap rounded bg-slate-950/60 p-1.5 text-[10px] text-slate-300"
-                  >
-                    {out.output}
-                  </pre>
+                  <OutputPre key={idx} output={out.output} />
                 ))}
               </div>
             );

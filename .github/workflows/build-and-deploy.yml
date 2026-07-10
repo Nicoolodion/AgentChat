@@ -85,10 +85,36 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  quality:
+    name: Lint, typecheck & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
   deploy:
     name: Trigger deploy webhook
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, quality]
     # Don't auto-deploy from dependabot/PR runs; only the real master branch.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:

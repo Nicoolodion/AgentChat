@@ -36,26 +36,34 @@ export async function createTask(input: CreateTaskInput): Promise<CreateTaskResu
     title: input.prompt.slice(0, 80),
   });
 
-  // Create the host + sandbox workspace dirs.
-  const workspacePath = await createHostWorkspace(chat.id).catch(() =>
-    // Fallback: the host-workspace path is deterministic anyway.
-    `${env.AGENT_WORKSPACE_DIR}/${chat.id}`,
-  );
-
-  const sandboxHealthy = await sandboxHealthCheck().catch(() => false);
-  if (sandboxHealthy) {
-    await sandboxCreateWorkspace(chat.id).catch(() => undefined);
-  }
-
-  // Create the agent session in idle.
+  // Create the agent session first so the host workspace can be keyed by
+  // the session id — matching every read path (notify, send_email,
+  // artifacts route, file-explorer) that resolves under
+  // data/agent-workspaces/{agentSessionId}/.
   const agentSession = await prisma.agentSession.create({
     data: {
       chatId: chat.id,
       userId: input.userId,
       status: "idle",
-      workspacePath,
+      workspacePath: "",
     },
   });
+
+  // Create the host + sandbox workspace dirs, keyed by session id.
+  const workspacePath = await createHostWorkspace(agentSession.id).catch(() =>
+    // Fallback: the host-workspace path is deterministic anyway.
+    `${env.AGENT_WORKSPACE_DIR}/${agentSession.id}`,
+  );
+
+  await prisma.agentSession.update({
+    where: { id: agentSession.id },
+    data: { workspacePath },
+  });
+
+  const sandboxHealthy = await sandboxHealthCheck().catch(() => false);
+  if (sandboxHealthy) {
+    await sandboxCreateWorkspace(agentSession.id).catch(() => undefined);
+  }
 
   // Copy attachments into the session workspace upload/ dir, exactly like
   // the execute route. The host can't write into the per-session uid-owned

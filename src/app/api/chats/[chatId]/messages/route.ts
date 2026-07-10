@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   appendAttachmentSummaryToMessage,
   AttachmentError,
+  getAttachmentForUser,
   prepareAttachmentsForModel,
 } from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
@@ -25,7 +26,6 @@ import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
 import type { AgentSseEvent } from "@/lib/agent/types";
 import { sandboxCreateWorkspace, sandboxFileWrite } from "@/lib/agent/sandbox";
-import { getAttachmentForUser } from "@/lib/attachments";
 import { activeAgents, agentSignals } from "@/lib/agent/runner-store";
 
 const schema = z.object({
@@ -36,6 +36,8 @@ const schema = z.object({
 });
 
 const encoder = new TextEncoder();
+
+const agentLaunchLock = new Map<string, true>();
 
 function sendSseEvent(controller: ReadableStreamDefaultController, event: string, data: unknown) {
   const encoded = encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -212,7 +214,7 @@ export async function POST(
           } else if (isRateLimit) {
             message = "AI service rate limit reached, please try again in a moment";
           } else {
-            message = `AI service error: ${err?.message ?? "Unknown error"}`;
+            message = "AI service error";
           }
           
           sendSseEvent(controller, "error", { message });
@@ -325,91 +327,97 @@ async function handleAgentMessage(input: {
 }) {
   const { auth, chat, chatId, content, attachments, reasoningEffort } = input;
 
-  // Prevent concurrent agent execution on the same session
-  const existingSession = await prisma.agentSession.findUnique({ where: { chatId } });
-  if (existingSession && activeAgents.has(existingSession.id)) {
+  if (agentLaunchLock.has(chatId)) {
     return NextResponse.json({ error: "Agent is already running for this chat." }, { status: 409 });
   }
+  agentLaunchLock.set(chatId, true);
 
-  // Find or create/reset agent session (upsert avoids unique constraint violation on chatId)
-  const agentSession = await prisma.agentSession.upsert({
-    where: { chatId },
-    create: {
-      chatId,
-      userId: auth.userId,
-      status: "idle",
-      workspacePath: `/workspace/${chatId}`,
-    },
-    update: {
-      status: "idle",
-      errorMessage: null,
-      completedAt: null,
-    },
-  });
-
-  const sessionId = agentSession.id;
-
-  // Ensure workspace directories exist in sandbox
   try {
-    await sandboxCreateWorkspace(sessionId);
-  } catch (err) {
-    console.error("[Agent] Failed to create workspace:", err);
-  }
-
-  // ── Copy user attachments into agent workspace upload/ ──────────────────
-  const attachmentRefs: MessageAttachmentRef[] = [];
-  for (const attachmentId of attachments) {
-    try {
-      const { meta, bytes } = await getAttachmentForUser({
-        userId: auth.userId,
-        userKey: auth.userKey,
-        attachmentId,
-      });
-      const destPath = `upload/${meta.fileName}`;
-      // Write to sandbox
-      await sandboxFileWrite(sessionId, destPath, bytes.toString("base64"), "base64");
-
-      attachmentRefs.push({
-        id: meta.id,
-        fileName: meta.fileName,
-        mimeType: meta.mimeType,
-        size: meta.size,
-        kind: meta.kind,
-      });
-    } catch (err) {
-      console.warn("[Agent] Failed to copy attachment to workspace:", attachmentId, err);
+    // Prevent concurrent agent execution on the same session
+    const existingSession = await prisma.agentSession.findUnique({ where: { chatId } });
+    if (existingSession && activeAgents.has(existingSession.id)) {
+      return NextResponse.json({ error: "Agent is already running for this chat." }, { status: 409 });
     }
-  }
 
-  // Fetch the conversation history BEFORE persisting the new user message.
-  // Otherwise getConversationForModel would include the just-appended message
-  // and the orchestrator would append it again (duplication the model saw as a
-  // repeated user turn).
-  const priorConversation = await getConversationForModel({
-    userId: auth.userId,
-    chatId: chat.id,
-    userKey: auth.userKey,
-    maxMessages: 30,
-  });
+    // Find or create/reset agent session (upsert avoids unique constraint violation on chatId)
+    const agentSession = await prisma.agentSession.upsert({
+      where: { chatId },
+      create: {
+        chatId,
+        userId: auth.userId,
+        status: "idle",
+        workspacePath: `/workspace/${chatId}`,
+      },
+      update: {
+        status: "idle",
+        errorMessage: null,
+        completedAt: null,
+      },
+    });
 
-  // Persist user message (with attachment refs so the UI can render them)
-  const userMessage = await appendMessageToChat({
-    chatId: chat.id,
-    role: "user",
-    content,
-    toolPayload: attachmentRefs.length
-      ? encodeUserAttachmentsPayload(attachmentRefs)
-      : undefined,
-    userKey: auth.userKey,
-  });
+    const sessionId = agentSession.id;
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const ac = new AbortController();
-      activeAgents.set(sessionId, ac);
-      agentSignals.set(sessionId, ac);
-      const onClientAbort = () => ac.abort();
-      input.request.signal.addEventListener("abort", onClientAbort, { once: true });
+    // Ensure workspace directories exist in sandbox
+    try {
+      await sandboxCreateWorkspace(sessionId);
+    } catch (err) {
+      console.error("[Agent] Failed to create workspace:", err);
+    }
+
+    // ── Copy user attachments into agent workspace upload/ ──────────────────
+    const attachmentRefs: MessageAttachmentRef[] = [];
+    for (const attachmentId of attachments) {
+      try {
+        const { meta, bytes } = await getAttachmentForUser({
+          userId: auth.userId,
+          userKey: auth.userKey,
+          attachmentId,
+        });
+        const destPath = `upload/${meta.fileName}`;
+        // Write to sandbox
+        await sandboxFileWrite(sessionId, destPath, bytes.toString("base64"), "base64");
+
+        attachmentRefs.push({
+          id: meta.id,
+          fileName: meta.fileName,
+          mimeType: meta.mimeType,
+          size: meta.size,
+          kind: meta.kind,
+        });
+      } catch (err) {
+        console.warn("[Agent] Failed to copy attachment to workspace:", attachmentId, err);
+      }
+    }
+
+    // Fetch the conversation history BEFORE persisting the new user message.
+    // Otherwise getConversationForModel would include the just-appended message
+    // and the orchestrator would append it again (duplication the model saw as a
+    // repeated user turn).
+    const priorConversation = await getConversationForModel({
+      userId: auth.userId,
+      chatId: chat.id,
+      userKey: auth.userKey,
+      maxMessages: 30,
+    });
+
+    // Persist user message (with attachment refs so the UI can render them)
+    const userMessage = await appendMessageToChat({
+      chatId: chat.id,
+      role: "user",
+      content,
+      toolPayload: attachmentRefs.length
+        ? encodeUserAttachmentsPayload(attachmentRefs)
+        : undefined,
+      userKey: auth.userKey,
+    });
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const ac = new AbortController();
+        activeAgents.set(sessionId, ac);
+        agentSignals.set(sessionId, ac);
+        const onClientAbort = () => ac.abort();
+        input.request.signal.addEventListener("abort", onClientAbort, { once: true });
 
       const toolCallMap = new Map<string, ChatToolCall>();
       // Tool outputs are captured per toolCallId from the `tool_output` event so
@@ -593,7 +601,7 @@ async function handleAgentMessage(input: {
             where: { id: sessionId },
             data: { status: "error", errorMessage: errMsg, completedAt: new Date() },
           });
-          sendSseEvent(controller, "error", { message: errMsg });
+          sendSseEvent(controller, "error", { message: "Agent execution failed" });
           sendSseEvent(controller, "done", {
             session: { ...agentSession!, status: "error" },
             artifacts: [],
@@ -605,16 +613,21 @@ async function handleAgentMessage(input: {
         input.request.signal.removeEventListener("abort", onClientAbort);
         activeAgents.delete(sessionId);
         agentSignals.delete(sessionId);
+        agentLaunchLock.delete(chatId);
       }
     },
-  });
+    });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    },
-  });
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  } catch (error) {
+    agentLaunchLock.delete(chatId);
+    throw error;
+  }
 }

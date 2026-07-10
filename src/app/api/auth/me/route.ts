@@ -4,12 +4,21 @@ import { env } from "@/lib/env";
 import { resolveAuthContext } from "@/lib/auth";
 import { sandboxHealthCheck } from "@/lib/agent/sandbox";
 
+let sandboxHealthCache: { ts: number; online: boolean } | null = null;
+const SANDBOX_HEALTH_TTL_MS = 30_000;
+
 export async function GET(request: Request) {
   const auth = await resolveAuthContext(request);
 
   let sandboxOnline = false;
-  if (env.AGENT_ENABLED) {
-    sandboxOnline = await sandboxHealthCheck().catch(() => false);
+  if (auth && env.AGENT_ENABLED) {
+    const now = Date.now();
+    if (sandboxHealthCache && now - sandboxHealthCache.ts < SANDBOX_HEALTH_TTL_MS) {
+      sandboxOnline = sandboxHealthCache.online;
+    } else {
+      sandboxOnline = await sandboxHealthCheck().catch(() => false);
+      sandboxHealthCache = { ts: now, online: sandboxOnline };
+    }
   }
 
   return NextResponse.json({

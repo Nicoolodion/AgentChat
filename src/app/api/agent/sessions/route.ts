@@ -10,7 +10,7 @@ import { sandboxCreateWorkspace, sandboxHealthCheck } from "@/lib/agent/sandbox"
 import { createHostWorkspace } from "@/lib/agent/workspace";
 
 const createSchema = z.object({
-  chatId: z.string().min(1),
+  chatId: z.string().min(1).max(100),
 });
 
 const ACTIVE_STATUSES = ["thinking", "executing"];
@@ -116,29 +116,37 @@ export async function POST(request: Request) {
       await prisma.agentSession.delete({ where: { id: existing.id } });
     }
 
-    // Create the workspace on the host filesystem first.
-    // The docker-compose binds ../data/agent-workspaces:/workspace,
-    // so the sandbox sees the exact same files.
-    const workspacePath = await createHostWorkspace(chatId);
-
-    // Also tell the sandbox to create its dirs (idempotent if already present)
-    const sandboxHealthy = await sandboxHealthCheck().catch(() => false);
-    if (sandboxHealthy) {
-      await sandboxCreateWorkspace(chatId).catch(() => {
-        // Non-critical for creation — will retry later
-      });
-    }
-
+    // Create the agent session first so the host workspace can be keyed by
+    // the session id — matching every read path (notify, send_email,
+    // artifacts route, file-explorer) that resolves under
+    // data/agent-workspaces/{sessionId}/.
     const session = await prisma.agentSession.create({
       data: {
         chatId,
         userId: auth.userId,
         status: "idle",
-        workspacePath,
+        workspacePath: "",
       },
     });
 
-    return NextResponse.json({ session }, { status: 201 });
+    // Create the workspace on the host filesystem, keyed by session id.
+    // The docker-compose binds ../data/agent-workspaces:/workspace,
+    // so the sandbox sees the exact same files.
+    const workspacePath = await createHostWorkspace(session.id);
+    const updated = await prisma.agentSession.update({
+      where: { id: session.id },
+      data: { workspacePath },
+    });
+
+    // Also tell the sandbox to create its dirs (idempotent if already present)
+    const sandboxHealthy = await sandboxHealthCheck().catch(() => false);
+    if (sandboxHealthy) {
+      await sandboxCreateWorkspace(session.id).catch(() => {
+        // Non-critical for creation — will retry later
+      });
+    }
+
+    return NextResponse.json({ session: updated }, { status: 201 });
   } catch (error) {
     console.error("[Agent Session Create Error]", error);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });

@@ -180,17 +180,16 @@ export async function cleanupOldWorkspaces(maxAgeDays = 7): Promise<number> {
       status: { in: ["completed", "error"] },
       completedAt: { lte: cutoff },
     },
-    select: { id: true, chatId: true },
+    select: { id: true },
   });
   let cleaned = 0;
   for (const session of oldSessions) {
     try {
-      // Workspaces may be keyed by chatId or session id; remove both so
-      // neither orphans regardless of the creation path that ran.
       await deleteHostWorkspace(session.id);
-      await deleteHostWorkspace(session.chatId);
       cleaned++;
-    } catch { /* best-effort */ }
+    } catch (err) {
+      console.error("[Workspace Cleanup Error]", session.id, err);
+    }
   }
   return cleaned;
 }

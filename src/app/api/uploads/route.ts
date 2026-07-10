@@ -6,8 +6,12 @@ import {
   saveAttachmentForUser,
 } from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
+import { requireCsrfHeader } from "@/lib/csrf";
 
 export async function POST(request: Request) {
+  const csrfError = requireCsrfHeader(request);
+  if (csrfError) return csrfError;
+
   try {
     const auth = await resolveAuthContext(request);
     if (!auth) {
@@ -30,7 +34,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const uploaded = [];
+    const staged: Array<{ file: File; bytes: Buffer }> = [];
 
     for (const file of files) {
       const bytes = Buffer.from(await file.arrayBuffer());
@@ -41,11 +45,17 @@ export async function POST(request: Request) {
         );
       }
 
+      staged.push({ file, bytes });
+    }
+
+    const uploaded = [];
+
+    for (const { file, bytes } of staged) {
       const saved = await saveAttachmentForUser({
         userId: auth.userId,
         userKey: auth.userKey,
         fileName: file.name,
-        mimeType: file.type,
+        mimeType: file.type || "application/octet-stream",
         bytes,
       });
 

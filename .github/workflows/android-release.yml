@@ -4,7 +4,7 @@ on:
   push:
     branches: [master]
     paths:
-      - "chatinterface-app/android-app/**"
+      - "android-app/**"
       - ".github/workflows/android-release.yml"
     tags:
       - "mobile-v*"
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: chatinterface-app/android-app
+        working-directory: android-app
     steps:
       - uses: actions/checkout@v4
 
@@ -58,14 +58,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: agentchat-apk
-          path: chatinterface-app/android-app/app/build/outputs/apk/release/app-release.apk
+          path: android-app/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: warn
 
       - name: Create GitHub Release
         if: ${{ github.ref_type == 'tag' }}
         uses: softprops/action-gh-release@v2
         with:
-          files: chatinterface-app/android-app/app/build/outputs/apk/release/app-release.apk
+          files: android-app/app/build/outputs/apk/release/app-release.apk
           generate_release_notes: true
           fail_on_unmatched_files: false
         env:
