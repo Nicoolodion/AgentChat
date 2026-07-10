@@ -14,13 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json package-lock.json* bun.lock* ./
 RUN if [ -f bun.lock ]; then \
       npm install -g bun && bun install --frozen-lockfile && \
-      bun add --dev lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+      bun add --dev lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu@4.2.4 @node-rs/argon2-linux-x64-gnu@2.0.2 @napi-rs/canvas-linux-x64-gnu@0.1.82; \
     elif [ -f package-lock.json ]; then \
       npm ci && \
-      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu@4.2.4 @node-rs/argon2-linux-x64-gnu@2.0.2 @napi-rs/canvas-linux-x64-gnu@0.1.82; \
     else \
       npm install && \
-      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu @node-rs/argon2-linux-x64-gnu @napi-rs/canvas-linux-x64-gnu; \
+      npm install --no-save lightningcss-linux-x64-gnu@1.32.0 @tailwindcss/oxide-linux-x64-gnu@4.2.4 @node-rs/argon2-linux-x64-gnu@2.0.2 @napi-rs/canvas-linux-x64-gnu@0.1.82; \
     fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
