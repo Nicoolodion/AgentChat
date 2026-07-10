@@ -13,7 +13,6 @@ export function AgentSidebar({
   activeTab,
   onSetTab,
   sessionId,
-  isExecuting,
   artifacts,
   onPreviewFile,
 }: {
@@ -22,7 +21,6 @@ export function AgentSidebar({
   activeTab: AgentUIState["activeTab"];
   onSetTab: (tab: AgentUIState["activeTab"]) => void;
   sessionId: string;
-  isExecuting: boolean;
   artifacts: AgentArtifact[];
   onPreviewFile?: (file: { path: string; name: string; mimeType: string }) => void;
 }) {

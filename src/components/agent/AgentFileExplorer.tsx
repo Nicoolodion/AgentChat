@@ -8,8 +8,6 @@ import {
   FileImage,
   FileText,
   Globe,
-  ChevronRight,
-  ChevronDown,
   RefreshCw,
   Upload,
   Download,
@@ -74,9 +72,9 @@ export function AgentFileExplorer({
 
   useEffect(() => {
     if (sessionId) {
-      void loadFiles(currentPath);
+      loadFiles(currentPath); // eslint-disable-line react-hooks/set-state-in-effect
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps, react-hooks/set-state-in-effect
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, currentPath, loadFiles]);
 
   function toggleExpand(path: string) {

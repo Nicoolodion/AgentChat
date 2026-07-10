@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { resolveAuthContext } from "@/lib/auth";
-import { sandboxHealthCheck } from "@/lib/agent/sandbox";
 import type { SkillInfo } from "@/lib/agent/types";
 
 const SKILLS_DIR = path.resolve(process.cwd(), "skills");

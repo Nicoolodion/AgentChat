@@ -77,10 +77,6 @@ export async function POST(
     // ── Mode Locking ────────────────────────────────────────────────────────
     // If the chat has messages, the mode is already locked. Respect it.
     // If this is the first message, lock the mode to whatever the client sent.
-    const messageCount = await prisma.message.count({
-      where: { chatId: chat.id },
-    });
-
     let agentEnabled = parsed.data.agentEnabled ?? false;
 
     if (chat.agentModeLocked !== null) {

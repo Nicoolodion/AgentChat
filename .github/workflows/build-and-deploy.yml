@@ -102,7 +102,7 @@ jobs:
         run: npm install
 
       - name: Install platform-specific native bindings
-        run: npm install --no-save @rolldown/binding-linux-x64-gnu@1.0.0-rc.16
+        run: npm install --no-save @rolldown/binding-linux-x64-gnu@1.0.0-rc.16 @node-rs/argon2-linux-x64-gnu@2.0.2
 
       - name: Generate Prisma client
         run: npx prisma generate

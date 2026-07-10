@@ -111,50 +111,50 @@ export function AgentTerminal({
     for (const entry of entries) {
       if (entry.type === "status") {
         if (currentGroup) groups.push(currentGroup);
-        currentGroup = { key: `status-${entry.timestamp}`, status: entry as any, outputs: [] };
+        currentGroup = { key: `status-${entry.timestamp}`, status: entry, outputs: [] };
         continue;
       }
       if (entry.type === "tool_start") {
         if (currentGroup) groups.push(currentGroup);
         currentGroup = {
-          key: `tool-${(entry as any).toolName}-${entry.timestamp}`,
-          start: entry as any,
+          key: `tool-${entry.toolName}-${entry.timestamp}`,
+          start: entry,
           outputs: [],
         };
         continue;
       }
       if (entry.type === "tool_output") {
         if (currentGroup) {
-          currentGroup.outputs.push(entry as any);
+          currentGroup.outputs.push(entry);
         } else {
           // orphan output
-          groups.push({ key: `output-${entry.timestamp}`, outputs: [entry as any] });
+          groups.push({ key: `output-${entry.timestamp}`, outputs: [entry] });
         }
         continue;
       }
       if (entry.type === "tool_done") {
         if (currentGroup) {
-          currentGroup.done = entry as any;
+          currentGroup.done = entry;
           groups.push(currentGroup);
           currentGroup = null;
         } else {
-          groups.push({ key: `done-${entry.timestamp}`, done: entry as any, outputs: [] });
+          groups.push({ key: `done-${entry.timestamp}`, done: entry, outputs: [] });
         }
         continue;
       }
       if (entry.type === "error") {
         if (currentGroup) {
-          currentGroup.error = entry as any;
+          currentGroup.error = entry;
           groups.push(currentGroup);
           currentGroup = null;
         } else {
-          groups.push({ key: `err-${entry.timestamp}`, error: entry as any, outputs: [] });
+          groups.push({ key: `err-${entry.timestamp}`, error: entry, outputs: [] });
         }
         continue;
       }
       if (entry.type === "step") {
         if (currentGroup) groups.push(currentGroup);
-        groups.push({ key: `step-${entry.timestamp}`, stepText: (entry as any).text, outputs: [] });
+        groups.push({ key: `step-${entry.timestamp}`, stepText: entry.text, outputs: [] });
         currentGroup = null;
       }
     }
@@ -231,7 +231,7 @@ export function AgentTerminal({
 
           // Step-only group
           if (group.key.startsWith("step-")) {
-            const stepText = (group as any).stepText ?? "---";
+            const stepText = group.stepText ?? "---";
             return (
               <div key={key} className="my-2 flex items-center gap-2">
                 <div className="h-px flex-1 bg-white/10" />
@@ -243,7 +243,6 @@ export function AgentTerminal({
 
           // Tool group
           if (group.start) {
-            const hasError = group.error || (group.done && !group.done.ok);
             const ok = group.done?.ok ?? false;
             return (
               <div key={key} className="mb-2 rounded-lg border border-white/5 bg-slate-950/40">

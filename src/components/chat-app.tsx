@@ -1703,7 +1703,6 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
             activeTab={agent.activeTab}
             onSetTab={agent.setActiveTab}
             sessionId={agent.agentSession.id}
-            isExecuting={agent.isExecuting}
             artifacts={agent.artifacts}
             onPreviewFile={(f) => setAgentFilePreview(f)}
           />
