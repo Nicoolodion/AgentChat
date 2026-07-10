@@ -16,6 +16,7 @@ import com.nicoolodion.agentchat.ui.ApiProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
 
@@ -66,7 +67,7 @@ fun NewTaskScreen(onSubmitted: () -> Unit) {
                                     val name = uri.lastPathSegment?.substringAfterLast('/') ?: "file"
                                     val mime = cr.getType(uri) ?: "application/octet-stream"
                                     val bytes = cr.openInputStream(uri)?.use { it.readBytes() } ?: continue
-                                    val mediaType = okhttp3.MediaType.parse(mime)
+                                    val mediaType = mime.toMediaType()
                                     val body = bytes.toRequestBody(mediaType)
                                     parts += MultipartBody.Part.createFormData("files", name, body)
                                 }

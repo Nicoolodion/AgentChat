@@ -25,12 +25,10 @@ fun SettingsScreen(onLogout: () -> Unit) {
 
     LaunchedEffect(Unit) {
         try {
-            val s = withContext(Dispatchers.IO) {
+            withContext(Dispatchers.IO) {
                 // Best-effort: GET /api/mobile/settings if endpoint exists.
                 ApiProvider.api()
             }
-            // The AgentApi interface doesn't expose settings here; kept light.
-            void(s)
         } catch (_: Exception) { }
     }
 

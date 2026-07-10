@@ -9,6 +9,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.nicoolodion.agentchat.AgentChatApp
+import com.nicoolodion.agentchat.data.ApiFactory
 import com.nicoolodion.agentchat.data.PairRequest
 import com.nicoolodion.agentchat.ui.ApiProvider
 import kotlinx.coroutines.Dispatchers
