@@ -69,16 +69,17 @@ COPY --from=builder --chown=chatapp:chatapp /app/.next/standalone ./
 COPY --from=builder --chown=chatapp:chatapp /app/.next/static ./.next/static
 COPY --from=builder --chown=chatapp:chatapp /app/public ./public
 
-# Prisma schema + migrations, used by `prisma migrate deploy` at startup
-# (replaces the data-loss-prone `prisma db push`).
+# Prisma schema + migrations + config, used by `prisma migrate deploy` at
+# startup (replaces the data-loss-prone `prisma db push`).
 COPY --from=builder --chown=chatapp:chatapp /app/prisma ./prisma
 COPY --from=builder --chown=chatapp:chatapp /app/prisma.config.ts ./prisma.config.ts
 
 # The `prisma` CLI + its engine/internals packages are NOT traced by Next.js
-# (app code only imports @prisma/client, never the CLI). Install prisma + its
-# transitive deps into a dedicated location so migrations can run at startup.
-# This is a thin layer (~50 MB) separate from the standalone server bundle.
+# (app code only imports @prisma/client, never the CLI). Install globally and
+# set NODE_PATH so prisma.config.ts can resolve `prisma/config` from the
+# global install location.
 RUN npm install -g prisma@7.8.0 --omit=dev
+ENV NODE_PATH=/usr/local/lib/node_modules
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
 RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
