@@ -75,11 +75,10 @@ COPY --from=builder --chown=chatapp:chatapp /app/prisma ./prisma
 COPY --from=builder --chown=chatapp:chatapp /app/prisma.config.ts ./prisma.config.ts
 
 # The `prisma` CLI + its engine/internals packages are NOT traced by Next.js
-# (app code only imports @prisma/client, never the CLI), so copy them
-# explicitly to run migrations at runtime without a network download.
-COPY --from=builder --chown=chatapp:chatapp /app/node_modules/prisma ./node_modules/prisma
-COPY --from=builder --chown=chatapp:chatapp /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=builder --chown=chatapp:chatapp /app/node_modules/.prisma ./node_modules/.prisma
+# (app code only imports @prisma/client, never the CLI). Install prisma + its
+# transitive deps into a dedicated location so migrations can run at startup.
+# This is a thin layer (~50 MB) separate from the standalone server bundle.
+RUN npm install -g prisma@7.8.0 --omit=dev
 
 # Persistent data (DB, encrypted user uploads, agent workspaces)
 RUN mkdir -p /app/data && chown -R chatapp:chatapp /app/data
@@ -99,4 +98,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/api/auth/me').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))" || exit 1
 
-CMD ["sh", "-c", "node ./node_modules/prisma/build/index.js migrate deploy && node server.js"]
+CMD ["sh", "-c", "prisma migrate deploy && node server.js"]
