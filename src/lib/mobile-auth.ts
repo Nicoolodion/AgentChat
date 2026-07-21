@@ -73,7 +73,7 @@ export async function pairMobileDevice(input: {
   username: string;
   password: string;
   installId: string;
-  label?: string;
+  label?: string | null;
 }): Promise<{ token: string; userId: string; ntfyTopic: string; ntfyAuth: string | null } | null> {
   const normalized = input.username.trim().toLowerCase();
   const user = await prisma.user.findUnique({ where: { username: normalized } });
