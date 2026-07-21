@@ -40,8 +40,14 @@ android {
                 "proguard-rules.pro",
             )
             val storeFilePath = System.getenv("ANDROID_KEYSTORE_PATH")
-            if (!storeFilePath.isNullOrEmpty()) {
-                signingConfig = signingConfigs.getByName("release")
+            // When no release keystore is configured (e.g. CI without the
+            // secret), fall back to the debug signing key so the APK is
+            // still installable. Remove this before shipping production
+            // releases with a proper release keystore.
+            signingConfig = if (!storeFilePath.isNullOrEmpty()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
         }
     }
