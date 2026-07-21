@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: android-app
@@ -39,7 +41,7 @@ jobs:
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Decode signing keystore
-        if: ${{ github.ref_type == 'tag' && env.ANDROID_KEYSTORE != '' }}
+        if: ${{ github.ref_type == 'tag' && secrets.ANDROID_KEYSTORE != '' }}
         env:
           ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
@@ -68,15 +70,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: agentchat-apk
-          path: android-app/app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: warn
+          path: android-app/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
 
       - name: Create GitHub Release
         if: ${{ github.ref_type == 'tag' }}
         uses: softprops/action-gh-release@v2
         with:
-          files: android-app/app/build/outputs/apk/release/app-release.apk
+          files: android-app/app/build/outputs/apk/release/*.apk
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
