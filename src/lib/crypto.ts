@@ -4,6 +4,17 @@ const ALGO = "aes-256-gcm";
 const IV_LENGTH = 12;
 const KEY_LENGTH = 32;
 
+type ScryptOptions = { N: number; r: number; p: number; maxmem: number };
+
+// Current KDF parameters (N=32768). Bumped from the Node scrypt default
+// (N=16384) as part of the security hardening pass.
+const SCRYPT_PARAMS: ScryptOptions = { N: 32768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
+
+// Legacy parameters used before SCRYPT_PARAMS to derive the password key.
+// Kept only so existing wrappedUserKey blobs created under the old cost factor
+// can be recovered and transparently re-wrapped under the new KDF on next login.
+const LEGACY_SCRYPT_PARAMS: ScryptOptions = { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+
 type EncryptedPayload = {
   v: number;
   iv: string;
@@ -52,20 +63,48 @@ export function generateSaltBase64(size = 16): string {
   return randomBytes(size).toString("base64");
 }
 
-export async function deriveKeyFromPassword(password: string, saltBase64: string): Promise<Buffer> {
+export async function deriveKeyFromPassword(
+  password: string,
+  saltBase64: string,
+  options: ScryptOptions = SCRYPT_PARAMS,
+): Promise<Buffer> {
   const salt = Buffer.from(saltBase64, "base64");
   return new Promise((resolve, reject) => {
     scryptCallback(
       password,
       salt,
       KEY_LENGTH,
-      { N: 32768, r: 8, p: 1, maxmem: 128 * 1024 * 1024 },
+      options,
       (err: Error | null, derivedKey: Buffer) => {
         if (err) reject(err);
         else resolve(derivedKey);
       },
     );
   });
+}
+
+/**
+ * Decrypt a password-wrapped user key, tolerating the legacy scrypt cost
+ * factor (N=16384) used before the KDF was hardened to N=32768. When the
+ * legacy path succeeds, `rewrappedUserKey` holds the same user key
+ * re-encrypted under the current KDF; the caller must persist it so the user
+ * is upgraded to the new parameters on first successful login and never pays
+ * the legacy penalty again.
+ */
+export async function unwrapUserKey(
+  wrappedUserKey: string,
+  password: string,
+  saltBase64: string,
+): Promise<{ userKeyBase64: string; rewrappedUserKey: string | null }> {
+  const currentKey = await deriveKeyFromPassword(password, saltBase64, SCRYPT_PARAMS);
+  try {
+    return { userKeyBase64: decryptString(wrappedUserKey, currentKey), rewrappedUserKey: null };
+  } catch {
+    // Fall back to the pre-hardening cost factor to recover legacy accounts.
+    const legacyKey = await deriveKeyFromPassword(password, saltBase64, LEGACY_SCRYPT_PARAMS);
+    const userKeyBase64 = decryptString(wrappedUserKey, legacyKey);
+    return { userKeyBase64, rewrappedUserKey: encryptString(userKeyBase64, currentKey) };
+  }
 }
 
 export function encryptString(plainText: string, key: Buffer): string {

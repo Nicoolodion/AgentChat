@@ -9,6 +9,7 @@ import {
   encryptString,
   generateRandomKeyBase64,
   generateSaltBase64,
+  unwrapUserKey,
 } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { getSessionKey, hashToken } from "@/lib/keys";
@@ -173,8 +174,17 @@ export async function loginUser(
     throw new Error("Invalid username or password.");
   }
 
-  const passwordDerivedKey = await deriveKeyFromPassword(password, user.keyDerivationSalt);
-  const userKeyBase64 = decryptString(user.wrappedUserKey, passwordDerivedKey);
+  const { userKeyBase64, rewrappedUserKey } = await unwrapUserKey(
+    user.wrappedUserKey,
+    password,
+    user.keyDerivationSalt,
+  );
+  if (rewrappedUserKey) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { wrappedUserKey: rewrappedUserKey },
+    });
+  }
   const wrappedSessionUserKey = encryptString(userKeyBase64, getSessionKey());
 
   const token = createSessionToken();

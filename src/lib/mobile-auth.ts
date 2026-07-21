@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 
-import { decodeKeyFromBase64, decryptString, deriveKeyFromPassword, encryptString } from "@/lib/crypto";
+import { decodeKeyFromBase64, decryptString, encryptString, unwrapUserKey } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { getSessionKey, hashToken } from "@/lib/keys";
 import { getDummyPasswordHash, verifyPasswordHash } from "@/lib/password";
@@ -85,8 +85,17 @@ export async function pairMobileDevice(input: {
   const ok = await verifyPasswordHash(input.password, user.passwordHash);
   if (!ok) return null;
 
-  const passwordDerivedKey = await deriveKeyFromPassword(input.password, user.keyDerivationSalt);
-  const userKeyBase64 = decryptString(user.wrappedUserKey, passwordDerivedKey);
+  const { userKeyBase64, rewrappedUserKey } = await unwrapUserKey(
+    user.wrappedUserKey,
+    input.password,
+    user.keyDerivationSalt,
+  );
+  if (rewrappedUserKey) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { wrappedUserKey: rewrappedUserKey },
+    });
+  }
   const wrappedSessionUserKey = encryptString(userKeyBase64, getSessionKey());
 
   const token = createMobileToken();

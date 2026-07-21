@@ -4,6 +4,7 @@ import { z } from "zod";
 import { loginUser, writeSessionCookie } from "@/lib/auth";
 import { env } from "@/lib/env";
 import { jsonError, requestIp } from "@/lib/http";
+import { log } from "@/lib/logger";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { requireCsrfHeader } from "@/lib/csrf";
 
@@ -44,7 +45,12 @@ export async function POST(request: Request) {
     const response = NextResponse.json({ ok: true, username: session.username });
     writeSessionCookie(response, session.token);
     return response;
-  } catch {
+  } catch (error) {
+    log.warn("Login failed.", {
+      username: parsed.data.username,
+      name: error instanceof Error ? error.name : undefined,
+      message: error instanceof Error ? error.message : String(error),
+    });
     return jsonError("Invalid username or password.", 401);
   }
 }
