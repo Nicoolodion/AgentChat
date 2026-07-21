@@ -2,10 +2,6 @@ name: Android Release
 
 on:
   push:
-    branches: [master]
-    paths:
-      - "android-app/**"
-      - ".github/workflows/android-release.yml"
     tags:
       - "mobile-v*"
   workflow_dispatch:
@@ -49,6 +45,17 @@ jobs:
         run: |
           echo "$ANDROID_KEYSTORE" | base64 --decode > /tmp/agentchat.keystore
           echo "ANDROID_KEYSTORE_PATH=/tmp/agentchat.keystore" >> "$GITHUB_ENV"
+
+      - name: Derive version from tag
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          # mobile-v1.2.3 -> VERSION_NAME=1.2.3, VERSION_CODE=10203
+          VERSION_NAME="${GITHUB_REF_NAME#mobile-v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NAME"
+          PATCH="${PATCH:-0}"
+          VERSION_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
 
       - name: Build release APK
         env:

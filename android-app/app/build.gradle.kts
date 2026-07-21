@@ -12,8 +12,9 @@ android {
         applicationId = "com.nicoolodion.agentchat"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // CI (mobile-v* tag) overrides both via env; local/debug keeps 1.0 / 1.
+        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
