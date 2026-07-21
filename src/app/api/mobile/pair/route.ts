@@ -4,6 +4,7 @@ import { z } from "zod";
 import { pairMobileDevice } from "@/lib/mobile-auth";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
 
 const pairSchema = z.object({
   username: z.string().min(3).max(32),
@@ -36,16 +37,28 @@ export async function POST(request: Request) {
     );
   }
 
-  const result = await pairMobileDevice(parsed.data);
-  if (!result) {
-    return NextResponse.json({ error: "Invalid username or password" }, { status: 401 });
-  }
+  try {
+    const result = await pairMobileDevice(parsed.data);
+    if (!result) {
+      return NextResponse.json({ error: "Invalid username or password" }, { status: 401 });
+    }
 
-  return NextResponse.json({
-    token: result.token,
-    userId: result.userId,
-    ntfyTopic: result.ntfyTopic,
-    ntfyAuth: result.ntfyAuth,
-    ntfyBaseUrl: env.NTFY_BASE_URL ?? null,
-  }, { status: 201 });
+    return NextResponse.json({
+      token: result.token,
+      userId: result.userId,
+      ntfyTopic: result.ntfyTopic,
+      ntfyAuth: result.ntfyAuth,
+      ntfyBaseUrl: env.NTFY_BASE_URL ?? null,
+    }, { status: 201 });
+  } catch (error) {
+    log.warn("Mobile pairing failed.", {
+      username: parsed.data.username,
+      name: error instanceof Error ? error.name : undefined,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return NextResponse.json(
+      { error: "Pairing failed due to a server error." },
+      { status: 500 },
+    );
+  }
 }

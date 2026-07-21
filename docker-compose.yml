@@ -152,13 +152,16 @@ services:
       - PORT=9000
       - DEPLOY_LOG_DIR=/app/logs
     # Hardening (C10): the webhook runs git + docker compose (plain socket I/O
-    # + file ops) as root, so it needs no Linux capabilities and must not gain
-    # any. The Docker socket stays mounted because it is required to drive
-    # deploys, but no-new-privileges + cap_drop:ALL cap the blast radius.
+    # + file ops) as root, so it needs minimal capabilities. DAC_OVERRIDE is
+    # required because the deploy-logs bind may be owned by a non-root UID
+    # (Unraid's nobody/users). The Docker socket is a far larger trust boundary
+    # than this file-write capability.
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_OVERRIDE
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/health"]
       interval: 30s

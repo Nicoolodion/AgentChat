@@ -33,6 +33,10 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# python
+__pycache__/
+*.pyc
+
 # env files (can opt-in for committing if needed)
 .env
 
@@ -42,3 +46,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+FINDINGS3.md
+temp/web-fetch-gelbooru.com_index.php_1c755ea4.md
+temp/web-fetch-portal.neuralwatt.com_docs_api_models_bc10c6a2.md
+temp/web-fetch-godling-of-aliot.neocities.org_Cyoa_Mindslaver__b7a7acf1.md
+temp/web-fetch-gelbooru.com_index.php_c052aa9c.md
+temp/web-fetch-themindcontroller.neocities.org_cc625ff9.md
+ISSUES.md
