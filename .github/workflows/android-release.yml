@@ -41,8 +41,9 @@ jobs:
           restore-keys: gradle-${{ runner.os }}-
 
       - name: Decode signing keystore
-        if: ${{ github.ref_type == 'tag' && secrets.ANDROID_KEYSTORE != '' }}
+        if: ${{ github.ref_type == 'tag' && env.HAS_KEYSTORE == 'true' }}
         env:
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE != '' }}
           ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
           echo "$ANDROID_KEYSTORE" | base64 --decode > /tmp/agentchat.keystore
