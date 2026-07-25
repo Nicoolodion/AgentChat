@@ -60,6 +60,61 @@ services:
     # Better-sqlite3 + the agent's heavy I/O benefits from extra shared mem
     shm_size: 512mb
 
+  # VPN egress sidecar for the agent sandbox. Only the sandbox shares this
+  # network namespace (see agent-sandbox.network_mode below), so ONLY sandbox
+  # traffic — tool calls, LLM API requests, web fetches — is tunneled. The app,
+  # webhook, ntfy and host all keep their normal routing.
+  #
+  # Provider is "custom" WireGuard: derive the values below from your .conf
+  # (wg-quick) export. To rotate/pick among MULTIPLE configs later, mount a
+  # directory of .conf files and switch envs; a single active config at a time.
+  # Leave WG_ENDPOINT blank and set the rest to disable the tunnel (the sandbox
+  # then has no external egress — fail-closed by gluetun's firewall).
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: chatinterface-gluetun
+    restart: unless-stopped
+    pull_policy: always
+    profiles: ["full"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WG_PRIVATE_KEY}
+      - WIREGUARD_PUBLIC_KEY=${WG_PEER_PUBLIC_KEY}
+      - WIREGUARD_PRESHARED_KEY=${WG_PRESHARED_KEY}
+      - WIREGUARD_ADDRESSES=${WG_ADDRESSES}
+      - WIREGUARD_ENDPOINT_IP=${WG_ENDPOINT_IP}
+      - WIREGUARD_ENDPOINT_PORT=${WG_ENDPOINT_PORT}
+      - WIREGUARD_ALLOWED_IPS=0.0.0.0/0
+      # Expose the sandbox's HTTP port on the tunnel netns so the app can
+      # still reach agent-sandbox:8080 over app-net (gluetun owns the IP).
+      - FIREWALL_INPUT_PORTS=8080
+      # Uncomment + set to your docker bridge subnet if the app cannot reach
+      # the sandbox by name (gluetun's firewall blocks private ranges by
+      # default). Find it with: docker network inspect chatinterface_app-net
+      # - FIREWALL_INPUT_SUBNET=172.20.0.0/16
+      - FIREWALL_VPN_CONNECTION_STARTUP=false
+    ports:
+      # Published here (not on the sandbox) — the sandbox shares this netns.
+      - "18080:8080"
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   # Optional: only enable if you want the full agent sandbox on the same host.
   # The app will still start without it; agent features will report "sandbox offline".
   agent-sandbox:
@@ -68,10 +123,14 @@ services:
     restart: unless-stopped
     pull_policy: always
     profiles: ["full"]   # start with: docker compose --profile full up -d
-    ports:
-      - "18080:8080"
-    networks:
-      - app-net
+    # Share gluetun's netns: ALL sandbox egress is routed through the WireGuard
+    # tunnel. Implies the sandbox has no ports/networks block of its own — the
+    # 18080:8080 publish lives on gluetun above. The app still reaches it as
+    # http://agent-sandbox:8080 (docker DNS resolves the name to gluetun's IP).
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
     volumes:
       - ./skills:/app/skills:ro
       - ./data/agent-workspaces:/workspace

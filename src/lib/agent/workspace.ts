@@ -39,9 +39,30 @@ export function getHostWorkspacePath(sessionId: string): string {
  */
 export async function createHostWorkspace(sessionId: string): Promise<string> {
   const ws = getHostWorkspacePath(sessionId);
-  await mkdir(path.join(ws, "upload"), { recursive: true });
-  await mkdir(path.join(ws, "output"), { recursive: true });
-  await mkdir(path.join(ws, "temp"), { recursive: true });
+  try {
+    await mkdir(path.join(ws, "upload"), { recursive: true });
+    await mkdir(path.join(ws, "output"), { recursive: true });
+    await mkdir(path.join(ws, "temp"), { recursive: true });
+  } catch (err) {
+    // The agent-workspaces root is owned by the sandbox container (mode 0711,
+    // root:root) under the per-session UID isolation model. The app (uid 1001)
+    // cannot create top-level entries there — the sandbox creates each
+    // session's dir tree itself (ensure_session_dirs / prepare_session, which
+    // also chowns it to the session's alloc uid and locks it to 0700). Swallow
+    // the permission error so session creation doesn't fail; the real
+    // workspace is materialized by the sandbox on first use. This keeps the
+    // host-side mkdir working in dev (writable parent) while degrading
+    // gracefully in the hardened production sandbox layout.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      console.warn(
+        "[Host Workspace] sandbox owns the agent-workspaces root; deferring dir creation to the sandbox:",
+        ws,
+      );
+    } else {
+      throw err;
+    }
+  }
   return ws;
 }
 
