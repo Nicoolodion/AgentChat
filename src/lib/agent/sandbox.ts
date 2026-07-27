@@ -750,15 +750,16 @@ export async function sandboxPptxRunStream(
   }
 }
 
-// ── OCR (PaddleOCR-VL via llama.cpp) ─────────────────────────────────────────
+// ── OCR (PP-OCRv6_medium via paddleocr / transformers) ──────────────────────
 
-export type OcrTask = "ocr" | "table" | "chart" | "formula" | "spotting" | "seal";
+export type OcrTask = "ocr" | "spotting";
 
 /**
  * OCR engine status as reported by the sandbox `/ocr/status` route.
- * - `active`/`ready`: models are downloaded AND the llama-server is live.
+ * - `active`/`ready`: the PP-OCRv6 pipeline is loaded AND the local OCR
+ *   server is responding on /health.
  * - `state`: preparing | ready | deactivated | unknown.
- * - `message`/`errors`: human-readable reason (used to build the deactivated
+ * - `model`/`errors`: human-readable reason (used to build the deactivated
  *   banner the agent sees in the tool description).
  */
 export type OcrStatus = {
@@ -767,9 +768,10 @@ export type OcrStatus = {
   state?: "preparing" | "ready" | "deactivated" | "unknown" | string;
   message?: string;
   errors?: string[];
-  models?: { main?: boolean; mmproj?: boolean; template?: boolean };
-  binary?: boolean;
+  engine?: string;
+  models?: { det?: boolean; rec?: boolean };
   port?: number;
+  device?: string;
 };
 
 export type SandboxOcrResult = {
@@ -796,8 +798,8 @@ export async function sandboxOcrStatus(): Promise<OcrStatus> {
 
 /**
  * Run an OCR task on a workspace image or PDF. The sandbox rasterizes PDFs to
- * PNG (via pdftoppm) and forwards each page to the local llama-server. Throws
- * `SandboxError` (503) when the engine is not ready.
+ * PNG (via pdftoppm) and forwards each page to the local PP-OCRv6 OCR server.
+ * Throws `SandboxError` (503) when the engine is not ready.
  */
 export async function sandboxOcr(
   sessionId: string,

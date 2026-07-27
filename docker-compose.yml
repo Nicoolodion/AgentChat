@@ -134,17 +134,16 @@ services:
     volumes:
       - ./skills:/app/skills:ro
       - ./data/agent-workspaces:/workspace
-      # OCR engine: llama.cpp binary + PaddleOCR-VL-1.6 GGUF models. Persisted so
-      # the multi-GB models download only once (on first start). Must be writable
-      # (the rootfs is read-only).
+      # OCR engine: PP-OCRv6_medium det+rec safetensors are baked into the
+      # image; /models only holds the readiness status file + server log, so it
+      # must still exist and be writable (the rootfs is read-only).
       - ./data/agent-models:/models
     environment:
       - SANDBOX_LOG_LEVEL=info
       - SANDBOX_MAX_EXECUTION_TIME=300
-      # OCR / llama.cpp tuning (CPU-only; the host is an i5-9500T, no GPU).
-      - LLAMA_THREADS=4
-      - LLAMA_CTX=8192
-      - LLAMA_PORT=8181
+      # OCR / PP-OCRv6 tuning (CPU-only; the host is an i5-9500T, no GPU).
+      - OCR_THREADS=4
+      - OCR_PORT=8181
       - OCR_PDF_DPI=200
       - OCR_MAX_PAGES=15
     logging:

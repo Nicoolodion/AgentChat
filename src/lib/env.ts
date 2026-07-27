@@ -60,8 +60,9 @@ const envSchema = z.object({
   // AGENT_VISION_FALLBACK_MODEL on a refusal / empty response before retrying.
   AGENT_VISION_MODEL: z.string().optional(),
   AGENT_VISION_FALLBACK_MODEL: z.string().optional(),
-  // Local OCR engine (llama.cpp + PaddleOCR-VL-1.6 in the agent sandbox). When
-  // false, the OCR tool is never advertised to the agent (no sandbox probe).
+  // Local OCR engine (PP-OCRv6_medium via paddleocr + transformers in the
+  // agent sandbox). When false, the OCR tool is never advertised to the agent
+  // (no sandbox probe).
   AGENT_OCR_ENABLED: boolLike.default(true),
   SEARXNG_URL: z.string().optional(),
 

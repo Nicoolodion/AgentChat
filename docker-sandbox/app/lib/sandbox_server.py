@@ -2308,7 +2308,7 @@ def convert_docx_to_pdf() -> Response:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OCR (PaddleOCR-VL via llama.cpp)
+# OCR (PP-OCRv6_medium via paddleocr / transformers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/ocr/status", methods=["GET"])
@@ -2333,9 +2333,8 @@ def ocr_run() -> Response:
     """Run an OCR task on a workspace image or PDF.
 
     Body: { session_id, input_path, task } where task is one of
-    ocr | table | chart | formula | spotting | seal. Runs as root (it must read
-    session files and talk to the shared root-owned llama-server); the extracted
-    text is returned to the agent.
+    ocr | spotting. Runs as root (it must resolve session files and talk to the
+    shared root-owned OCR server); the extracted text is returned to the agent.
     """
     data = request.get_json(force=True) or {}
     session_id = data.get("session_id", "default")

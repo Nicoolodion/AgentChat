@@ -53,25 +53,25 @@ python -c "import playwright; print(f'Playwright: OK')" || { echo "WARNING: Play
 libreoffice --version || { echo "WARNING: LibreOffice not available"; }
 dotnet --version || { echo "WARNING: .NET not available"; }
 
-# ── OCR engine (llama.cpp + PaddleOCR-VL-1.6) ────────────────────────────────
-# Models + the llama.cpp binary live in /models, which MUST be a writable volume
-# (the rootfs is read-only). The bootstrap runs in the background so it never
-# blocks the sandbox API: it downloads the GGUF models the first time, launches
-# a persistent llama-server on 127.0.0.1:$LLAMA_PORT, and writes a status file
-# at /models/.ocr-status.json that the /ocr + /ocr/status routes read. If the
-# download or server launch fails, the tool is marked deactivated and the app
-# hides it — the sandbox keeps running normally.
+# ── OCR engine (PP-OCRv6_medium via paddleocr / transformers) ────────────────
+# The det+rec safetensors weights are baked into the image under /app/models.
+# Only /models needs to be a writable volume (status file + server log); the
+# entrypoint runs `ocr.py --bootstrap` detached — it loads the pipeline, binds
+# a local HTTP server on 127.0.0.1:$OCR_PORT that serves /ocr + /health, and
+# writes /models/.ocr-status.json read by the /ocr + /ocr/status routes. If the
+# pipeline load or the server bind fails the tool is marked deactivated and the
+# app hides it — the sandbox keeps running normally.
 mkdir -p /models 2>/dev/null || true
 if [ -w /models ]; then
   echo ""
   echo "Starting OCR engine bootstrap in the background..."
-  echo "  Models dir: /models  (llama-server log: /models/llama-server.log)"
+  echo "  Models dir: /app/models  (server log: /models/ocr-server.log)"
   # Color output is forced so the banners render in `docker logs`.
   OCR_FORCE_COLOR=1 setsid python /app/lib/ocr.py --bootstrap \
       < /dev/null &
 else
   echo "WARNING: /models is not writable — OCR tool will report deactivated."
-  echo "         Mount a /models volume to enable llama.cpp OCR."
+  echo "         Mount a /models volume to enable the PP-OCRv6 OCR engine."
 fi
 
 echo ""

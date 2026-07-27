@@ -18,10 +18,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg \
     libc6 libgcc-s1 libicu72 liblttng-ust1 libssl3 libstdc++6 libunwind8 zlib1g \
-    # Shared libs for the prebuilt llama.cpp ubuntu binary (CPU build). The
-    # server links libcurl (remote model fetch) + libssl/libcrypto; libgomp is
-    # OpenMP for CPU multi-threading. tar/gzip extract the release archive.
-    libcurl4 libnghttp2-14 libssh2-1 libpsl5 librtmp1 libldap-common libbrotli1 libidn2-0 \
+    # libgomp1: OpenMP runtime — used by the CPU torch/opencv stacks pulled in
+    # for the in-sandbox PP-OCRv6 OCR engine (paddleocr transformers engine).
     libgomp1 \
     libreoffice-writer libreoffice-impress \
     fonts-liberation fonts-noto fonts-noto-cjk \
@@ -34,6 +32,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget unzip tar gzip pandoc \
     # poppler-utils: provides pdftoppm for rasterizing PDFs in the OCR tool.
     poppler-utils \
+    # git-lfs: the PP-OCRv6 safetensors weights are shipped via LFS in
+    # docker-sandbox/app/models/ (the build host calls `git lfs pull` during
+    # checkout). The runtime itself does not need lfs, but installing it here
+    # keeps the toolchain self-contained for layered rebuilds.
+    git-lfs \
     supervisor gosu \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -70,7 +73,14 @@ RUN groupadd -r sandbox -g 1001 \
 # reproducibility, pin every package to an exact version (preferably via a
 # requirements.txt referenced here) and rebuild. --no-cache-dir keeps this
 # layer small.
+#
+# torch is installed first from the CPU-only wheel index so CUDA libs (which
+# add ~3GB) are never pulled; it powers the in-sandbox PP-OCRv6 OCR engine
+# (paddleocr transformers engine) running purely on CPU.
 RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch \
+    && pip install --no-cache-dir \
     jupyter ipython ipykernel \
     python-docx docxtpl python-pptx openpyxl lxml \
     pikepdf pdfplumber weasyprint \
@@ -86,9 +96,11 @@ RUN pip install --no-cache-dir \
     # the generated PDFs. Pre-installed so the agent doesn't waste a turn on
     # pip_install on every session.
     reportlab pypdf \
-    # gguf: used by the OCR bootstrap to patch clip.vision.image_max_pixels on the
-    # PaddleOCR-VL mmproj (required by the 'spotting' task).
-    gguf \
+    # OCR engine stack: PP-OCRv6_medium (det + rec safetensors). The
+    # transformers engine avoids needing the heavy paddlepaddle framework
+    # entirely — only `transformers` + `torch` (CPU, above) are required to
+    # run the baked-in safetensors weights under /app/models.
+    paddleocr transformers \
     playwright
 
 # ── Playwright browsers & deps ────────────────────────────────────────────────
@@ -108,10 +120,16 @@ WORKDIR /app
 
 COPY app/lib/ /app/lib/
 COPY app/scripts/ /app/scripts/
+# PP-OCRv6_medium detection + recognition safetensors, baked read-only into the
+# image (tracked via Git LFS — see .gitattributes). No runtime download: the OCR
+# bootstrap loads them straight from /app/models. Kept read-only for the
+# runtime user (rootfs is read-only anyway), so a compromised session cannot
+# tamper with the model weights.
+COPY app/models/ /app/models/
 COPY entrypoint.sh /app/entrypoint.sh
 COPY supervisord.conf /app/supervisord.conf
 
-RUN chmod 0755 /app /app/lib /app/scripts \
+RUN chmod 0755 /app /app/lib /app/scripts /app/models \
     && find /app/lib /app/scripts -type d -exec chmod 0755 {} + \
     && find /app/lib /app/scripts -type f -exec chmod 0644 {} + \
     && chmod 0755 /app/entrypoint.sh \

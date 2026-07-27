@@ -26,18 +26,18 @@ services:
       # One session cannot read another's data because the backend only
       # ever resolves paths inside the specific session directory.
       - ../data/agent-workspaces:/workspace
-      # OCR engine: llama.cpp binary + PaddleOCR-VL-1.6 GGUF models (persistent,
-      # writable; downloads only once on first start).
+      # OCR engine: PP-OCRv6_medium det+rec safetensors are baked into the
+      # image; /models only holds the readiness status file + server log
+      # (writable, no download).
       - ../data/agent-models:/models
     environment:
       - SANDBOX_LOG_LEVEL=info
       - SANDBOX_MAX_EXECUTION_TIME=300
       - SANDBOX_DEFAULT_TIMEOUT=60
       - TMPDIR=/tmp
-      # OCR / llama.cpp tuning (CPU-only).
-      - LLAMA_THREADS=4
-      - LLAMA_CTX=8192
-      - LLAMA_PORT=8181
+      # OCR / PP-OCRv6 tuning (CPU-only).
+      - OCR_THREADS=4
+      - OCR_PORT=8181
       - OCR_PDF_DPI=200
       - OCR_MAX_PAGES=15
     # Resource limits (mirror production constraints)

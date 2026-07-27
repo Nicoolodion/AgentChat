@@ -52,6 +52,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # The docker-sandbox image bakes in PP-OCRv6 safetensors weights that
+          # are tracked via Git LFS (.gitattributes → *.safetensors). Without
+          # this the COPY layer would ship LFS pointer files instead of the
+          # real model weights.
+          lfs: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

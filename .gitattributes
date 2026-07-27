@@ -1,0 +1,4 @@
+# Large model weights for the in-sandbox PP-OCRv6 OCR engine are tracked via
+# Git LFS so the repo history stays small. See
+# docker-sandbox/app/models/PP-OCRv6_medium_{det,rec}_safetensors/.
+*.safetensors filter=lfs diff=lfs merge=lfs -text
