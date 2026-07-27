@@ -74,12 +74,15 @@ RUN groupadd -r sandbox -g 1001 \
 # requirements.txt referenced here) and rebuild. --no-cache-dir keeps this
 # layer small.
 #
-# torch is installed first from the CPU-only wheel index so CUDA libs (which
-# add ~3GB) are never pulled; it powers the in-sandbox PP-OCRv6 OCR engine
-# (paddleocr transformers engine) running purely on CPU.
+# torch + torchvision are installed first from the CPU-only wheel index so CUDA
+# libs (which add ~3GB) are never pulled; they power the in-sandbox PP-OCRv6 OCR
+# engine (paddleocr transformers engine) running purely on CPU. torchvision is
+# required by the HuggingFace `AutoImageProcessor` the PaddleOCR preprocessor
+# loads at pipeline init — without it the OCR bootstrap dies with
+# "AutoImageProcessor requires the Torchvision library".
 RUN pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu \
-        torch \
+        torch torchvision \
     && pip install --no-cache-dir \
     jupyter ipython ipykernel \
     python-docx docxtpl python-pptx openpyxl lxml \
