@@ -1784,8 +1784,17 @@ function FilePreviewDialog({
         <div className="max-h-[calc(92vh-64px)] overflow-auto bg-slate-950 p-3">
           {file.mimeType.startsWith("image/") ? (
             <img src={url} alt={file.name} className="mx-auto max-h-[78vh] w-auto max-w-full rounded-lg" />
-          ) : file.mimeType === "application/pdf" || file.mimeType.startsWith("text/") || file.mimeType === "application/json" ? (
+          ) : file.mimeType === "application/pdf" ? (
             <iframe src={url} className="h-[78vh] w-full rounded-lg border border-white/10 bg-white" title={file.name} />
+          ) : file.mimeType.startsWith("text/") || file.mimeType === "application/json" ? (
+            <iframe
+              src={url}
+              // sandbox without allow-scripts: renders HTML visually but never
+              // executes untrusted scripts in the app's own origin.
+              sandbox=""
+              className="h-[78vh] w-full rounded-lg border border-white/10 bg-white"
+              title={file.name}
+            />
           ) : (
             <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 text-center">
               <File className="h-10 w-10 text-teal-200" />

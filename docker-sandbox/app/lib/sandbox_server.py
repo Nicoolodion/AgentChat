@@ -1810,11 +1810,13 @@ def _prepare_kimi_cache(runtime_dir: Path) -> tuple[Path, Path]:
         # in a tree whose .so / parent perms have rotted, so we always re-apply
         # the permission walk below.
         if not cache_binary.exists():
-            # rmtree is safe here because we hold the lock.
+            # rmtree is safe here because we hold the lock. ignore_errors in
+            # case a leftover file is unwritable; dirs_exist_ok on copytree
+            # below then still merges cleanly instead of FileExistsError-ing
+            # on a partially-removed tree (the previous 500-on-second-run bug).
             if cache_root.exists():
                 shutil.rmtree(cache_root, ignore_errors=True)
-            cache_root.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(runtime_dir, cache_root)
+            shutil.copytree(runtime_dir, cache_root, dirs_exist_ok=True)
             # kimi_pptd writes oxml template fragments next to itself at runtime;
             # ensure the dir exists and is traversable.
             (cache_root / "pptx" / "oxml").mkdir(parents=True, exist_ok=True)
