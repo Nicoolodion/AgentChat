@@ -37,7 +37,7 @@ import time
 import traceback
 import urllib.request
 import urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
@@ -65,13 +65,27 @@ OCR_PORT = int(os.environ.get("OCR_PORT", os.environ.get("LLAMA_PORT", "8181")))
 OCR_HOST = "127.0.0.1"
 OCR_DEVICE = os.environ.get("OCR_DEVICE", "cpu").strip() or "cpu"
 OCR_THREADS = int(os.environ.get("OCR_THREADS", os.environ.get("LLAMA_THREADS", "4")))
-OCR_USE_TEXTLINE_ORIENT = os.environ.get("OCR_USE_TEXTLINE_ORIENTATION", "1") == "1"
+# Text-line orientation classification adds an extra forward pass PER detected
+# text line AND pulls a 3rd model (PP-LCNet_x1_0_textline_ori) that is NOT
+# baked into the image — PaddleOCR auto-downloads it from HuggingFace at
+# pipeline init, which breaks offline operation and slows inference. Default
+# off for the in-sandbox CPU engine; set OCR_USE_TEXTLINE_ORIENTATION=1 to
+# re-enable when accuracy on rotated text matters more than speed.
+OCR_USE_TEXTLINE_ORIENT = os.environ.get("OCR_USE_TEXTLINE_ORIENTATION", "0") == "1"
 SERVER_READY_TIMEOUT = int(os.environ.get("OCR_READY_TIMEOUT", "180"))
 
 PDF_DPI = int(os.environ.get("OCR_PDF_DPI", "200"))
 MAX_PAGES = int(os.environ.get("OCR_MAX_PAGES", "15"))
 
-OCR_CALL_TIMEOUT = int(os.environ.get("OCR_CALL_TIMEOUT", "180"))
+# Cap the longest side of each image fed to the detector. The det preprocessor
+# ships limit_type="min" (it only upscales small images, never caps large
+# ones), so a high-res photo runs the detector at full resolution and then runs
+# recognition on every candidate region — easily 180s+ on a weak CPU. Capping
+# to 1568px keeps OCR accurate for readable text while making inference fast.
+# Set OCR_IMAGE_MAX_SIDE=0 to disable resizing.
+OCR_IMAGE_MAX_SIDE = int(os.environ.get("OCR_IMAGE_MAX_SIDE", "1568"))
+
+OCR_CALL_TIMEOUT = int(os.environ.get("OCR_CALL_TIMEOUT", "240"))
 
 # Tasks the agent may request. PP-OCRv6_medium (det+rec) genuinely supports
 # plain text extraction and text-region spotting with bboxes. Other structured
@@ -320,6 +334,11 @@ _PIPELINE: Any = None            # paddleocr.PaddleOCR instance
 _PIPELINE_LOCK = threading.Lock()
 _PIPELINE_ERR: Optional[str] = None
 _BOOTSTRAP_LIVE = False          # set True once http server has bound the port
+# Serializes inference calls: the transformers engine + CTC decode are NOT
+# thread-safe across concurrent predict() calls. The HTTP server is threaded
+# (so /health and /status stay responsive during a long /ocr), but only ONE
+# /ocr inference may run at a time — this lock enforces that.
+_INFERENCE_LOCK = threading.Lock()
 
 
 def _verify_local_models() -> tuple[bool, bool, list[str]]:
@@ -493,26 +512,90 @@ def _format_page(regions: list[dict[str, Any]], task: str) -> str:
     return "\n".join(r["text"] for r in regions if r["text"]) or "(no text detected)"
 
 
-def _run_image_ocr(image_path: str, task: str) -> tuple[str, list[dict[str, Any]]]:
-    """Run the pipeline on one image; return (formatted_text, regions)."""
-    pipeline = _ensure_pipeline()
-    # PaddleOCR 3.x `predict()` accepts positional `input` only on some
-    # versions and `batch_size` only on others; call it positionally to avoid
-    # "got an unexpected keyword argument" across API variants.
+def _prepare_image(image_path: str) -> tuple[str, float]:
+    """Optionally downscale a large image before feeding it to the detector.
+
+    The det preprocessor ships limit_type="min" (only upscales small images,
+    never caps large ones), so a high-res photo would run the detector at full
+    resolution — very slow on CPU. We cap the longest side to OCR_IMAGE_MAX_SIDE
+    (preserving aspect ratio) and write the resized image to a temp file. The
+    returned scale factor maps bbox coords from the resized image back to the
+    original (used by the 'spotting' task).
+
+    Returns (path_to_feed, scale). scale == 1.0 when no resize was needed (the
+    original path is returned unchanged in that case).
+    """
+    cap = OCR_IMAGE_MAX_SIDE
+    if cap <= 0:
+        return image_path, 1.0
     try:
-        output = pipeline.predict(image_path)
-    except TypeError:
-        output = pipeline.predict(input=image_path)
-    res_dict: dict[str, Any] = {}
-    try:
-        first = next(iter(output))
-        res_dict = _result_dict(first)
-    except StopIteration:
-        pass
+        from PIL import Image  # type: ignore  # local: keeps Pillow out of gunicorn
     except Exception:
-        pass
-    regions = _extract_regions(res_dict)
-    return _format_page(regions, task), regions
+        return image_path, 1.0
+    try:
+        with Image.open(image_path) as im:
+            w, h = im.size
+            longest = max(w, h)
+            if longest <= cap:
+                return image_path, 1.0
+            scale = longest / cap
+            nw = max(1, round(w / scale))
+            nh = max(1, round(h / scale))
+            im = im.convert("RGB")
+            resized = im.resize((nw, nh), Image.LANCZOS)
+            tmp_path = image_path + ".ocrresized.png"
+            resized.save(tmp_path, format="PNG")
+            return tmp_path, scale
+    except Exception as e:
+        log(f"image pre-resize skipped ({e}); feeding original", level="warn")
+        return image_path, 1.0
+
+
+def _scale_regions(regions: list[dict[str, Any]], scale: float) -> list[dict[str, Any]]:
+    """Scale bbox coords from the (resized) image space back to the original."""
+    if scale == 1.0:
+        return regions
+    for r in regions:
+        x1, y1, x2, y2 = r["bbox"]
+        r["bbox"] = [int(round(x1 * scale)), int(round(y1 * scale)),
+                     int(round(x2 * scale)), int(round(y2 * scale))]
+    return regions
+
+
+def _run_image_ocr(image_path: str, task: str) -> tuple[str, list[dict[str, Any]]]:
+    """Run the pipeline on one image; return (formatted_text, regions).
+
+    Pre-resizes large images (see _prepare_image) for speed on CPU, then maps
+    any bboxes back to the original coordinate space.
+    """
+    pipeline = _ensure_pipeline()
+    feed_path, scale = _prepare_image(image_path)
+    tmp_resized = feed_path != image_path
+    try:
+        # PaddleOCR 3.x `predict()` accepts positional `input` only on some
+        # versions and `batch_size` only on others; call it positionally to
+        # avoid "got an unexpected keyword argument" across API variants.
+        try:
+            output = pipeline.predict(feed_path)
+        except TypeError:
+            output = pipeline.predict(input=feed_path)
+        res_dict: dict[str, Any] = {}
+        try:
+            first = next(iter(output))
+            res_dict = _result_dict(first)
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+        regions = _extract_regions(res_dict)
+        regions = _scale_regions(regions, scale)
+        return _format_page(regions, task), regions
+    finally:
+        if tmp_resized:
+            try:
+                os.unlink(feed_path)
+            except Exception:
+                pass
 
 
 def _handle_ocr_request(input_path: str, task: str) -> dict[str, Any]:
@@ -614,10 +697,14 @@ class _OcrHandler(BaseHTTPRequestHandler):
         if not input_path:
             self._send(400, {"error": "missing input_path"})
             return
-        # The single-threaded HTTPServer already serializes requests, so no
-        # extra locking is needed here — and we must NOT take _PIPELINE_LOCK
-        # (it is a non-reentrant lock held while _ensure_pipeline loads the
-        # model; _ensure_pipeline is reachable from _handle_ocr_request).
+        # The HTTP server is threaded so /health and /status stay responsive,
+        # but inference is NOT thread-safe — serialize it with _INFERENCE_LOCK.
+        # If another inference is already running, refuse fast (503 busy)
+        # instead of queueing behind it (which would pile up past the client
+        # timeout). acquire(timeout=...) avoids an indefinite block.
+        if not _INFERENCE_LOCK.acquire(timeout=OCR_CALL_TIMEOUT):
+            self._send(503, {"error": "OCR engine is busy with another request; retry shortly."})
+            return
         try:
             result = _handle_ocr_request(input_path, task)
         except OcrUnavailable as e:
@@ -628,14 +715,20 @@ class _OcrHandler(BaseHTTPRequestHandler):
             log(f"ocr inference failed: {e}\n{tb}", level="error")
             self._send(500, {"error": f"ocr inference failed: {e}"})
             return
+        finally:
+            _INFERENCE_LOCK.release()
         self._send(200, result)
 
 
-def _start_http_server() -> Optional[HTTPServer]:
+def _start_http_server() -> Optional[ThreadingHTTPServer]:
     """Bind the OCR HTTP server on 127.0.0.1:OCR_PORT. Returns the server
-    or None if the port was busy / unavailable."""
+    or None if the port was busy / unavailable.
+
+    Uses ThreadingHTTPServer so /health and /status can be answered even while
+    a long /ocr inference is running (inference itself is serialized via
+    _INFERENCE_LOCK in the handler, since predict() is not thread-safe)."""
     try:
-        srv = HTTPServer((OCR_HOST, OCR_PORT), _OcrHandler)
+        srv = ThreadingHTTPServer((OCR_HOST, OCR_PORT), _OcrHandler)
     except OSError as e:
         log(f"could not bind {OCR_HOST}:{OCR_PORT}: {e}", level="error")
         return None
@@ -743,7 +836,7 @@ def bootstrap() -> None:
         pass
 
 
-def _serve_forever(srv: HTTPServer) -> None:
+def _serve_forever(srv: ThreadingHTTPServer) -> None:
     try:
         srv.serve_forever()
     except Exception as e:
