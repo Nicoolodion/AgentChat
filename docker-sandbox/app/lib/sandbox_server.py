@@ -1844,14 +1844,27 @@ def _prepare_kimi_cache(runtime_dir: Path) -> tuple[Path, Path]:
             lf.close()
 
 
-def _resolve_kimi_pptd() -> tuple[Path, Path]:
+def _resolve_kimi_pptd(needs_certifi: bool = False) -> tuple[Path, Path]:
     """Return (binary_path, runtime_dir) for the kimi_pptd executable.
 
     Prefers the mounted binary when it is already executable by others (fast
     path, no copy) AND the skills mount allows execution. Otherwise prepares
     (and validates) the writable cache copy on an exec-capable mount. The
     runtime_dir returned is the directory whose libs/templates the binary
-    expects to find next to itself (used for LD_LIBRARY_PATH)."""
+    expects to find next to itself (used for LD_LIBRARY_PATH).
+
+    ``needs_certifi``: when True, the action being prepared (convert/screenshot)
+    imports ``requests`` at runtime, which — in requests >=2.32 — calls
+    ``certifi.where()`` at IMPORT time and ``SSLContext.load_verify_locations``
+    on the result. The compiled-in ``certifi`` resolves ``cacert.pem`` to a
+    path NEXT TO the binary (``<runtime_dir>/certifi/cacert.pem``). The
+    read-only skills mount never carries that data file, so taking the fast
+    path there makes ``import requests`` raise ``FileNotFoundError`` in
+    ``adapters.py`` and the whole convert/render path crashes (check is
+    unaffected — it never imports requests). Gating the fast path on the
+    CA bundle's presence routes such actions through ``_prepare_kimi_cache``,
+    whose ``_ensure_runtime_data_pkgs`` copies a real ``certifi/cacert.pem``
+    next to the cached binary."""
     runtime_dir = SKILLS_ROOT / "pptx" / "scripts" / "runtime"
     binary = runtime_dir / "kimi_pptd"
     if not binary.exists():
@@ -1864,10 +1877,15 @@ def _resolve_kimi_pptd() -> tuple[Path, Path]:
     # (we cannot write an exec probe into it) but is a bind from the host FS,
     # which is exec by default — so an exec-bit-present binary here can be run in
     # place with no copy. If the host checkout lost the exec bit (Windows/CI),
-    # this check fails and we fall through to the prepared cache.
+    # this check fails and we fall through to the prepared cache. Additionally,
+    # when the action imports requests we require certifi/cacert.pem to already
+    # sit next to the mounted binary; otherwise the bundled requests crashes at
+    # import (see needs_certifi above) and we must use the cache where the data
+    # file is materialized.
     try:
         if binary.stat().st_mode & 0o001:  # S_IXOTH
-            return binary, runtime_dir
+            if not needs_certifi or (runtime_dir / "certifi" / "cacert.pem").exists():
+                return binary, runtime_dir
     except OSError:
         pass
 
@@ -1973,7 +1991,9 @@ def _prepare_pptx_run(
             if action == "screenshot" or output_path.endswith("/"):
                 out_file.mkdir(parents=True, exist_ok=True)
 
-    binary, runtime_dir = _resolve_kimi_pptd()
+    binary, runtime_dir = _resolve_kimi_pptd(
+        needs_certifi=action in ("convert", "screenshot")
+    )
 
     argv_tail: list[str] = []
     if action in ("convert", "screenshot") and out_file is not None:
