@@ -496,7 +496,13 @@ def _format_page(regions: list[dict[str, Any]], task: str) -> str:
 def _run_image_ocr(image_path: str, task: str) -> tuple[str, list[dict[str, Any]]]:
     """Run the pipeline on one image; return (formatted_text, regions)."""
     pipeline = _ensure_pipeline()
-    output = pipeline.predict(input=image_path, batch_size=1)
+    # PaddleOCR 3.x `predict()` accepts positional `input` only on some
+    # versions and `batch_size` only on others; call it positionally to avoid
+    # "got an unexpected keyword argument" across API variants.
+    try:
+        output = pipeline.predict(image_path)
+    except TypeError:
+        output = pipeline.predict(input=image_path)
     res_dict: dict[str, Any] = {}
     try:
         first = next(iter(output))

@@ -22,6 +22,14 @@ on:
       - 'docs/**'
   workflow_dispatch: {}
 
+# Cancel any in-progress run for the same branch when a new commit lands.
+# The newer run will build + deploy the latest commit, so the superseded one
+# has nothing useful left to do. Safe: the host deploy-webhook is stateless
+# per-run and the next run re-triggers it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   # Parsed groups; image names live inline in the matrix below so GHCR's
@@ -56,8 +64,9 @@ jobs:
           # The docker-sandbox image bakes in PP-OCRv6 safetensors weights that
           # are tracked via Git LFS (.gitattributes → *.safetensors). Without
           # this the COPY layer would ship LFS pointer files instead of the
-          # real model weights.
-          lfs: true
+          # real model weights. Only the sandbox actually needs LFS objects,
+          # so skip the (slow) LFS fetch for the app + webhook images.
+          lfs: ${{ matrix.image == 'sandbox' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -105,7 +114,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Install platform-specific native bindings
         run: npm install --no-save @rolldown/binding-linux-x64-gnu@1.0.0-rc.16 @node-rs/argon2-linux-x64-gnu@2.0.2
