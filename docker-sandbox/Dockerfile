@@ -42,9 +42,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # ── Node.js 20 ────────────────────────────────────────────────────────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# NodeSource's setup_20.x repo script started returning 403 (their legacy
+# deb repo was retired), so install from the official nodejs.org binary
+# tarball instead. Pinning an exact version keeps the build reproducible and
+# avoids depending on any third-party apt infrastructure. nodejs.org/dist
+# never removes published releases, so this URL is permanent.
+# Using the .tar.gz (not .tar.xz) so plain `tar` can extract it without
+# needing xz-utils (not in the slim base image).
+ENV NODE_VERSION=20.20.2
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" \
+        -o /tmp/node.tar.gz \
+    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.gz \
+    && node --version && npm --version
 
 # ── .NET 8 SDK ────────────────────────────────────────────────────────────────
 # Required by the `docx` skill, which builds DOCX files via a C# + OpenXML SDK
