@@ -7,11 +7,11 @@ import { decryptBuffer, decryptString, encryptBuffer, encryptString } from "@/li
 import { env } from "@/lib/env";
 
 const FILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
-const MAX_ATTACHMENTS_PER_MESSAGE = 40;
-const MAX_TEXT_PER_ATTACHMENT = 32_000;
-const MAX_TOTAL_EXTRACTED_TEXT = 28_000;
-const MAX_PDF_IMAGE_PAGES = 50;
+const MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 50;
+const MAX_TEXT_PER_ATTACHMENT = 128_000;
+const MAX_TOTAL_EXTRACTED_TEXT = 56_000;
+const MAX_PDF_IMAGE_PAGES = 100;
 const IMAGE_RENDER_SCALE = 1.35;
 
 const IMAGE_MIME_TYPES = new Set([
