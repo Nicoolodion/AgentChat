@@ -424,25 +424,42 @@ def _ensure_pipeline() -> Any:
 # The exact key set drifts across versions, so probe defensively.
 
 def _result_dict(r: Any) -> dict[str, Any]:
+    """Extract the per-image result dict from a PaddleOCR result object.
+
+    PaddleOCR 3.x wraps results: `result.json` returns ``{"res": {...}}`` where
+    the inner ``res`` dict holds the actual fields (dt_polys, rec_texts, …).
+    We unwrap that single-key wrapper so callers see the real fields directly.
+    """
     for attr in ("json", "res"):
         try:
             v = getattr(r, attr, None)
         except Exception:
             v = None
         if isinstance(v, dict):
-            return v
+            return _unwrap_res(v)
         if callable(v):
             try:
                 vv = v()
                 if isinstance(vv, dict):
-                    return vv
+                    return _unwrap_res(vv)
             except Exception:
                 pass
     # Raw object dict fallback.
     try:
-        return dict(r)  # type: ignore[arg-type]
+        return _unwrap_res(dict(r))  # type: ignore[arg-type]
     except Exception:
         return {}
+
+
+def _unwrap_res(d: dict[str, Any]) -> dict[str, Any]:
+    """If d is exactly {'res': {...}}, return the inner dict; else d."""
+    if (
+        len(d) == 1
+        and "res" in d
+        and isinstance(d["res"], dict)
+    ):
+        return d["res"]
+    return d
 
 
 def _as_list(v: Any) -> list[Any]:
@@ -477,10 +494,13 @@ def _poly_to_bbox(poly: Any) -> list[int]:
 
 
 def _extract_regions(res_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    # Prefer pre-computed axis-aligned bboxes (rec_boxes) when present; fall
+    # back to converting rec_polys / dt_polys.
+    boxes = _as_list(res_dict.get("rec_boxes"))
     polys = _as_list(res_dict.get("rec_polys") or res_dict.get("dt_polys"))
     texts = _as_list(res_dict.get("rec_texts"))
     scores = _as_list(res_dict.get("rec_scores"))
-    n = max(len(polys), len(texts))
+    n = max(len(boxes), len(polys), len(texts))
     regions: list[dict[str, Any]] = []
     for i in range(n):
         text = ""
@@ -488,7 +508,9 @@ def _extract_regions(res_dict: dict[str, Any]) -> list[dict[str, Any]]:
         score: float = 0.0
         if i < len(texts):
             text = str(texts[i]) if texts[i] is not None else ""
-        if i < len(polys):
+        if i < len(boxes):
+            bbox = _box_from_list(boxes[i]) if boxes[i] is not None else [0, 0, 0, 0]
+        elif i < len(polys):
             bbox = _poly_to_bbox(polys[i])
         if i < len(scores):
             try:
@@ -497,6 +519,17 @@ def _extract_regions(res_dict: dict[str, Any]) -> list[dict[str, Any]]:
                 score = 0.0
         regions.append({"bbox": bbox, "score": score, "text": text})
     return regions
+
+
+def _box_from_list(b: Any) -> list[int]:
+    """Coerce a 4-element iterable to [x1,y1,x2,y2] ints (rec_boxes shape)."""
+    vals = _as_list(b)
+    if len(vals) < 4:
+        return [0, 0, 0, 0]
+    try:
+        return [int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3])]
+    except (TypeError, ValueError):
+        return [0, 0, 0, 0]
 
 
 def _format_page(regions: list[dict[str, Any]], task: str) -> str:
