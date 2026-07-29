@@ -13,7 +13,7 @@
 # Update (manual: pull prebuilt images + recreate):
 #   docker compose --profile full pull && docker compose --profile full up -d
 # Update (automatic): push to master -> GitHub Actions builds + pushes images
-#   -> POSTs to deploy-webhook -> deploy.sh pulls + recreates app/sandbox.
+#   -> POSTs to deploy-webhook -> deploy.sh pulls + recreates app + sandbox.
 #
 # The companion agent sandbox lives in docker-sandbox/ and is built from its
 # own Dockerfile by the same CI workflow. The deploy webhook receiver lives in
@@ -36,6 +36,12 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: 3000
       DATABASE_URL: file:/app/data/chatinterface.db
+      # Pin the agent's search backend to the in-stack SearXNG (added in this
+      # compose) instead of the old LAN host: the sandbox egresses through the
+      # VPN netns and cannot reach a LAN address, and a stale SEARXNG_URL in the
+      # host .env would silently break search after a deploy. This explicit
+      # value takes precedence over .env; edit here (not .env) to change it.
+      SEARXNG_URL: http://searxng:8080
     ports:
       - "3000:3000"
     networks:
@@ -178,6 +184,63 @@ services:
     sysctls:
       - net.ipv4.ip_unprivileged_port_start=1024
 
+  # ── sandbox-watchdog ──────────────────────────────────────────────────────
+  # Self-heals the agent-sandbox <-> gluetun network coupling. The sandbox
+  # shares gluetun's netns (`network_mode: service:gluetun`); whenever the
+  # gluetun CONTAINER restarts for any reason (manual restart, a recreate, a
+  # daemon/host event) it gets a fresh netns and the still-running sandbox is
+  # stranded on the destroyed one. The sandbox's loopback healthcheck keeps
+  # passing so Docker still reports it "healthy", but it is unreachable from
+  # the app at http://gluetun:8080 -> the app reports "sandbox offline".
+  #
+  # Compose's `depends_on` only orders startup (it does not restart dependents
+  # on a later dependency restart), so this lightweight probe loop is the
+  # permanent fix: it hits the sandbox through the SAME path the app uses and
+  # restarts the sandbox container (re-attaching it to gluetun's current netns)
+  # when it goes silent — but only while gluetun is healthy, so the VPN tunnel
+  # itself is never touched.
+  #
+  # See deploy/sandbox-watchdog.sh for the full rationale + logic.
+  sandbox-watchdog:
+    image: docker:cli
+    container_name: chatinterface-sandbox-watchdog
+    restart: unless-stopped
+    pull_policy: missing
+    profiles: ["full"]
+    entrypoint: ["/bin/sh", "/app/sandbox-watchdog.sh"]
+    networks:
+      - app-net
+    volumes:
+      # Absolute host path (not a relative bind): the compose CLI driving this
+      # service may run from a container (e.g. the unraid MCP) whose cwd is not
+      # a real host path, so a relative bind would make Docker mount an empty
+      # placeholder and the script would be unreadable. Using $HOST_DEPLOY_PATH
+      # (already set in .env) keeps the source correct regardless of which
+      # client creates/recreates the container.
+      - ${HOST_DEPLOY_PATH}/deploy/sandbox-watchdog.sh:/app/sandbox-watchdog.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      gluetun:
+        condition: service_healthy
+      agent-sandbox:
+        condition: service_started
+    environment:
+      - SANDBOX_CONTAINER=chatinterface-agent-sandbox
+      - GLUETUN_CONTAINER=chatinterface-gluetun
+      - SANDBOX_HEALTH_URL=http://gluetun:8080/health
+      - WATCHDOG_INTERVAL_SECONDS=30
+      - WATCHDOG_FAILURE_THRESHOLD=3
+      - WATCHDOG_COOLDOWN_SECONDS=45
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
+
   # Deploy webhook receiver. Listens on 127.0.0.1:9000; expose it via your
   # reverse proxy (e.g. deploy.<your-domain> -> 127.0.0.1:9000). GitHub Actions
   # posts to /deploy with header X-Webhook-Secret; the container validates it,
@@ -232,6 +295,60 @@ services:
         max-size: "5m"
         max-file: "2"
 
+  # Self-hosted SearXNG metasearch — free and privacy-preserving (no tracking,
+  # aggregates upstream engines anonymously). The agent's `web_search` tool
+  # queries it over its JSON API.
+  #
+  # Runs on app-net (NOT in gluetun's netns) so it egresses via the host's
+  # normal routing, exactly like the app/ntfy. The agent-sandbox shares
+  # gluetun's netns and reaches this service over the local docker bridge:
+  # gluetun auto-allows its own local ipnet (172.x.0.0/16), so the query path
+  # sandbox -> searxng stays on the LAN and never enters the VPN tunnel. This
+  # is why SEARXNG_URL=http://searxng:8080 works from the sandbox even though
+  # all of its internet egress is tunneled.
+  #
+  # JSON output must be enabled in settings (disabled by default) and the limiter
+  # disabled (the only client is our sandbox). /etc/searxng is a tmpfs (empty +
+  # world-writable at boot) so the non-root searxng runtime can write settings
+  # there directly via the wrapper below; a bind/named volume would ship a
+  # root-owned template the runtime cannot overwrite. The config is regenerated
+  # on every boot from the base64 blob; deploy/searxng-settings.yml is the
+  # human-readable source of truth.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: chatinterface-searxng
+    restart: unless-stopped
+    pull_policy: always
+    profiles: ["full"]
+    networks:
+      - app-net
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    tmpfs:
+      - /etc/searxng:rw,nosuid,nodev,size=33554432,mode=0777
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /etc/searxng
+        printf '%s' 'IyBTZWFyWE5HIHNldHRpbmdzIGZvciB0aGUgQ2hhdGludGVyZmFjZSBzdGFjay4KIwojIFRoZSBhZ2VudCdzIHdlYl9zZWFyY2ggdG9vbCBxdWVyaWVzIHRoaXMgaW5zdGFuY2Ugd2l0aCA/Zm9ybWF0PWpzb24sIHNvIHRoZQojIEpTT04gb3V0cHV0IGZvcm1hdCBNVVNUIGJlIGVuYWJsZWQgKGl0IGlzIGRpc2FibGVkIGJ5IGRlZmF1bHQpLiBUaGUgbGltaXRlcgojIChib3QgcHJvdGVjdGlvbiAvIHJhdGUtbGltaXQgbWlkZGxld2FyZSkgaXMgZGlzYWJsZWQgYmVjYXVzZSB0aGUgb25seSBjbGllbnQKIyBpcyBvdXIgb3duIHNhbmRib3gsIGFuZCB0aGUgbGltaXRlciB3b3VsZCByZWplY3QgaXRzIHJlcXVlc3RzIG9yIDQyOSB0aGVtLgojIE5vIFJlZGlzIGlzIGNvbmZpZ3VyZWQgKHNlZSB0aGUgdG1wZnMgL2V0Yy9zZWFyeG5nL2RhdGEgbW91bnQgaW4gY29tcG9zZSkuCgp1c2VfZGVmYXVsdF9zZXR0aW5nczogdHJ1ZQoKZ2VuZXJhbDoKICBpbnN0YW5jZV9uYW1lOiAiQ2hhdGludGVyZmFjZSBTZWFyY2giCgpzZWFyY2g6CiAgc2FmZV9zZWFyY2g6IDAKICBhdXRvY29tcGxldGU6ICIiCiAgZGVmYXVsdF9sYW5nOiAiZW4iCiAgZm9ybWF0czoKICAgIC0gaHRtbAogICAgLSBqc29uCgpzZXJ2ZXI6CiAgc2VjcmV0X2tleTogIjEwYjIzMTU0ZmI3ODhmN2Y4ODg3NDk5MzYyMGUwM2E2NDIyMDhmYzIwNjU4YWE3YjNhNWMxYjRjOTlhNjY4MmEiCiAgbGltaXRlcjogZmFsc2UKICBwdWJsaWNfaW5zdGFuY2U6IGZhbHNlCiAgaW1hZ2VfcHJveHk6IGZhbHNlCiAgbWV0aG9kOiAiUE9TVCIKCnVpOgogIHN0YXRpY191c2VfaGFzaDogdHJ1ZQoKb3V0Z29pbmc6CiAgcmVxdWVzdF90aW1lb3V0OiA4LjAKICBtYXhfcmVxdWVzdF90aW1lb3V0OiAxMi4wCiAgdXNlcmFnZW50X3N1ZmZpeDogIiIK' | base64 -d > /etc/searxng/settings.yml
+        exec /usr/local/searxng/entrypoint.sh
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
   # ntfy (self-hosted, UnifiedPush-compatible) push server. The Android app
   # subscribes to its per-user topic; the app POSTs to it on task completion.
   # Upstream official image — no custom build needed. Behind your reverse
@@ -249,7 +366,13 @@ services:
       - app-net
     volumes:
       - ./data/ntfy:/var/lib/ntfy
-      - ./deploy/ntfy.yml:/etc/ntfy/server.yml:ro
+      # Absolute host path (same pattern as sandbox-watchdog): the deploy
+      # webhook keeps $HOST_DEPLOY_PATH a live git checkout, so the committed
+      # config is always present there. A relative `./deploy/ntfy.yml` bind is
+      # fragile because compose's cwd path may not exist as a file on the host
+      # daemon, yielding an empty placeholder *directory* (ntfy then fails
+      # with "read server.yml: is a directory").
+      - ${HOST_DEPLOY_PATH}/deploy/ntfy.yml:/etc/ntfy/server.yml:ro
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL}
     healthcheck:

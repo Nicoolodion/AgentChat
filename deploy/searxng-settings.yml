@@ -1,0 +1,44 @@
+# SearXNG settings for the Chatinterface stack.
+#
+# This is the HUMAN-READABLE source of truth for the SearXNG config. The
+# running container does NOT mount this file (a host-file bind is fragile when
+# compose is driven from a container whose cwd isn't the host path); instead
+# the docker-compose `searxng` service regenerates /etc/searxng/settings.yml at
+# boot from a base64 blob of this very file. If you edit settings here, re-encode
+# to base64 and update the blob in docker-compose.yml, then recreate searxng:
+#   base64 -w0 deploy/searxng-settings.yml   # paste into the entrypoint printf
+#   docker compose --profile full up -d --force-recreate searxng
+#
+# The agent's web_search tool queries this instance with ?format=json, so the
+# JSON output format MUST be enabled (it is disabled by default). The limiter
+# (bot protection / rate-limit middleware) is disabled because the only client
+# is our own sandbox, and the limiter would reject its requests or 429 them.
+# No Redis is configured (see the tmpfs /etc/searxng mount in compose).
+
+use_default_settings: true
+
+general:
+  instance_name: "Chatinterface Search"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "10b23154fb788f7f88874993620e03a642208fc20658aa7b3a5c1b4c99a6682a"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "POST"
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+  useragent_suffix: ""
