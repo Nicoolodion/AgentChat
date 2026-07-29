@@ -1726,7 +1726,10 @@ print(json.dumps(out))
       const meta = extractPageMeta(parsed.body ?? "");
 
       // Non-text / binary responses: describe them instead of dumping bytes.
-      if (!isHtmlBody(contentType, finalUrl) && !parsed.body) {
+      // Pass the body to isHtmlBody so that a missing Content-Type header
+      // (e.g. Amazon) is sniffed — otherwise genuinely-HTML pages with no
+      // Content-Type would be misdescribed as binary and their content dropped.
+      if (!isHtmlBody(contentType, finalUrl, parsed.body) && !parsed.body) {
         const desc = describeBinaryResponse({
           contentType,
           url,
@@ -1741,7 +1744,10 @@ print(json.dumps(out))
       }
 
       const rawBody = parsed.body ?? "";
-      const htmlBody = isHtmlBody(contentType, finalUrl);
+      // Sniff the body when the Content-Type is missing/ambiguous (Amazon and
+      // others omit it) so markdown/text conversion and embedded-data
+      // extraction actually run instead of returning raw HTML.
+      const htmlBody = isHtmlBody(contentType, finalUrl, rawBody);
       // Title/URL that may be overridden by a headless-browser render below.
       let displayTitle = meta.title;
       let displayUrl = finalUrl;

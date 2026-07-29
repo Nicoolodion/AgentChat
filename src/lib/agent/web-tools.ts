@@ -70,6 +70,7 @@ export function deriveReferer(url: string): string {
 export function classifyContentType(
   contentType: string | null | undefined,
   url: string | null | undefined,
+  body?: string | null,
 ): ClassifiedContentType {
   const ct = (contentType ?? "").toLowerCase().split(";")[0]!.trim();
   const path = (url ?? "").toLowerCase().split("?")[0]!;
@@ -90,13 +91,30 @@ export function classifyContentType(
   if (["html", "htm"].includes(ext)) return "html";
   if (["txt", "md", "csv", "log"].includes(ext)) return "text";
 
+  // When the content-type is absent (e.g. Amazon returns no Content-Type
+  // header), sniff the leading bytes of the body. Many sites omit the header
+  // but still serve HTML; without this sniff, web_fetch would return the raw
+  // HTML unconverted because isHtmlBody() returns false. We only sniff when
+  // the content-type is genuinely missing or a generic octet-stream, and we
+  // require an unambiguous HTML signature so JSON/text are never misdetected.
+  if ((!ct || ct === "application/octet-stream") && body) {
+    const head = body.slice(0, 1024).toLowerCase();
+    if (/^\s*<!doctype\s+html/.test(head) || /^\s*<html\b/.test(head) || /<html\b[^>]*>/.test(head)) {
+      return "html";
+    }
+  }
+
   if (!ct || ct === "application/octet-stream") return "binary";
   if (ct.startsWith("text/")) return "text";
   return "binary";
 }
 
-export function isHtmlBody(contentType: string | null | undefined, url: string | null | undefined): boolean {
-  return classifyContentType(contentType, url) === "html";
+export function isHtmlBody(
+  contentType: string | null | undefined,
+  url: string | null | undefined,
+  body?: string | null,
+): boolean {
+  return classifyContentType(contentType, url, body) === "html";
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
@@ -666,12 +684,22 @@ export function htmlToMarkdown(html: string, baseUrl: string | null = null): str
   // Headings
   for (let i = 6; i >= 1; i--) {
     const re = new RegExp(`<h${i}\\b[^>]*>([\\s\\S]*?)</h${i}>`, "gi");
-    s = s.replace(re, (_, inner) => `\n\n${"#".repeat(i)} ${flattenInline(inner, baseUrl)}\n\n`);
+    s = s.replace(re, (_, inner) => `\n\n${"#".repeat(i)} ${collapseInline(flattenInline(inner, baseUrl))}\n\n`);
   }
   // Paragraphs
   s = s.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, (_, inner) => `\n\n${flattenInline(inner, baseUrl)}\n\n`);
-  // Lists
-  s = s.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_, inner) => `\n- ${flattenInline(inner, baseUrl)}`);
+  // Lists — collapse each item's text onto a single line so nested block tags
+  // (Amazon's nav <li> with multi-element shortcuts, definition lists, ...)
+  // don't produce dangling empty bullets / text on its own lines. Skip items
+  // with no visible text (e.g. Amazon's image-thumbnail <li> that contain only
+  // structural spans/decorative divs).
+  s = s.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_, inner) => {
+    // Measure text content after tag stripping — flattenInline keeps spans,
+    // so checking the raw inner would wrongly keep tag-only items.
+    if (!stripTags(inner).replace(/&nbsp;|\s/g, "").trim()) return "";
+    const text = collapseInline(flattenInline(inner, baseUrl));
+    return text ? `\n- ${text}` : "";
+  });
   s = s.replace(/<\/?(ul|ol)\b[^>]*>/gi, "\n");
   // Blockquotes
   s = s.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi, (_, inner) =>
@@ -715,10 +743,19 @@ function flattenInline(html: string, baseUrl: string | null = null): string {
     const alt = attr(ALT_RE, full) ?? "";
     return src ? `![${alt}](${src})` : "";
   });
-  // Bold
-  s = s.replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_, _t, inner) => `**${flattenInline(inner, baseUrl)}**`);
+  // Bold — drop the wrapper entirely when empty (Amazon sprinkles empty
+  // <strong></strong> around nav/button chrome → stray "**" in the output).
+  s = s.replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_, _t, inner) => {
+    const flat = flattenInline(inner, baseUrl);
+    if (!flat.trim()) return "";
+    return `**${flat}**`;
+  });
   // Italic
-  s = s.replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_, _t, inner) => `*${flattenInline(inner, baseUrl)}*`);
+  s = s.replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_, _t, inner) => {
+    const flat = flattenInline(inner, baseUrl);
+    if (!flat.trim()) return "";
+    return `*${flat}*`;
+  });
   // Inline code
   s = s.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_, inner) => `\`${stripTags(inner).trim()}\``);
   // Spans / etc left as-is; they'll be stripped below.
@@ -727,6 +764,14 @@ function flattenInline(html: string, baseUrl: string | null = null): string {
 
 function stripTags(html: string): string {
   return html.replace(/<[^>]+>/g, "");
+}
+
+/** Collapse all runs of whitespace (incl. newlines) to single spaces and trim.
+ *  Used for inline contexts (list items, headings, table cells) where nested
+ *  block tags or pretty-printed HTML would otherwise leave text spread across
+ *  multiple lines, producing dangling empty bullets and garbled Markdown. */
+function collapseInline(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
 }
 
 function convertTables(html: string, baseUrl: string | null = null): string {

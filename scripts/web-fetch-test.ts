@@ -83,9 +83,17 @@ async function fetchOne(rawUrl: string, format: FetchFormat = "markdown"): Promi
     const contentType = resp.headers.get("content-type") ?? "";
     const raw = Buffer.from(await resp.arrayBuffer());
     const size = raw.length;
-    const kind = classifyContentType(contentType, finalUrl);
+    const charset = /charset=([^;]+)/i.exec(contentType)?.[1]?.trim() ?? "utf-8";
+    let body: string;
+    try {
+      body = raw.toString(charset as BufferEncoding);
+    } catch {
+      body = raw.toString("utf-8");
+    }
 
-    if (!isHtmlBody(contentType, finalUrl)) {
+    const kind = classifyContentType(contentType, finalUrl, body);
+
+    if (!isHtmlBody(contentType, finalUrl, body)) {
       const desc = describeBinaryResponse({
         contentType: contentType || null,
         url: rawUrl,
@@ -96,14 +104,6 @@ async function fetchOne(rawUrl: string, format: FetchFormat = "markdown"): Promi
         url: rawUrl, ok: true, status: resp.status, contentType, finalUrl, size,
         format, kind, binary: true, content: desc,
       };
-    }
-
-    const charset = /charset=([^;]+)/i.exec(contentType)?.[1]?.trim() ?? "utf-8";
-    let body: string;
-    try {
-      body = raw.toString(charset as BufferEncoding);
-    } catch {
-      body = raw.toString("utf-8");
     }
 
     const pageMeta = extractPageMeta(body);

@@ -76,6 +76,18 @@ describe("web-tools: classifyContentType", () => {
   it("falls back to binary for unknown octet-stream", () => {
     expect(classifyContentType("application/octet-stream", "https://x.test/a.bin")).toBe("binary");
   });
+  it("sniffs html from the body when the content-type is missing (Amazon)", () => {
+    // Amazon product pages return no Content-Type header; without body
+    // sniffing, web_fetch would treat them as binary and drop the content.
+    const body = '<!DOCTYPE html><html lang="de"><head><title>X</title></head><body><p>hi</p></body></html>';
+    expect(classifyContentType("", "https://www.amazon.de/dp/B0DT1MXW1G", body)).toBe("html");
+    expect(isHtmlBody("", "https://www.amazon.de/dp/B0DT1MXW1G", body)).toBe(true);
+    expect(isHtmlBody("", "https://www.amazon.de/dp/B0DT1MXW1G")).toBe(false);
+  });
+  it("does not misdetect plain text / json as html via sniffing", () => {
+    expect(classifyContentType("", "https://x.test/api", '{"a":1}')).toBe("binary");
+    expect(classifyContentType("", "https://x.test/api", "just plain text no tags")).toBe("binary");
+  });
 });
 
 describe("web-tools: isHtmlBody", () => {
@@ -367,6 +379,38 @@ describe("web-tools: htmlToMarkdown", () => {
     const md = htmlToMarkdown(`<table><tr><td>a|b</td><td>c</td></tr></table>`);
     expect(md).toContain("a\\|b");
     expect(md).toContain("---");
+  });
+
+  it("collapses multi-line list items onto a single bullet line", () => {
+    // Amazon nav <li> with nested block-ish spacing must not produce a bare
+    // "-" followed by text on the next line.
+    const html = `<ul><li>
+      <a href="#main">Hauptinhalt</a>
+    </li><li>
+      Suche
+      <span>option</span> + /
+    </li></ul>`;
+    const md = htmlToMarkdown(html, "https://example.com/");
+    expect(md).toContain("- [Hauptinhalt](https://example.com/#main)");
+    expect(md).toContain("- Suche option + /");
+    // No dangling empty bullet lines.
+    expect(md.split("\n").some((l) => l.trim() === "-")).toBe(false);
+  });
+
+  it("drops empty <li> items and empty <strong>/<em> wrappers", () => {
+    // Amazon sprinkles empty <strong></strong> around button chrome and uses
+    // tag-only <li> spacers (image-thumbnail li with only structural spans).
+    const html = `<ul>
+      <li><strong></strong></li>
+      <li><span class="a-list-item"><span data-action="thumb-action"></span></span></li>
+      <li>real content</li>
+      <li><em>  </em></li>
+    </ul>`;
+    const md = htmlToMarkdown(html, "https://example.com/");
+    expect(md).toContain("- real content");
+    expect(md).not.toContain("**\n");
+    // Only one bullet survives (the empty/whitespace/tag-only ones are dropped).
+    expect(md.split("\n").filter((l) => l.trim().startsWith("- ")).length).toBe(1);
   });
 });
 
