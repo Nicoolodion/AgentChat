@@ -16,7 +16,7 @@ const ibmPlexMono = IBM_Plex_Mono({
 
 export const metadata: Metadata = {
   title: "Chatinterface",
-  description: "Secure NanoGPT chat interface with account auth, encrypted storage, and tool-capable agent flows.",
+  description: "Secure chat interface with account auth, encrypted storage, and tool-capable agent flows.",
 };
 
 export default function RootLayout({

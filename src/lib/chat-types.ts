@@ -4,6 +4,7 @@ export type ChatListItem = {
   model: string;
   webSearchEnabled: boolean;
   agentModeLocked: boolean | null;
+  customAgentId: string | null;
   createdAt: string;
   updatedAt: string;
   lastMessagePreview: string;
@@ -75,6 +76,7 @@ export type ChatDetail = {
   model: string;
   webSearchEnabled: boolean;
   agentModeLocked: boolean | null;
+  customAgentId: string | null;
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
@@ -82,6 +84,23 @@ export type ChatDetail = {
 };
 
 export type ModelSource = "nanogpt" | "neuralwatt";
+
+/**
+ * A user-defined agent preset. `defaultAttachmentIds` references uploaded
+ * attachment ids (stored encrypted per-user via the normal upload pipeline).
+ * The owning user can run a chat "as" one of these instead of picking a bare
+ * model; the preset's model + extra instructions + default files then apply.
+ */
+export type CustomAgent = {
+  id: string;
+  name: string;
+  description: string | null;
+  systemPrompt: string;
+  model: string;
+  defaultAttachmentIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
 

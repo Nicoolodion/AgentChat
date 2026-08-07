@@ -1028,7 +1028,28 @@ export async function runAgentExecution(input: {
       const llmToolCallId = tc.id;
       const toolName = tc.function.name;
       const toolArgsResult = parseToolArgs(tc.function.arguments ?? "{}");
-      const toolCallRecord = await createToolCall(sessionId, toolName, tc.function.arguments);
+      // Persist a DB row for this tool call right before executing it. The
+      // toolCallId carried in live SSE events is the DB row id, which matches
+      // the id used by the stream route's replay-after-refresh (otherwise the
+      // same logical tool call would have a different id before vs after a
+      // refresh, breaking client-side grouping). The row is created here
+      // (rather than up-front for all tools) so an early loop exit (e.g.
+      // maxToolCalls) cannot orphan a "running" row. The LLM-generated id is
+      // kept separately for the conversation's tool_call_id, which the provider
+      // requires to round-trip unchanged.
+      //
+      // A transient DB hiccup (e.g. SQLite briefly locked) must NOT abort the
+      // whole run — fall back to an ephemeral id and keep going.
+      let toolCallRecord: { id: string };
+      try {
+        toolCallRecord = await createToolCall(sessionId, toolName, tc.function.arguments);
+      } catch (dbErr) {
+        const ephemeralId = `tc-${Date.now()}-${toolCallIdSeq++}`;
+        toolCallRecord = { id: ephemeralId };
+        sendEvent({ type: "status", data: { status: "executing", step: "Tool history write failed; continuing" } });
+        // Non-fatal: log and proceed so the agent can still execute the tool.
+        void dbErr;
+      }
       const toolCallId = toolCallRecord.id;
       const toolArgs: Record<string, unknown> = toolArgsResult.ok ? toolArgsResult.args : {};
 
@@ -1073,7 +1094,13 @@ export async function runAgentExecution(input: {
       }
 
       const durationMs = Date.now() - startMs;
-      await completeToolCall(toolCallId, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
+      try {
+        await completeToolCall(toolCallId, result.ok ? "success" : "error", JSON.stringify(result), result.error ?? undefined, durationMs);
+      } catch {
+        // Completing the persisted tool-call row is best-effort. A transient
+        // DB failure must not abort the whole workflow; the in-memory result is
+        // still fed back to the model below.
+      }
 
       // For streamed tools (e.g. ipython) stdout was already emitted
       // incrementally as tool_output chunks; sending the full capture again
@@ -2506,10 +2533,15 @@ async function runPptxAction(
 }
 
 async function updateSessionStatus(sessionId: string, status: AgentSessionStatus): Promise<void> {
-  await prisma.agentSession.update({
-    where: { id: sessionId },
-    data: { status },
-  });
+  try {
+    await prisma.agentSession.update({
+      where: { id: sessionId },
+      data: { status },
+    });
+  } catch {
+    // Status updates are best-effort: a transient DB error (e.g. SQLite
+    // momentarily locked) must not propagate and kill the in-flight run.
+  }
 }
 
 async function loadUserProfileSafe(sessionId: string): Promise<{ country?: string | null; language?: string | null; timezone?: string | null } | undefined> {

@@ -13,6 +13,7 @@ const updateSchema = z.object({
   model: z.string().min(1).max(150).optional(),
   webSearchEnabled: z.boolean().optional(),
   title: z.string().max(120).optional(),
+  customAgentId: z.string().min(1).max(64).nullable().optional(),
 });
 
 export async function GET(
@@ -61,6 +62,7 @@ export async function PATCH(
     model: parsed.data.model,
     webSearchEnabled: parsed.data.webSearchEnabled,
     title: parsed.data.title,
+    customAgentId: parsed.data.customAgentId,
   });
 
   if (!updated) {

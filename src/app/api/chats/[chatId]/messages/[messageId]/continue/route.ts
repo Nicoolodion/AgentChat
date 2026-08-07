@@ -10,6 +10,8 @@ import {
   getChatByIdForUser,
   getConversationForModel,
 } from "@/lib/chat-store";
+import { getCustomAgentForUser } from "@/lib/custom-agents";
+import { buildDefaultSystemPrompt } from "@/lib/prompts";
 import { prisma } from "@/lib/prisma";
 
 const encoder = new TextEncoder();
@@ -82,6 +84,14 @@ export async function POST(
             maxMessages: 30,
           });
 
+          // Custom Agent: re-apply its extra instructions so a continued turn
+          // keeps the same persona/system context as the original send.
+          let extraInstructions: string | undefined;
+          if (chat.customAgentId) {
+            const agent = await getCustomAgentForUser(auth.userId, chat.customAgentId);
+            if (agent) extraInstructions = agent.systemPrompt;
+          }
+
           completion = await streamCompletionWithCallbacks(
             {
               model: chat.model,
@@ -89,8 +99,7 @@ export async function POST(
               messages: [
                 {
                   role: "system",
-                  content:
-                    "You are a secure assistant in Chatinterface. Return concise, accurate answers.",
+                  content: buildDefaultSystemPrompt({ extraInstructions }),
                 },
                 ...priorConversation,
               ],

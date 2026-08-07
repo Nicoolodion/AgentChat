@@ -543,6 +543,36 @@ export async function prepareAttachmentsForModel(input: {
   return results;
 }
 
+/**
+ * Tolerant variant of `prepareAttachmentsForModel`: prepares whatever it can
+ * and silently skips ids that are missing, expired, or fail to decode. Used
+ * for a Custom Agent's "default files", which may have expired since the agent
+ * was configured — a stale default file must never abort a chat send.
+ */
+export async function prepareAttachmentsTolerant(input: {
+  userId: string;
+  userKey: Buffer;
+  attachmentIds: string[];
+}): Promise<PreparedAttachment[]> {
+  const ids = Array.from(new Set(input.attachmentIds.map((id) => id.trim()).filter(Boolean)));
+  if (ids.length === 0) return [];
+
+  const prepared: PreparedAttachment[] = [];
+  for (const id of ids) {
+    try {
+      const single = await prepareSingleAttachment({
+        userId: input.userId,
+        userKey: input.userKey,
+        attachmentId: id,
+      });
+      prepared.push(single);
+    } catch {
+      // Skip missing/expired/unreadable default files.
+    }
+  }
+  return prepared;
+}
+
 function formatAttachmentSummary(attachments: PreparedAttachment[]): string {
   const names = attachments.map((file) => file.fileName).join(", ");
   return `Attached files: ${names}`;

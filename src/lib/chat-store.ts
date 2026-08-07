@@ -111,6 +111,7 @@ function chatToListItem(chat: ChatWithLatestMessage, userKey: Buffer): ChatListI
     model: chat.model,
     webSearchEnabled: chat.webSearchEnabled,
     agentModeLocked: chat.agentModeLocked,
+    customAgentId: chat.customAgentId ?? null,
     createdAt: chat.createdAt.toISOString(),
     updatedAt: chat.updatedAt.toISOString(),
     lastMessagePreview: preview,
@@ -123,6 +124,7 @@ export async function createChatForUser(input: {
   model: string;
   webSearchEnabled: boolean;
   title?: string;
+  customAgentId?: string | null;
 }): Promise<ChatListItem> {
   const title = input.title?.trim() || "New chat";
   const chat = await prisma.chat.create({
@@ -131,6 +133,7 @@ export async function createChatForUser(input: {
       encryptedTitle: encryptString(title, input.userKey),
       model: input.model,
       webSearchEnabled: input.webSearchEnabled,
+      customAgentId: input.customAgentId ?? null,
     },
     include: {
       messages: {
@@ -191,6 +194,7 @@ export async function getChatDetailForUser(
     model: chat.model,
     webSearchEnabled: chat.webSearchEnabled,
     agentModeLocked: chat.agentModeLocked,
+    customAgentId: chat.customAgentId ?? null,
     createdAt: chat.createdAt.toISOString(),
     updatedAt: chat.updatedAt.toISOString(),
     messages: chat.messages
@@ -215,6 +219,7 @@ export async function updateChatSettingsForUser(input: {
   model?: string;
   webSearchEnabled?: boolean;
   title?: string;
+  customAgentId?: string | null;
 }): Promise<ChatDetail | null> {
   const existing = await prisma.chat.findFirst({
     where: { id: input.chatId, userId: input.userId },
@@ -235,6 +240,11 @@ export async function updateChatSettingsForUser(input: {
         typeof input.title === "string"
           ? encryptString(input.title.trim() || "New chat", input.userKey)
           : existing.encryptedTitle,
+      // Allow explicitly clearing (null) or setting the agent binding.
+      customAgentId:
+        input.customAgentId === undefined
+          ? existing.customAgentId
+          : input.customAgentId,
     },
     include: { messages: { orderBy: { createdAt: "asc" } }, agentSession: { select: { id: true, status: true } } },
   });
@@ -245,6 +255,7 @@ export async function updateChatSettingsForUser(input: {
     model: updated.model,
     webSearchEnabled: updated.webSearchEnabled,
     agentModeLocked: updated.agentModeLocked,
+    customAgentId: updated.customAgentId ?? null,
     createdAt: updated.createdAt.toISOString(),
     updatedAt: updated.updatedAt.toISOString(),
     // Some legacy rows may not decrypt (e.g. a key migration in progress or a

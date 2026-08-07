@@ -22,6 +22,7 @@ model User {
   mobileTokens      UserMobileToken[]
   mobileTasks       MobileTask[]
   profile           UserProfile?
+  customAgents      CustomAgent[]
 }
 
 model Session {
@@ -45,6 +46,9 @@ model Chat {
   model             String
   webSearchEnabled  Boolean         @default(false)
   agentModeLocked   Boolean?        // true = agent, false = normal, null = undecided
+  // When set, this chat runs under a user-defined Custom Agent (its model +
+  // system instructions + default files apply). null = plain model mode.
+  customAgentId     String?
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
   user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -214,4 +218,28 @@ model MailboxState {
   id          String   @id @default("singleton")
   lastSeenUid Int      @default(0)
   updatedAt   DateTime @updatedAt
+}
+
+// ── Custom Agents ─────────────────────────────────────────────────────────────
+// A user-defined agent preset: a name, extra system-prompt instructions, a
+// model to use, and a set of "default files" that are automatically injected
+// into every chat bound to this agent (text/image content inlined directly;
+// other file types staged via the normal attachment pipeline). Scoped to the
+// owning user today, but the userId field keeps it ready for multi-user.
+
+model CustomAgent {
+  id                   String   @id @default(cuid())
+  userId               String
+  name                 String
+  description          String?
+  // Extra instructions appended to the base default system prompt.
+  systemPrompt         String
+  model                String
+  // JSON array of uploaded attachment ids to inject automatically.
+  defaultAttachmentIds String   @default("[]")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }

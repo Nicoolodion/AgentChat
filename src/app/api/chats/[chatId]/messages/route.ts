@@ -6,6 +6,7 @@ import {
   AttachmentError,
   getAttachmentForUser,
   prepareAttachmentsForModel,
+  prepareAttachmentsTolerant,
 } from "@/lib/attachments";
 import { resolveAuthContext } from "@/lib/auth";
 import { requireCsrfHeader } from "@/lib/csrf";
@@ -21,6 +22,8 @@ import {
   getConversationForModel,
   updateChatSettingsForUser,
 } from "@/lib/chat-store";
+import { getCustomAgentForUser } from "@/lib/custom-agents";
+import { buildDefaultSystemPrompt } from "@/lib/prompts";
 import { streamCompletionWithCallbacks, generateChatTitle, resolveModelContextLength } from "@/lib/nanogpt";
 import { prisma } from "@/lib/prisma";
 import { runAgentExecution } from "@/lib/agent/orchestrator";
@@ -131,6 +134,34 @@ export async function POST(
       throw error;
     }
 
+    // ── Custom Agent ────────────────────────────────────────────────────────
+    // If the chat is bound to a user-defined Custom Agent, apply that agent's
+    // extra instructions to the system prompt and auto-inject its default
+    // files (text/image content inlined; other types staged via the same
+    // prepare pipeline) so they are always in context without the user having
+    // to re-attach them.
+    let customAgentSystemPrompt: string | undefined;
+    if (chat.customAgentId) {
+      const agent = await getCustomAgentForUser(auth.userId, chat.customAgentId);
+      if (agent) {
+        customAgentSystemPrompt = agent.systemPrompt;
+        if (agent.defaultAttachmentIds.length > 0) {
+          const defaultAtts = await prepareAttachmentsTolerant({
+            userId: auth.userId,
+            userKey: auth.userKey,
+            attachmentIds: agent.defaultAttachmentIds,
+          });
+          // Defaults first, then the user's explicit attachments for this turn.
+          preparedAttachments = [...defaultAtts, ...preparedAttachments];
+        }
+      } else {
+        // Agent was deleted but a chat still references it — clear the binding.
+        await prisma.chat
+          .update({ where: { id: chat.id }, data: { customAgentId: null } })
+          .catch(() => undefined);
+      }
+    }
+
     const persistedUserContent = appendAttachmentSummaryToMessage(
       parsed.data.content,
       preparedAttachments,
@@ -170,8 +201,9 @@ export async function POST(
               messages: [
                 {
                   role: "system",
-                  content:
-                    "You are a secure assistant in Chatinterface. Return concise, accurate answers.",
+                  content: buildDefaultSystemPrompt({
+                    extraInstructions: customAgentSystemPrompt,
+                  }),
                 },
                 ...priorConversation,
               ],

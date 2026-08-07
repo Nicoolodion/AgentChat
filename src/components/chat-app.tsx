@@ -31,6 +31,11 @@ import {
   Activity,
   Menu,
   Square,
+  Users,
+  Plus,
+  Pencil,
+  Save,
+  Cpu,
 } from "lucide-react";
 import { useRouter, usePathname } from "next/navigation";
 
@@ -45,6 +50,7 @@ import type {
   ChatDetail,
   ChatListItem,
   ChatMessage,
+  CustomAgent,
   MessageAttachmentRef,
   ModelInfo,
   ModelSource,
@@ -362,6 +368,12 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   const [modelSearch, setModelSearch] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  // Custom Agents: user-defined presets selectable instead of a bare model.
+  const [customAgents, setCustomAgents] = useState<CustomAgent[]>([]);
+  const [agentsModalOpen, setAgentsModalOpen] = useState(false);
+  // Mobile: open the agent sidebar (right rail) as an overlay drawer, since
+  // it is otherwise only laid out in the xl grid.
+  const [mobileAgentSidebarOpen, setMobileAgentSidebarOpen] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<"none" | ReasoningEffort>("none");
   // Inline chat rename: editingChatId holds the chat being renamed; renameDraft
   // is the live text. Enter/blur commits, Escape cancels.
@@ -459,13 +471,15 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
           router.replace("/login");
           return;
         }
-        const [{ models: modelRows, defaultModel: serverDefaultModel }, { chats: chatRows }] = await Promise.all([
+        const [{ models: modelRows, defaultModel: serverDefaultModel }, { chats: chatRows }, { agents: agentRows }] = await Promise.all([
           apiFetch<{ models: ModelInfo[]; defaultModel?: string }>("/api/models"),
           apiFetch<{ chats: ChatListItem[] }>("/api/chats"),
+          apiFetch<{ agents: CustomAgent[] }>("/api/agents").catch(() => ({ agents: [] as CustomAgent[] })),
         ]);
         setModels(modelRows);
         if (serverDefaultModel) setDefaultModelId(serverDefaultModel);
         setChats(chatRows);
+        setCustomAgents(agentRows);
 
         const pickDefault = serverDefaultModel || modelRows[0]?.id || "";
         const targetId = chatIdFromPath(pathname) ?? initialChatId;
@@ -624,6 +638,39 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
   }, [activeChat, models]);
   const activeModelDisplay = activeModelInfo?.name ?? activeModelInfo?.displayName ?? activeChat?.model;
 
+  // The Custom Agent bound to the active chat (if any). When set, the chat runs
+  // under that agent's model + extra instructions + default files.
+  const activeCustomAgent = useMemo(() => {
+    if (!activeChat?.customAgentId) return null;
+    return customAgents.find((a) => a.id === activeChat.customAgentId) ?? null;
+  }, [activeChat?.customAgentId, customAgents]);
+
+  async function reloadAgents() {
+    const { agents } = await apiFetch<{ agents: CustomAgent[] }>("/api/agents").catch(() => ({ agents: [] as CustomAgent[] }));
+    setCustomAgents(agents);
+    return agents;
+  }
+
+  // Bind (or unbind) the active chat to a Custom Agent. Switching agents also
+  // sets the chat's model to the agent's model so the runtime uses it.
+  async function selectAgent(agentId: string | null) {
+    if (!activeChat) return;
+    const agent = agentId ? customAgents.find((a) => a.id === agentId) : null;
+    if (activeChat.id === NEW_CHAT_ID) {
+      setActiveChat((c) => (c ? { ...c, customAgentId: agentId, model: agent?.model ?? c.model } : c));
+      return;
+    }
+    const { chat } = await apiFetch<{ chat: ChatDetail }>(`/api/chats/${activeChat.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        customAgentId: agentId,
+        model: agent?.model,
+      }),
+    });
+    setActiveChat(chat);
+    setChats((prev) => prev.map((c) => (c.id === chat.id ? { ...c, model: chat.model } : c)));
+  }
+
   useEffect(() => {
     if (modelDropdownOpen) {
       setTimeout(() => modelSearchRef.current?.focus(), 0);
@@ -691,7 +738,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
       .filter((src) => sections.has(src))
       .map((src) => ({
         source: src,
-        label: src === "neuralwatt" ? "Neuralwatt" : "NanoGPT",
+        label: src === "neuralwatt" ? "Neuralwatt" : "Default provider",
         models: sections.get(src)!,
       }))
       .concat(
@@ -715,6 +762,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
       model: modelId ?? (defaultModelId || models[0]?.id) ?? "",
       webSearchEnabled: false,
       agentModeLocked: null,
+      customAgentId: null,
       createdAt: now,
       updatedAt: now,
       messages: [],
@@ -759,12 +807,14 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     model?: string;
     webSearchEnabled: boolean;
     agentEnabled: boolean;
+    customAgentId?: string | null;
   }): Promise<ChatListItem> {
     const { chat } = await apiFetch<{ chat: ChatListItem }>("/api/chats", {
       method: "POST",
       body: JSON.stringify({
         model: input.model || undefined,
         webSearchEnabled: input.webSearchEnabled,
+        customAgentId: input.customAgentId ?? null,
       }),
     });
     // Deliberately NOT prepended to the sidebar here: the new chat must only
@@ -774,7 +824,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
     return chat;
   }
 
-  async function updateChat(payload: Partial<Pick<ChatDetail, "title" | "model" | "webSearchEnabled">>) {
+  async function updateChat(payload: Partial<Pick<ChatDetail, "title" | "model" | "webSearchEnabled" | "customAgentId">>) {
     if (!activeChat || activeChat.id === NEW_CHAT_ID) {
       // Transient chat: keep changes client-side until the chat is persisted.
       setActiveChat((c) => (c ? { ...c, ...payload } : c));
@@ -915,6 +965,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
           // transient chat.
           webSearchEnabled: usingAgent ? true : (activeChat.webSearchEnabled ?? false),
           agentEnabled: usingAgent,
+          customAgentId: activeChat.customAgentId ?? null,
         });
 
         // For agent runs, materialize the agent session up front so the
@@ -1168,7 +1219,7 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
           <div className="mb-4 flex items-center justify-between gap-3">
             <div>
               <div className="text-xs uppercase tracking-[0.2em] text-teal-300">Chatinterface</div>
-              <div className="text-lg font-semibold text-white">NanoGPT Agent Desk</div>
+              <div className="text-lg font-semibold text-white">Agent Desk</div>
             </div>
             <div className="flex items-center gap-2">
               <a
@@ -1332,10 +1383,17 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
               <div className="relative" ref={modelDropdownRef}>
                 <button
                   onClick={() => setModelDropdownOpen((p) => !p)}
-                  aria-label="Select model"
+                  aria-label="Select model or agent"
                   className="min-w-[240px] truncate rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-left text-sm text-slate-100 outline-none ring-teal-300/40 focus:ring"
                 >
-                  <span className="font-mono text-xs">{activeModelDisplay ?? "Select model"}</span>
+                  {activeCustomAgent ? (
+                    <span className="flex items-center gap-1.5">
+                      <Cpu className="h-3.5 w-3.5 text-violet-300" />
+                      <span className="truncate text-xs font-medium text-violet-100">{activeCustomAgent.name}</span>
+                    </span>
+                  ) : (
+                    <span className="font-mono text-xs">{activeModelDisplay ?? "Select model"}</span>
+                  )}
                 </button>
                 {modelDropdownOpen && (
                   <div className="absolute z-50 mt-1 w-[calc(100%+2px)] rounded-xl border border-white/10 bg-slate-900 shadow-2xl">
@@ -1351,6 +1409,55 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                       placeholder="Search models..."
                     />
                     <div className="max-h-[320px] overflow-y-auto p-1">
+                      {customAgents.length > 0 && (
+                        <div className="mb-1">
+                          <div className="sticky top-0 z-10 flex items-center gap-2 bg-slate-900 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-violet-300">
+                            <Users className="h-3 w-3" />
+                            Custom Agents
+                            <span className="text-slate-600">· {customAgents.length}</span>
+                          </div>
+                          {customAgents.map((a) => (
+                            <button
+                              key={a.id}
+                              onClick={() => {
+                                void selectAgent(a.id);
+                                setModelDropdownOpen(false);
+                                setModelSearch("");
+                              }}
+                              className={cn(
+                                "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left transition",
+                                activeChat?.customAgentId === a.id ? "bg-violet-400/20 text-violet-100" : "text-slate-300 hover:bg-white/10",
+                              )}
+                            >
+                              <Cpu className="h-3.5 w-3.5 shrink-0 text-violet-300" />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-sm text-white">{a.name}</div>
+                                <div className="truncate font-mono text-[10px] text-slate-400">{a.model}</div>
+                              </div>
+                              {a.defaultAttachmentIds.length > 0 && (
+                                <span className="shrink-0 text-[10px] text-slate-500" title={`${a.defaultAttachmentIds.length} default file(s)`}>
+                                  {a.defaultAttachmentIds.length}📎
+                                </span>
+                              )}
+                              {activeChat?.customAgentId === a.id && (
+                                <span className="text-[10px] font-semibold text-violet-300">ACTIVE</span>
+                              )}
+                            </button>
+                          ))}
+                          <button
+                            onClick={() => {
+                              void selectAgent(null);
+                              setModelDropdownOpen(false);
+                              setModelSearch("");
+                            }}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-1.5 text-left text-[11px] text-slate-500 transition hover:bg-white/10 hover:text-slate-300"
+                          >
+                            <X className="h-3 w-3" />
+                            Use plain model (no agent)
+                          </button>
+                          <div className="my-1 border-t border-white/5" />
+                        </div>
+                      )}
                       {groupedModels.map((section) => (
                         <div key={section.source} className="mb-1">
                           <div className="sticky top-0 z-10 flex items-center gap-2 bg-slate-900 px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
@@ -1370,7 +1477,9 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
                               <button
                                 key={m.id}
                                 onClick={() => {
-                                  void updateChat({ model: m.id });
+                                  // Picking a plain model clears any active
+                                  // custom-agent binding so the two never clash.
+                                  void updateChat({ model: m.id, customAgentId: null });
                                   setModelDropdownOpen(false);
                                   setModelSearch("");
                                 }}
@@ -1479,6 +1588,24 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
             </div>
 
             <div className="flex items-center gap-2">
+              {showAgentSidebar && (
+                <button
+                  onClick={() => setMobileAgentSidebarOpen(true)}
+                  className="inline-flex items-center justify-center rounded-xl border border-white/15 bg-slate-900 p-2 text-slate-200 hover:bg-slate-800 xl:hidden"
+                  aria-label="Open agent panel"
+                  title="Open agent panel"
+                >
+                  <Cpu className="h-4 w-4" />
+                </button>
+              )}
+              <button
+                onClick={() => setAgentsModalOpen(true)}
+                className="inline-flex items-center gap-2 rounded-xl border border-white/15 bg-slate-900 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
+                title="Manage custom agents"
+              >
+                <Users className="h-4 w-4" />
+                <span className="hidden sm:inline">Agents</span>
+              </button>
               <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-300">
                 Context: {activeModelInfo?.contextLength ? formatContext(activeModelInfo.contextLength) : "unknown"}
               </div>
@@ -1697,23 +1824,70 @@ export function ChatApp({ initialChatId }: { initialChatId: string }) {
 
         {/* ── Right: agent sidebar ───────────────────────────────────────── */}
         {showAgentSidebar && agent.agentSession && (
-          <AgentSidebar
-            open={agent.sidebarOpen}
-            onToggle={agent.sidebarOpen ? agent.closeSidebar : agent.openSidebar}
-            activeTab={agent.activeTab}
-            onSetTab={agent.setActiveTab}
-            sessionId={agent.agentSession.id}
-            artifacts={agent.artifacts}
-            onPreviewFile={(f) => setAgentFilePreview(f)}
-          />
+          <div className="hidden xl:block">
+            <AgentSidebar
+              open={agent.sidebarOpen}
+              onToggle={agent.sidebarOpen ? agent.closeSidebar : agent.openSidebar}
+              activeTab={agent.activeTab}
+              onSetTab={agent.setActiveTab}
+              sessionId={agent.agentSession.id}
+              artifacts={agent.artifacts}
+              onPreviewFile={(f) => setAgentFilePreview(f)}
+            />
+          </div>
         )}
       </div>
+
+      {/* Mobile agent sidebar drawer: the right rail is grid-only above xl, so
+          on phones/tablets we surface it as a slide-in overlay instead. */}
+      {showAgentSidebar && agent.agentSession && mobileAgentSidebarOpen && (
+        <div className="fixed inset-0 z-50 flex justify-end xl:hidden">
+          <div
+            className="absolute inset-0 bg-slate-950/60 backdrop-blur-sm"
+            onClick={() => setMobileAgentSidebarOpen(false)}
+          />
+          <div className="relative h-full w-[88vw] max-w-[380px] border-l border-white/10 bg-slate-950 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+              <span className="text-xs font-semibold uppercase tracking-wider text-violet-300">Agent Panel</span>
+              <button
+                onClick={() => setMobileAgentSidebarOpen(false)}
+                className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-300 transition hover:bg-white/10 hover:text-white"
+                aria-label="Close agent panel"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="h-[calc(100%-41px)]">
+              <AgentSidebar
+                open
+                onToggle={() => setMobileAgentSidebarOpen(false)}
+                activeTab={agent.activeTab}
+                onSetTab={agent.setActiveTab}
+                sessionId={agent.agentSession.id}
+                artifacts={agent.artifacts}
+                onPreviewFile={(f) => { setAgentFilePreview(f); }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Attachment preview (user uploads) */}
       {previewAttachment && (
         <AttachmentPreviewDialog
           attachment={previewAttachment}
           onClose={() => setPreviewAttachment(null)}
+        />
+      )}
+
+      {/* Custom Agents management modal */}
+      {agentsModalOpen && (
+        <CustomAgentsModal
+          models={models}
+          defaultModelId={defaultModelId}
+          agents={customAgents}
+          onChange={reloadAgents}
+          onClose={() => setAgentsModalOpen(false)}
         />
       )}
     </div>
@@ -1930,5 +2104,343 @@ function forwardAgentEvent(
     default:
       return null;
   }
+}
+
+// ── Custom Agents management modal ───────────────────────────────────────────
+
+type DraftAgent = {
+  id?: string;
+  name: string;
+  description: string;
+  systemPrompt: string;
+  model: string;
+  defaultFiles: UploadedAttachment[];
+};
+
+function emptyDraft(modelId: string): DraftAgent {
+  return { name: "", description: "", systemPrompt: "", model: modelId, defaultFiles: [] };
+}
+
+function CustomAgentsModal({
+  models,
+  defaultModelId,
+  agents,
+  onChange,
+  onClose,
+}: {
+  models: ModelInfo[];
+  defaultModelId: string;
+  agents: CustomAgent[];
+  onChange: () => Promise<CustomAgent[]>;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [draft, setDraft] = useState<DraftAgent | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (draft) setDraft(null);
+        else onClose();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [draft, onClose]);
+
+  async function uploadDefaultFiles(files: File[]) {
+    if (!files.length || uploading) return;
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      for (const f of files) fd.append("files", f, f.name);
+      const res = await fetch("/api/uploads", { method: "POST", body: fd, headers: { "X-Requested-With": "ChatInterface" } });
+      const j = (await res.json().catch(() => ({}))) as { attachments?: UploadedAttachment[]; error?: string };
+      if (!res.ok) throw new Error(j.error ?? "Upload failed");
+      setDraft((d) => (d ? { ...d, defaultFiles: [...d.defaultFiles, ...(j.attachments ?? [])].slice(0, 50) } : d));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function save() {
+    if (!draft) return;
+    if (!draft.name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    if (!draft.model.trim()) {
+      setError("Model is required.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const payload = {
+        name: draft.name,
+        description: draft.description || null,
+        systemPrompt: draft.systemPrompt,
+        model: draft.model,
+        defaultAttachmentIds: draft.defaultFiles.map((f) => f.id),
+      };
+      if (draft.id) {
+        await apiFetch(`/api/agents/${draft.id}`, { method: "PATCH", body: JSON.stringify(payload) });
+      } else {
+        await apiFetch("/api/agents", { method: "POST", body: JSON.stringify(payload) });
+      }
+      await onChange();
+      setDraft(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save agent.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeAgent(id: string) {
+    try {
+      await apiFetch(`/api/agents/${id}`, { method: "DELETE" });
+      await onChange();
+      setConfirmDeleteId(null);
+      if (draft?.id === id) setDraft(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete agent.");
+    }
+  }
+
+  function startEdit(agent: CustomAgent) {
+    setError(null);
+    setDraft({
+      id: agent.id,
+      name: agent.name,
+      description: agent.description ?? "",
+      systemPrompt: agent.systemPrompt,
+      model: agent.model,
+      // We don't fetch the stored attachment metadata back (ids are enough for
+      // persistence); show a count placeholder.
+      defaultFiles: agent.defaultAttachmentIds.map((id, i) => ({
+        id,
+        fileName: `default file ${i + 1}`,
+        mimeType: "application/octet-stream",
+        size: 0,
+        kind: "binary" as const,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date().toISOString(),
+      })),
+    });
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur"
+      onClick={() => { if (!saving) onClose(); }}
+    >
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Custom agents"
+        className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Users className="h-4 w-4 text-violet-300" />
+            <span className="text-sm font-semibold text-white">Custom Agents</span>
+            <span className="text-xs text-slate-500">{agents.length} saved</span>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-white/10 bg-white/5 p-1.5 text-slate-300 transition hover:bg-white/10 hover:text-white"
+            aria-label="Close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row">
+          {/* Agent list */}
+          <div className={`overflow-y-auto border-white/10 p-3 ${draft ? "hidden md:block md:w-56 md:shrink-0 md:border-r" : "w-full"}`}>
+            <button
+              onClick={() => { setError(null); setDraft(emptyDraft(defaultModelId || models[0]?.id || "")); }}
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-violet-500/20 px-3 py-2 text-sm font-medium text-violet-100 transition hover:bg-violet-500/30"
+            >
+              <Plus className="h-4 w-4" />
+              New agent
+            </button>
+            {agents.length === 0 && (
+              <p className="px-1 py-6 text-center text-xs text-slate-500">
+                No agents yet. Create one to give it extra instructions, default files, and a model.
+              </p>
+            )}
+            <div className="space-y-1">
+              {agents.map((a) => (
+                <div
+                  key={a.id}
+                  className={cn(
+                    "group rounded-lg border px-2 py-1.5 transition",
+                    draft?.id === a.id ? "border-violet-400/40 bg-violet-400/10" : "border-white/10 bg-white/5 hover:bg-white/10",
+                  )}
+                >
+                  <button
+                    onClick={() => startEdit(a)}
+                    className="block w-full text-left"
+                  >
+                    <div className="truncate text-sm text-white">{a.name}</div>
+                    <div className="truncate font-mono text-[10px] text-slate-400">{a.model}</div>
+                  </button>
+                  {confirmDeleteId === a.id ? (
+                    <div className="mt-1 flex items-center gap-1">
+                      <button onClick={() => void removeAgent(a.id)} className="rounded bg-rose-500/80 px-1.5 py-0.5 text-[10px] font-semibold text-white">Delete</button>
+                      <button onClick={() => setConfirmDeleteId(null)} className="text-[10px] text-slate-400">Cancel</button>
+                    </div>
+                  ) : (
+                    <div className="mt-1 flex items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                      <button onClick={() => startEdit(a)} className="text-[10px] text-slate-400 hover:text-white" title="Edit"><Pencil className="h-3 w-3" /></button>
+                      <button onClick={() => setConfirmDeleteId(a.id)} className="text-[10px] text-rose-300 hover:text-rose-200" title="Delete"><Trash2 className="h-3 w-3" /></button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Editor */}
+          {draft ? (
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  {draft.id ? "Edit agent" : "New agent"}
+                </span>
+                <button onClick={() => setDraft(null)} className="text-xs text-slate-500 hover:text-slate-300">← back to list</button>
+              </div>
+
+              <label className="mb-1 block text-xs text-slate-400">Name</label>
+              <input
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                placeholder="e.g. Code Reviewer"
+                maxLength={80}
+                className="mb-3 w-full rounded-lg border border-white/15 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-violet-400/50"
+                disabled={saving}
+              />
+
+              <label className="mb-1 block text-xs text-slate-400">Description (optional)</label>
+              <input
+                value={draft.description}
+                onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+                placeholder="Short note shown only to you"
+                maxLength={500}
+                className="mb-3 w-full rounded-lg border border-white/15 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-violet-400/50"
+                disabled={saving}
+              />
+
+              <label className="mb-1 block text-xs text-slate-400">Model</label>
+              <select
+                value={draft.model}
+                onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                className="mb-3 w-full rounded-lg border border-white/15 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-violet-400/50"
+                disabled={saving}
+              >
+                {models.length === 0 && <option value={draft.model}>{draft.model || "no models configured"}</option>}
+                {models.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name || m.displayName}</option>
+                ))}
+              </select>
+
+              <label className="mb-1 block text-xs text-slate-400">Extra instructions</label>
+              <textarea
+                value={draft.systemPrompt}
+                onChange={(e) => setDraft({ ...draft, systemPrompt: e.target.value })}
+                placeholder="Extra system-prompt instructions applied to every chat using this agent. e.g. 'You are a senior security researcher. Answer with exploit-grade detail…'"
+                rows={6}
+                className="mb-3 w-full resize-y rounded-lg border border-white/15 bg-slate-950 px-3 py-2 text-sm text-white outline-none focus:border-violet-400/50"
+                disabled={saving}
+              />
+
+              <label className="mb-1 block text-xs text-slate-400">Default files (auto-included in context)</label>
+              <p className="mb-2 text-[11px] text-slate-500">
+                Text and image files are inlined directly into the model context. Other file types are staged via the normal attachment pipeline.
+              </p>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,.pdf,.docx,.odt,.odp,.pptx,.txt,.md,.csv,.json,.xml,.rtf"
+                className="hidden"
+                onChange={(e) => { const files = Array.from(e.target.files ?? []); if (files.length) void uploadDefaultFiles(files); }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading || saving}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-white/10 disabled:opacity-50"
+              >
+                {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Paperclip className="h-3.5 w-3.5" />}
+                Add default file
+              </button>
+              {draft.defaultFiles.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {draft.defaultFiles.map((f, i) => {
+                    const Icon = f.kind === "image" ? FileImage : FileText;
+                    return (
+                      <div key={f.id ?? i} className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] text-slate-200">
+                        <Icon className="h-3 w-3 text-teal-200" />
+                        <span className="max-w-[140px] truncate">{f.fileName}</span>
+                        <button
+                          type="button"
+                          onClick={() => setDraft({ ...draft, defaultFiles: draft.defaultFiles.filter((_, idx) => idx !== i) })}
+                          className="text-slate-400 hover:text-white"
+                          aria-label="Remove default file"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {error && (
+                <div className="mt-3 rounded-lg border border-rose-400/40 bg-rose-500/15 px-3 py-2 text-xs text-rose-200">{error}</div>
+              )}
+
+              <div className="mt-4 flex items-center justify-end gap-2">
+                <button
+                  onClick={() => setDraft(null)}
+                  disabled={saving}
+                  className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/10"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => void save()}
+                  disabled={saving}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-violet-500 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-violet-400 disabled:opacity-50"
+                >
+                  {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  {draft.id ? "Save changes" : "Create agent"}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="hidden flex-1 items-center justify-center p-8 text-center text-sm text-slate-500 md:flex">
+              Select an agent to edit, or create a new one.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
