@@ -2142,17 +2142,29 @@ function CustomAgentsModal({
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Keep the latest draft in a ref so the Escape keydown handler can branch on
+  // it WITHOUT depending on `draft` — depending on draft would re-run the
+  // effect on every keystroke and refocus the dialog container, stealing focus
+  // from the text input after one character.
+  const draftRef = useRef<DraftAgent | null>(null);
+  draftRef.current = draft;
+
+  // Focus the dialog container once on mount.
   useEffect(() => {
     dialogRef.current?.focus();
+  }, []);
+
+  // Escape: close the editor if open, otherwise close the modal.
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (draft) setDraft(null);
+        if (draftRef.current) setDraft(null);
         else onClose();
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [draft, onClose]);
+  }, [onClose]);
 
   async function uploadDefaultFiles(files: File[]) {
     if (!files.length || uploading) return;
